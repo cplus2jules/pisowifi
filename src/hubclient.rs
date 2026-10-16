@@ -10,7 +10,6 @@ use crate::db::Db;
 use crate::engine::{Engine, Resume, MAX_GRANT_SECS};
 use crate::hub::proto::*;
 use crate::hub::{normalize_code, signing_message};
-use crate::keys::read_or_create_secret;
 use crate::net::Mac;
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
@@ -89,10 +88,56 @@ fn status_error(code: u16, body: &str) -> HubError {
     }
 }
 
-fn signing_key(data_dir: &Path) -> Result<SigningKey> {
-    let raw = read_or_create_secret(&data_dir.join("hub-signing.key"))?;
-    let bytes: [u8; 32] = raw[..].try_into().context("hub-signing.key")?;
+const SIGNING_KEY: &str = "hub_signing_key";
+/// Where older versions kept the key, unencrypted on the SD card.
+const OLD_KEY_FILE: &str = "hub-signing.key";
+
+/// This vendo's Ed25519 key for the hub. It lives in the encrypted database
+/// (locked to the board's chip ID), so a copied SD card doesn't give it away,
+/// and it's in passphrase backups, so a replacement board keeps its place in
+/// the chain. A key file from an older version is moved in (same key, no
+/// re-enrolment) and then removed.
+fn signing_key(db: &Db, data_dir: &Path) -> Result<SigningKey> {
+    let file = data_dir.join(OLD_KEY_FILE);
+    let from_file = match std::fs::read(&file) {
+        Ok(b) => Some(zeroize::Zeroizing::new(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+    };
+    let raw = match (db.get_secret(SIGNING_KEY)?, &from_file) {
+        (Some(k), _) => k,
+        (None, Some(old)) => {
+            if old.len() != 32 {
+                bail!("{} is corrupt (expected 32 bytes)", file.display());
+            }
+            let k = db.put_secret_once(SIGNING_KEY, old)?;
+            tracing::info!("hub signing key moved into the encrypted database");
+            k
+        }
+        (None, None) => db.put_secret_once(SIGNING_KEY, &rand::random::<[u8; 32]>())?,
+    };
+    if let Some(old) = from_file {
+        if *old == *raw {
+            remove_key_file(&file);
+        } else {
+            tracing::warn!("{} doesn't match the key in the database; left in place (the database's key is used)", file.display());
+        }
+    }
+    let bytes: [u8; 32] = raw[..].try_into().context("hub signing key in the database")?;
     Ok(SigningKey::from_bytes(&bytes))
+}
+
+/// Overwrites, then deletes. On flash the old blocks may survive wear
+/// levelling, so this is best effort; the key no longer depends on it.
+fn remove_key_file(file: &Path) {
+    let wiped = std::fs::OpenOptions::new().write(true).open(file).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(&[0u8; 32])?;
+        f.sync_all()
+    });
+    if let Err(e) = wiped.and_then(|_| std::fs::remove_file(file)) {
+        tracing::warn!("couldn't remove {}: {e}", file.display());
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -115,7 +160,7 @@ fn check_url(url: &str, dev: bool) -> Result<String> {
 /// `pisowifi join-hub`: registers this box with the hub (one-time code).
 pub fn join(db: &Db, data_dir: &Path, url: &str, code: &str, dev: bool) -> Result<EnrollResp> {
     let url = check_url(url, dev)?;
-    let key = signing_key(data_dir)?;
+    let key = signing_key(db, data_dir)?;
     let req = EnrollReq { code: code.trim().to_string(), pubkey: hex::encode(key.verifying_key().as_bytes()) };
     let resp: EnrollResp = match agent().post(&format!("{url}/v1/enroll")).send_json(&req) {
         Ok(r) => r.into_json()?,
@@ -196,7 +241,7 @@ impl HubClient {
             status: Mutex::new(HubStatus { url: url.clone(), name, vendo_id: vendo_id.clone(), ..Default::default() }),
             url,
             vendo_id,
-            key: signing_key(data_dir)?,
+            key: signing_key(db, data_dir)?,
             agent: agent(),
             chain: Mutex::new(db.get_setting("hub_chain")?),
             db: db.clone(),
@@ -576,6 +621,43 @@ mod tests {
         assert!(matches!(a.hub.resume(&a.engine, mac, IP).await, Resume::Resumed));
     }
 
+    #[test]
+    fn the_signing_key_moves_from_the_sd_card_into_the_database() {
+        let dir = std::env::temp_dir().join(format!("pisowifi-sigkey-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = DbKey(Zeroizing::new([7u8; 32]));
+        let open = || Db::open(&dir.join("t.db"), &key).unwrap();
+        let file = dir.join(OLD_KEY_FILE);
+        // An older install: the key is a plain file next to the database.
+        std::fs::write(&file, [9u8; 32]).unwrap();
+        let enrolled = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        let db = open();
+        assert_eq!(signing_key(&db, &dir).unwrap().verifying_key(), enrolled, "same key: no re-enrolment");
+        assert!(!file.exists(), "the plain copy is gone");
+        let on_disk = |name: &str| std::fs::read(dir.join(name)).unwrap_or_default();
+        assert!(!on_disk("t.db-wal").is_empty(), "the write is in the WAL");
+        for name in ["t.db", "t.db-wal"] {
+            assert!(!on_disk(name).windows(32).any(|w| w == [9u8; 32]), "{name} holds it encrypted");
+        }
+        drop(db);
+        assert_eq!(signing_key(&open(), &dir).unwrap().verifying_key(), enrolled, "kept across restarts");
+
+        // A stray file that isn't this vendo's key is left alone, and unused.
+        std::fs::write(&file, [1u8; 32]).unwrap();
+        assert_eq!(signing_key(&open(), &dir).unwrap().verifying_key(), enrolled);
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A new vendo: a random key, never written to a file.
+        let dir2 = std::env::temp_dir().join(format!("pisowifi-sigkey-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let db = Db::open(&dir2.join("t.db"), &key).unwrap();
+        let a = signing_key(&db, &dir2).unwrap().verifying_key();
+        assert_eq!(signing_key(&db, &dir2).unwrap().verifying_key(), a);
+        assert!(!dir2.join(OLD_KEY_FILE).exists());
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn leaving_the_hub_forgets_pass_links_but_not_the_time() {
         let h = serve_test_hub().await;
@@ -589,5 +671,6 @@ mod tests {
         assert!(a.db.load_links().unwrap().is_empty() && a.db.outbox_list(10).unwrap().is_empty());
         assert!(a.db.get_setting("hub_chain").unwrap().is_none());
         assert_eq!(a.db.load_clients().unwrap().len(), 1, "the phone keeps its time");
+        assert!(a.db.get_secret(SIGNING_KEY).unwrap().is_some(), "and the vendo its key, to join again");
     }
 }

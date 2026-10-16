@@ -154,6 +154,12 @@ CREATE TABLE hub_outbox (
 );
 ";
 
+/// v4: secrets that must stay inside the encrypted database (the vendo's
+/// hub signing key).
+const SCHEMA_V4: &str = "
+CREATE TABLE secrets (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -191,7 +197,30 @@ impl Db {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        if v < 4 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    // ---- secrets --------------------------------------------------------
+
+    pub fn get_secret(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let c = self.conn.lock().unwrap();
+        let v: Option<Vec<u8>> = c.query_row("SELECT value FROM secrets WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+        Ok(v.map(Zeroizing::new))
+    }
+
+    /// Stores a secret unless one by that name exists; returns the stored one.
+    pub fn put_secret_once(&self, name: &str, value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        {
+            let c = self.conn.lock().unwrap();
+            c.execute("INSERT OR IGNORE INTO secrets (name, value) VALUES (?1, ?2)", params![name, value])?;
+        }
+        self.get_secret(name)?.context("secret not stored")
     }
 
     // ---- settings -------------------------------------------------------
@@ -778,9 +807,18 @@ mod tests {
     }
 
     #[test]
+    fn secrets_are_written_once() {
+        let (_dir, db) = test_db();
+        assert!(db.get_secret("k").unwrap().is_none());
+        assert_eq!(*db.put_secret_once("k", b"first").unwrap(), b"first");
+        assert_eq!(*db.put_secret_once("k", b"second").unwrap(), b"first", "never overwritten");
+    }
+
+    #[test]
     fn backup_roundtrip() {
         let (dir, db) = test_db();
         db.set_rates(&[Rate { pesos: 5, minutes: 99 }]).unwrap();
+        db.put_secret_once("hub_signing_key", &[3u8; 32]).unwrap();
         let bk = dir.0.join("backup.db");
         db.export_backup(&bk, "correct horse").unwrap();
         let key2 = DbKey(Zeroizing::new([9u8; 32]));
@@ -788,5 +826,7 @@ mod tests {
         import_backup(&bk, "correct horse", &dir.0.join("new.db"), &key2).unwrap();
         let db2 = Db::open(&dir.0.join("new.db"), &key2).unwrap();
         assert_eq!(db2.rates().unwrap(), vec![Rate { pesos: 5, minutes: 99 }]);
+        // A replacement board keeps its hub identity.
+        assert_eq!(*db2.get_secret("hub_signing_key").unwrap().unwrap(), [3u8; 32]);
     }
 }

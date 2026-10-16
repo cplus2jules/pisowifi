@@ -149,7 +149,7 @@ coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
 | Dashboard | `https://10.0.0.1:8443/` from a phone on the WiFi. Accept the certificate once **after checking the fingerprint** from `sudo pisowifi admin-info`. |
 | Lock the dashboard to your phone | Add your phone's MAC to `admin.allow_macs` in the config. Turn off "private address" for this network on the phone. |
 | Logs | `journalctl -u pisowifi -f` |
-| Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. |
+| Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. It includes the vendo's Piso Pass key, so a replacement board restored from it stays in your chain without re-joining. |
 | Restore onto a replacement board | Stop the service, move `/var/lib/pisowifi/pisowifi.db` aside, then run `sudo pisowifi restore --from …`. |
 | Changed `config.toml`? | Restart (`sudo systemctl restart pisowifi`). If you changed interfaces or ports, also refresh the boot firewall: `sudo sh -c '{ echo "flush ruleset"; pisowifi print-firewall; } > /etc/nftables.conf'`. |
 | Coin slot offline | The dashboard says so, and the portal refuses coins instead of losing them. Check `[coin]` in the config and `journalctl -u pisowifi`. |
@@ -230,11 +230,15 @@ switched off.
   nonce and body hash; stale (±5 min) or replayed requests are refused, and
   the hub checks who is asking before it reads a request. Vendos never store
   pass codes, and the hub only stores HMACs of them.
-- **A stolen vendo.** Its signing key (`hub-signing.key`) is a plain file on
-  the SD card. The hub only lets a vendo's reports *lower* a pass's time, or
-  raise it by sales the vendo reported for that pass, so a copied key can't
-  mint free time, and every refused report is logged. If a box goes missing,
-  run `pisowifi hub remove-vendo` for it straight away.
+- **A stolen vendo.** Its signing key is kept inside the encrypted database,
+  which is locked to the board's chip, so a copied SD card alone doesn't give
+  it away (unless the chip ID can't be read and the service warned at start
+  that it fell back to a key file on the card). (Older versions kept it in a plain `hub-signing.key` file; it is
+  moved into the database and the file removed on the first start.) Someone
+  with the whole box does have it, but the hub only lets a vendo's reports
+  *lower* a pass's time, or raise it by sales the vendo reported for that
+  pass, so the key can't mint free time, and every refused report is logged.
+  If a box goes missing, run `pisowifi hub remove-vendo` for it straight away.
 
 ### Set up the hub (once)
 
