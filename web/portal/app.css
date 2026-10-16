@@ -273,6 +273,16 @@ h1, h2, p { margin: 0; }
 .confetti i { position: absolute; display: block; will-change: transform, opacity; }
 .noscript { padding: 24px; text-align: center; }
 .foot { text-align: center; font: 600 11.5px/1 var(--mono); color: #A3A5B5; padding-top: 4px; }
+.made-by {
+  justify-self: center; align-self: center; display: inline-flex; align-items: center; gap: 7px;
+  margin-top: -4px; padding: 6px 10px; border-radius: 999px;
+  font: 600 12px/1 var(--font); color: #A3A5B5; text-decoration: none;
+  transition: color .2s ease, background-color .2s ease;
+}
+.made-by-mark { width: 16px; height: 16px; flex: none; }
+.made-by-mark rect { fill: currentColor; transition: fill .2s ease; }
+.made-by-mark text { fill: #fff; font: 800 7.4px/1 var(--font); letter-spacing: -.2px; }
+.made-by:hover { color: var(--purple); background: var(--lavender); }
 
 /* ---- onboarding ------------------------------------------------------------ */
 .onboard { position: fixed; inset: 0; z-index: 50; display: grid; align-items: end; justify-items: center; background: rgba(30, 31, 46, .38); backdrop-filter: blur(4px); animation: fade .3s ease; }
