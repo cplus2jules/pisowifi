@@ -154,6 +154,12 @@ CREATE TABLE hub_outbox (
 );
 ";
 
+/// v4: secrets that must stay inside the encrypted database (the vendo's
+/// hub signing key).
+const SCHEMA_V4: &str = "
+CREATE TABLE secrets (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -191,7 +197,30 @@ impl Db {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        if v < 4 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    // ---- secrets --------------------------------------------------------
+
+    pub fn get_secret(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let c = self.conn.lock().unwrap();
+        let v: Option<Vec<u8>> = c.query_row("SELECT value FROM secrets WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+        Ok(v.map(Zeroizing::new))
+    }
+
+    /// Stores a secret unless one by that name exists; returns the stored one.
+    pub fn put_secret_once(&self, name: &str, value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        {
+            let c = self.conn.lock().unwrap();
+            c.execute("INSERT OR IGNORE INTO secrets (name, value) VALUES (?1, ?2)", params![name, value])?;
+        }
+        self.get_secret(name)?.context("secret not stored")
     }
 
     // ---- settings -------------------------------------------------------
@@ -295,6 +324,35 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets which phone holds which pass and the sales not yet reported:
+    /// both belong to one hub enrolment. Phones keep their time here.
+    pub fn clear_pass_state(&self) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute_batch("DELETE FROM pass_links; DELETE FROM hub_outbox;")?;
+        Ok(())
+    }
+
+    /// At startup: pass links and unsent credits belong to the hub enrolment
+    /// they were made under. After `join-hub` (a new vendo id) or `leave-hub`
+    /// they are dropped, since a running service writes them back on its way
+    /// down. Returns true if anything was cleared.
+    pub fn reset_pass_state_if_hub_changed(&self, vendo_id: Option<&str>) -> Result<bool> {
+        let owner = self.get_setting("pass_links_hub")?;
+        if owner.as_deref() == vendo_id {
+            return Ok(false);
+        }
+        // Links from before this was recorded belong to the current enrolment.
+        let adopt = owner.is_none() && vendo_id.is_some();
+        if !adopt {
+            self.clear_pass_state()?;
+        }
+        match vendo_id {
+            Some(id) => self.set_setting("pass_links_hub", id)?,
+            None => self.delete_setting("pass_links_hub")?,
+        }
+        Ok(!adopt)
     }
 
     pub fn outbox_delete(&self, ids: &[i64]) -> Result<()> {
@@ -724,9 +782,43 @@ mod tests {
     }
 
     #[test]
+    fn pass_links_are_dropped_when_the_hub_enrolment_changes() {
+        let (_dir, db) = test_db();
+        let mac = Mac::parse("02:11:22:33:44:55").unwrap();
+        let fill = |db: &Db| {
+            db.save_links(&[(mac, "p_1".into())]).unwrap();
+            db.outbox_add("p_1", 5, 600).unwrap();
+        };
+        let held = |db: &Db| (db.load_links().unwrap().len(), db.outbox_list(10).unwrap().len());
+        // Links made before the owner was recorded belong to the current hub.
+        fill(&db);
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap());
+        assert_eq!(held(&db), (1, 1));
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap(), "same hub: kept");
+        assert_eq!(held(&db), (1, 1));
+        // join-hub as a new vendo: the old service saved its links on the way down.
+        assert!(db.reset_pass_state_if_hub_changed(Some("v_b")).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        // leave-hub.
+        fill(&db);
+        assert!(db.reset_pass_state_if_hub_changed(None).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        assert!(!db.reset_pass_state_if_hub_changed(None).unwrap(), "no hub, nothing to do");
+    }
+
+    #[test]
+    fn secrets_are_written_once() {
+        let (_dir, db) = test_db();
+        assert!(db.get_secret("k").unwrap().is_none());
+        assert_eq!(*db.put_secret_once("k", b"first").unwrap(), b"first");
+        assert_eq!(*db.put_secret_once("k", b"second").unwrap(), b"first", "never overwritten");
+    }
+
+    #[test]
     fn backup_roundtrip() {
         let (dir, db) = test_db();
         db.set_rates(&[Rate { pesos: 5, minutes: 99 }]).unwrap();
+        db.put_secret_once("hub_signing_key", &[3u8; 32]).unwrap();
         let bk = dir.0.join("backup.db");
         db.export_backup(&bk, "correct horse").unwrap();
         let key2 = DbKey(Zeroizing::new([9u8; 32]));
@@ -734,5 +826,7 @@ mod tests {
         import_backup(&bk, "correct horse", &dir.0.join("new.db"), &key2).unwrap();
         let db2 = Db::open(&dir.0.join("new.db"), &key2).unwrap();
         assert_eq!(db2.rates().unwrap(), vec![Rate { pesos: 5, minutes: 99 }]);
+        // A replacement board keeps its hub identity.
+        assert_eq!(*db2.get_secret("hub_signing_key").unwrap().unwrap(), [3u8; 32]);
     }
 }

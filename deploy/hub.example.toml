@@ -16,7 +16,7 @@ data_dir = "/var/lib/pisowifi-hub"
 # LoadCredential (see pisowifi-hub.service), so they stay readable by root only.
 #
 # [wallet]
-# brand_name = "Juan's WiFi"                # shown on the pass
+# brand_name = "Juan's WiFi"                # shown on the pass (24 characters at most)
 # background = "#5A43E6"                    # pass colours
 # foreground = "#FFFFFF"
 # label      = "#D4F04C"

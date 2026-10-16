@@ -47,6 +47,7 @@ async function api(path, body) {
   if (!res.ok) {
     const err = new Error(data.error || "Couldn't reach the WiFi box. Check that you're still connected.");
     err.status = res.status;
+    err.code = data.code;
     throw err;
   }
   return data;
@@ -510,12 +511,16 @@ $("slot").addEventListener("click", () =>
 $("done").addEventListener("click", () =>
   action($("done"), async () => {
     const before = state.slot.pesos;
-    const r = await api("/coin/done", {});
+    // The saved pass goes along, so the coins join it instead of a new pass.
+    const saved = storedPass();
+    const r = await api("/coin/done", saved ? { pass: saved } : {});
+    if (r.pass_unknown) unknownPass = saved;
+    if (r.pass_secs !== undefined) autoClaim.done = true;
     if (before > 0) {
       confetti($("done"));
       if (r.pass_code) showPassSheet(r.pass_code);
       else {
-        toast("You're online. Enjoy!");
+        toast(r.pass_secs > 0 ? "You're online, with " + human(r.pass_secs) + " from your Piso Pass too." : "You're online. Enjoy!");
         recheckSoon();
       }
     }
@@ -540,7 +545,7 @@ $("voucher-form").addEventListener("submit", (ev) => {
   const code = $("code").value;
   action(btn, async () => {
     if (isPassCode(code)) {
-      const r = await api("/pass/claim", { code });
+      const r = await api("/pass/claim", { code, start: true });
       savePass(code);
       $("code").value = "";
       confetti(btn);
@@ -568,24 +573,33 @@ $("code").addEventListener("input", (ev) => {
 
 // ---- Piso Pass ------------------------------------------------------------------
 
-const PASS_KEY = "pisowifi-pass";
-let passTried = false;
+// Saved per chain (one owner's hub): every owner's vendos use 10.0.0.1, so a
+// phone may carry passes for several chains, and each only works on its own.
+// A saved pass is never deleted automatically; only a pass the customer
+// claims, or asks for with "Save my time", replaces it.
+const PASS_KEY = "pisowifi-pass:";
+let unknownPass = null;  // saved pass this chain's hub says doesn't exist
 
 function isPassCode(code) {
   const raw = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   return raw.startsWith("PASS") || raw.length === 16;
 }
+function passKey() {
+  return state && state.pass.enabled && state.pass.chain ? PASS_KEY + state.pass.chain : null;
+}
 function storedPass() {
-  try { return localStorage.getItem(PASS_KEY); } catch (_) { return null; }
+  const k = passKey();
+  if (!k) return null;
+  try { return localStorage.getItem(k); } catch (_) { return null; }
 }
 function savePass(code) {
   const raw = code.toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^PASS/, "");
   const nice = "PASS-" + raw.match(/.{1,4}/g).join("-");
-  try { localStorage.setItem(PASS_KEY, nice); } catch (_) { /* private mode */ }
+  const k = passKey();
+  if (k) {
+    try { localStorage.setItem(k, nice); } catch (_) { /* private mode */ }
+  }
   return nice;
-}
-function forgetPass() {
-  try { localStorage.removeItem(PASS_KEY); } catch (_) { /* ignore */ }
 }
 
 let sheetCode = null;   // pass shown in the sheet (works even if storage is off)
@@ -620,13 +634,19 @@ function renderPass() {
   renderWallet();
   const enabled = state.pass.enabled;
   const code = storedPass();
+  // A saved pass the hub doesn't know can be replaced, but only by asking.
+  const usable = code && code !== unknownPass;
+  const canSave = !usable && !state.pass.linked && state.remaining_secs > 0;
   $("code-label").textContent = enabled ? "Have a voucher or Piso Pass?" : "Have a voucher code?";
   const card = $("pass-card");
-  card.hidden = !enabled || (!code && !(state.remaining_secs > 0 && !state.pass.linked));
+  card.hidden = !enabled || (!code && !canSave);
   $("pass-show").hidden = !code;
-  $("pass-save").hidden = !!code || state.pass.linked || !(state.remaining_secs > 0);
+  $("pass-save").hidden = !canSave;
   const line = $("pass-line");
-  if (code) {
+  if (code && !usable) {
+    line.textContent = "Your saved pass isn't recognized here";
+    line.className = "";
+  } else if (code) {
     line.textContent = code.slice(0, 9) + "-••••-••••";
     line.className = "mono";
   } else {
@@ -699,8 +719,9 @@ $("cs-yes").addEventListener("click", () =>
   action($("cs-yes"), async () => {
     const code = deepPass;
     closeClaimSheet();
-    const r = await api("/pass/claim", { code });
+    const r = await api("/pass/claim", { code, start: true });
     savePass(code);
+    autoClaim.done = true;
     toast(r.secs > 0 ? "Welcome back! " + human(r.secs) + " from your Piso Pass." : "Piso Pass linked to this phone.");
     if (r.secs > 0) {
       confetti($("meter"));
@@ -709,31 +730,49 @@ $("cs-yes").addEventListener("click", () =>
   }));
 
 // At another location: bring this phone's saved pass along automatically.
+// Paused time stays paused (the phone may be in a pocket). If the hub can't
+// be reached, try again later, waiting longer each time.
+const autoClaim = { done: false, busy: false, next: 0, wait: 15000 };
+
 async function maybeClaimPass() {
-  if (passTried || !state.pass.enabled) return;
+  if (!state.pass.enabled || !state.pass.chain) return;
   if (deepPass) {
     // The pass already saved on this phone: nothing to ask.
     if (deepPass === storedPass()) deepPass = null;
-    else {
-      passTried = true;
-      return askDeepPass(deepPass);
-    }
+    else if ($("claim-sheet").hidden) return askDeepPass(deepPass);
+    else return;
   }
-  if (state.pass.linked) return;
-  passTried = true;
+  if (autoClaim.done || autoClaim.busy || state.pass.linked) return;
   const code = storedPass();
-  if (!code) return;
+  if (!code || code === unknownPass || performance.now() < autoClaim.next) return;
+  autoClaim.busy = true;
   try {
     const r = await api("/pass/claim", { code });
+    autoClaim.done = true;
     if (r.secs > 0) {
-      toast("Welcome back! " + human(r.secs) + " from your Piso Pass.");
       confetti($("meter"));
-      recheckSoon();
+      if (r.running) {
+        toast("Welcome back! " + human(r.secs) + " from your Piso Pass.");
+        recheckSoon();
+      } else {
+        toast("Welcome back! " + human(r.secs) + " from your Piso Pass is saved here. Tap Resume to go online.");
+      }
     }
-    await refresh();
+    refresh();
   } catch (e) {
-    if (/isn't valid/.test(e.message)) forgetPass();
+    if (e.code === "unknown_pass") {
+      unknownPass = code;
+      autoClaim.done = true;
+    } else if (!e.status || e.status >= 500) {
+      autoClaim.next = performance.now() + autoClaim.wait;
+      autoClaim.wait = Math.min(autoClaim.wait * 2, 120000);
+    } else {
+      autoClaim.done = true; // e.g. this phone's pass time is already here
+    }
+  } finally {
+    autoClaim.busy = false;
   }
+  renderPass();
 }
 
 document.addEventListener("visibilitychange", () => {

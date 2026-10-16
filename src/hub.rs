@@ -9,6 +9,12 @@
 //! * Claiming a pass at vendo B refunds A's lease (last report minus time
 //!   that has run since), moves everything to B, and A drops that phone on
 //!   its next report.
+//! * A lease a vendo stops reporting goes back to the pass's balance (a
+//!   vendo drops a pass once its time there has run out and it reported
+//!   zero). Leases granted in the last [`LEASE_GRACE_SECS`] are left alone:
+//!   the report may have been taken before the grant reached the vendo.
+//! * A report can only lower a lease, or raise it by time the vendo has
+//!   reported selling for that pass, so a stolen vendo key can't mint time.
 //!
 //! Security
 //! * Vendos enrol with a one-time code and an Ed25519 key that never leaves
@@ -22,7 +28,7 @@ use crate::db::apply_key;
 use crate::keys::{read_or_create_secret, DbKey};
 use crate::wallet::Wallet;
 use anyhow::{bail, Context, Result};
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -41,6 +47,17 @@ use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
 
 pub const MAX_SKEW_SECS: i64 = 300;
+/// Most leases and credits one sync may carry. A vendo reports only phones
+/// holding pass time there, so real vendos stay far below this; a bigger
+/// sync is refused whole rather than cut short.
+pub const MAX_SYNC_LEASES: usize = 2000;
+pub const MAX_SYNC_CREDITS: usize = 500;
+/// An unreported lease younger than this may have been granted after the
+/// vendo took its snapshot, so it isn't taken back yet.
+pub const LEASE_GRACE_SECS: i64 = 90;
+/// Request bodies: a sync is the only big one (see MAX_SYNC_*).
+const SMALL_BODY: usize = 4 * 1024;
+const SYNC_BODY: usize = 256 * 1024;
 /// Unambiguous characters for codes people type (no 0/O, 1/I/L).
 const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -48,6 +65,11 @@ const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
 pub mod proto {
     use serde::{Deserialize, Serialize};
+
+    /// `code` in the hub's 404 body when a pass code doesn't exist. Only this
+    /// means "no such pass": a 404 from anything else (a misconfigured proxy)
+    /// is a hub problem.
+    pub const UNKNOWN_PASS: &str = "unknown_pass";
 
     #[derive(Serialize, Deserialize)]
     pub struct EnrollReq {
@@ -58,6 +80,9 @@ pub mod proto {
     pub struct EnrollResp {
         pub vendo_id: String,
         pub name: String,
+        /// This hub's chain id (see SyncResp::chain).
+        #[serde(default)]
+        pub chain: String,
     }
     #[derive(Serialize, Deserialize)]
     pub struct PassResp {
@@ -72,6 +97,10 @@ pub mod proto {
     pub struct ClaimResp {
         pub pass_id: String,
         pub secs: u64,
+        /// The time was running where it was (false: paused, or waiting on
+        /// the hub), so a claim the customer didn't ask for keeps it paused.
+        #[serde(default)]
+        pub running: bool,
     }
     #[derive(Serialize, Deserialize, Clone, Debug)]
     pub struct LeaseReport {
@@ -98,6 +127,10 @@ pub mod proto {
         pub revoked: Vec<String>,
         /// Credit ids stored; the vendo can forget them.
         pub acked: Vec<i64>,
+        /// Random id of this hub (its database). Phones keep passes per
+        /// chain, since every owner's vendos share the address 10.0.0.1.
+        #[serde(default)]
+        pub chain: String,
         /// Wallet passes the hub can make (absent from older hubs).
         #[serde(default)]
         pub wallet: WalletSupport,
@@ -231,6 +264,7 @@ pub struct HubDb {
     conn: Mutex<Connection>,
     /// HMAC key for pass codes; lives inside the encrypted DB.
     code_key: Zeroizing<Vec<u8>>,
+    chain: String,
 }
 
 #[derive(Serialize)]
@@ -278,7 +312,23 @@ impl HubDb {
                 k.to_vec()
             }
         };
-        Ok(HubDb { conn: Mutex::new(conn), code_key: Zeroizing::new(code_key) })
+        let chain: Option<Vec<u8>> =
+            conn.query_row("SELECT value FROM secrets WHERE name = 'chain_id'", [], |r| r.get(0)).optional()?;
+        let chain = match chain {
+            Some(c) => c,
+            None => {
+                let c: [u8; 8] = rand::random();
+                conn.execute("INSERT INTO secrets (name, value) VALUES ('chain_id', ?1)", [c.to_vec()])?;
+                c.to_vec()
+            }
+        };
+        Ok(HubDb { conn: Mutex::new(conn), code_key: Zeroizing::new(code_key), chain: hex::encode(chain) })
+    }
+
+    /// Identifies this hub's passes (not secret).
+    #[cfg(test)]
+    pub fn chain(&self) -> &str {
+        &self.chain
     }
 
     fn code_hash(&self, code: &str) -> Vec<u8> {
@@ -325,7 +375,7 @@ impl HubDb {
         )?;
         Self::event(&tx, Some(&id), None, "enroll", 0);
         tx.commit()?;
-        Ok(Some(EnrollResp { vendo_id: id, name }))
+        Ok(Some(EnrollResp { vendo_id: id, name, chain: self.chain.clone() }))
     }
 
     pub fn vendo_key(&self, id: &str) -> Result<Option<[u8; 32]>> {
@@ -400,17 +450,20 @@ impl HubDb {
         let Some((id, balance, lease_vendo, lease_secs, running, reported)) = row else { return Ok(None) };
         let refund = if lease_vendo.is_some() { lease_value(lease_secs, running, reported, t) } else { 0 };
         let total = balance + refund;
+        // Time that was counting down keeps counting; paused time (and the
+        // balance) stays paused until the customer resumes it.
+        let running = lease_vendo.is_some() && running && refund > 0;
         tx.execute(
-            "UPDATE passes SET balance_secs = 0, lease_vendo = ?2, lease_secs = ?3, lease_running = 1,
+            "UPDATE passes SET balance_secs = 0, lease_vendo = ?2, lease_secs = ?3, lease_running = ?5,
                lease_reported_at = ?4, last_used = ?4 WHERE id = ?1",
-            params![id, vendo, total, t],
+            params![id, vendo, total, t, running],
         )?;
         if let Some(from) = lease_vendo.as_deref().filter(|f| *f != vendo) {
             Self::event(&tx, Some(from), Some(&id), "moved_away", refund);
         }
         Self::event(&tx, Some(vendo), Some(&id), "claim", total);
         tx.commit()?;
-        Ok(Some(ClaimResp { pass_id: id, secs: total as u64 }))
+        Ok(Some(ClaimResp { pass_id: id, secs: total as u64, running }))
     }
 
     /// The pass a code belongs to (for a wallet pass), noted in the event log.
@@ -429,43 +482,84 @@ impl HubDb {
     }
 
     pub fn sync(&self, vendo: &str, req: &SyncReq) -> Result<SyncResp> {
+        if req.leases.len() > MAX_SYNC_LEASES || req.credits.len() > MAX_SYNC_CREDITS {
+            bail!("sync too large");
+        }
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
         let t = now();
-        let mut out = SyncResp::default();
+        let mut out = SyncResp { chain: self.chain.clone(), ..Default::default() };
+        // Credits first: time sold here for a pass is what lets its lease grow.
+        for cr in &req.credits {
+            let secs = cr.secs.min(crate::engine::MAX_GRANT_SECS) as i64;
+            let new = tx.execute(
+                "INSERT OR IGNORE INTO credits (vendo_id, credit_id, pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![vendo, cr.id, cr.pass_id, cr.pesos, secs, cr.ts],
+            )?;
+            if new == 1 {
+                tx.execute(
+                    "UPDATE passes SET lease_secs = MIN(?3, lease_secs + ?4) WHERE id = ?1 AND lease_vendo = ?2",
+                    params![cr.pass_id, vendo, crate::engine::MAX_GRANT_SECS as i64, secs],
+                )?;
+            }
+            out.acked.push(cr.id);
+        }
         let mut reported = std::collections::HashSet::new();
-        for l in req.leases.iter().take(5000) {
-            let n = tx.execute(
+        for l in &req.leases {
+            let held: Option<i64> = tx
+                .query_row("SELECT lease_secs FROM passes WHERE id = ?1 AND lease_vendo = ?2", params![l.pass_id, vendo], |r| r.get(0))
+                .optional()?;
+            let Some(held) = held else {
+                out.revoked.push(l.pass_id.clone());
+                continue;
+            };
+            // Never more than the lease held at its last report (or grant)
+            // plus credits since: an honest vendo's time only grows by sales.
+            let remaining = l.remaining_secs.min(i64::MAX as u64) as i64;
+            if remaining > held {
+                tracing::warn!(vendo, pass = %l.pass_id, reported = remaining, held, "lease report above what was granted; capped");
+                Self::event(&tx, Some(vendo), Some(&l.pass_id), "capped", remaining - held);
+            }
+            tx.execute(
                 "UPDATE passes SET lease_secs = ?3, lease_running = ?4, lease_reported_at = ?5, last_used = ?5
                  WHERE id = ?1 AND lease_vendo = ?2",
-                params![l.pass_id, vendo, l.remaining_secs.min(i64::MAX as u64) as i64, l.running, t],
+                params![l.pass_id, vendo, remaining.min(held), l.running, t],
             )?;
-            if n == 0 {
-                out.revoked.push(l.pass_id.clone());
-            } else {
-                reported.insert(l.pass_id.clone());
-            }
+            reported.insert(l.pass_id.clone());
         }
-        // Leases the vendo no longer reports have run out there.
-        let mut st = tx.prepare("SELECT id FROM passes WHERE lease_vendo = ?1")?;
-        let mine: Vec<String> = st.query_map([vendo], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        // Leases the vendo didn't report: it dropped them (their time ran out
+        // there, or the grant never reached it), so whatever they still hold
+        // goes back to the pass. Fresh grants may postdate this report.
+        let mut st = tx.prepare("SELECT id, lease_secs, lease_running, lease_reported_at FROM passes WHERE lease_vendo = ?1")?;
+        let mine: Vec<(String, i64, bool, Option<i64>)> =
+            st.query_map([vendo], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
         drop(st);
-        for id in mine.iter().filter(|id| !reported.contains(*id)) {
+        for (id, secs, running, at) in mine.iter().filter(|(id, ..)| !reported.contains(id)) {
+            if at.is_some_and(|at| t - at < LEASE_GRACE_SECS) {
+                continue;
+            }
+            let back = lease_value(*secs, *running, *at, t);
             tx.execute(
-                "UPDATE passes SET lease_vendo = NULL, lease_secs = 0, lease_running = 0, lease_reported_at = NULL WHERE id = ?1",
-                [id],
+                "UPDATE passes SET balance_secs = balance_secs + ?2, lease_vendo = NULL, lease_secs = 0, lease_running = 0,
+                   lease_reported_at = NULL WHERE id = ?1",
+                params![id, back],
             )?;
-        }
-        for cr in req.credits.iter().take(1000) {
-            tx.execute(
-                "INSERT OR IGNORE INTO credits (vendo_id, credit_id, pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![vendo, cr.id, cr.pass_id, cr.pesos, cr.secs as i64, cr.ts],
-            )?;
-            out.acked.push(cr.id);
+            if back > 0 {
+                Self::event(&tx, Some(vendo), Some(id), "returned", back);
+            }
         }
         tx.execute("UPDATE vendos SET last_seen = ?2 WHERE id = ?1", params![vendo, t])?;
         tx.commit()?;
         Ok(out)
+    }
+
+    #[cfg(test)]
+    pub fn lease_for_tests(&self, pass_id: &str) -> (i64, Option<String>, i64) {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT balance_secs, lease_vendo, lease_secs FROM passes WHERE id = ?1", [pass_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
     }
 
     pub fn summary(&self) -> Result<(u64, u64, u64)> {
@@ -510,7 +604,7 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/wallet/google/{token}", get(wallet_google).head(wallet_google_head))
         .route("/v1/wallet/logo.png", get(wallet_logo))
         .layer(axum::middleware::from_fn(crate::server::security_headers))
-        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(DefaultBodyLimit::max(SMALL_BODY))
         .with_state(st)
 }
 
@@ -518,8 +612,19 @@ fn hub_err(code: StatusCode, msg: &str) -> Response {
     ApiError::new(code, msg).into_response()
 }
 
-/// Verifies the vendo's signature and returns its id.
-fn authenticate(st: &HubState, method: &str, path: &str, headers: &HeaderMap, body: &[u8]) -> Result<String, Response> {
+fn unknown_pass() -> Response {
+    ApiError::new(StatusCode::NOT_FOUND, "unknown pass").with_code(UNKNOWN_PASS).into_response()
+}
+
+/// Reads a request body, refusing anything over `limit` bytes.
+async fn read_body(body: Body, limit: usize) -> Result<Bytes, Response> {
+    axum::body::to_bytes(body, limit).await.map_err(|_| hub_err(StatusCode::PAYLOAD_TOO_LARGE, "request too large"))
+}
+
+/// Checks a vendo's request: headers first (known vendo, fresh timestamp),
+/// so a stranger's body is never read, then the signature over the body
+/// (at most `limit` bytes). Returns the vendo's id and the body.
+async fn authenticate(st: &HubState, path: &str, headers: &HeaderMap, body: Body, limit: usize) -> Result<(String, Bytes), Response> {
     let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
     let (Some(vendo), Some(ts), Some(nonce), Some(sig)) = (h("x-vendo-id"), h("x-ts"), h("x-nonce"), h("x-sig")) else {
         return Err(hub_err(StatusCode::UNAUTHORIZED, "unsigned request"));
@@ -531,10 +636,14 @@ fn authenticate(st: &HubState, method: &str, path: &str, headers: &HeaderMap, bo
     if nonce.len() < 16 || nonce.len() > 64 {
         return Err(hub_err(StatusCode::UNAUTHORIZED, "bad nonce"));
     }
+    if vendo.len() > 64 {
+        return Err(hub_err(StatusCode::UNAUTHORIZED, "unknown vendo"));
+    }
     let key = st.db.vendo_key(&vendo).ok().flatten().ok_or_else(|| hub_err(StatusCode::UNAUTHORIZED, "unknown vendo"))?;
     let sig: [u8; 64] = hex::decode(&sig).ok().and_then(|s| s.try_into().ok()).ok_or_else(|| hub_err(StatusCode::UNAUTHORIZED, "bad signature"))?;
     let vk = VerifyingKey::from_bytes(&key).map_err(|_| hub_err(StatusCode::UNAUTHORIZED, "bad key"))?;
-    vk.verify(&signing_message(method, path, &vendo, ts, &nonce, body), &Signature::from_bytes(&sig))
+    let body = read_body(body, limit).await?;
+    vk.verify(&signing_message("POST", path, &vendo, ts, &nonce, &body), &Signature::from_bytes(&sig))
         .map_err(|_| hub_err(StatusCode::UNAUTHORIZED, "bad signature"))?;
     // Replay protection: each nonce once within the skew window.
     let mut seen = st.nonces.lock().unwrap();
@@ -543,8 +652,29 @@ fn authenticate(st: &HubState, method: &str, path: &str, headers: &HeaderMap, bo
     if seen.insert(format!("{vendo}:{nonce}"), t).is_some() {
         return Err(hub_err(StatusCode::UNAUTHORIZED, "replayed request"));
     }
-    Ok(vendo)
+    Ok((vendo, body))
 }
+
+/// Where an enrolment attempt came from. Behind a reverse proxy on this
+/// machine (Caddy) every connection is from 127.0.0.1, so the address the
+/// proxy put last in X-Forwarded-For is used; anyone else could forge that
+/// header, so it is ignored for direct connections.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.ip().is_loopback() {
+        return peer.ip();
+    }
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .last()
+        .and_then(|ip| ip.trim().parse().ok())
+        .unwrap_or(peer.ip())
+}
+
+/// Addresses tracked for enrolment lockouts, at most (memory guard).
+const MAX_ENROLL_TRACKED: usize = 10_000;
 
 fn parse<T: for<'a> Deserialize<'a>>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|_| hub_err(StatusCode::BAD_REQUEST, "bad request body"))
@@ -555,18 +685,22 @@ fn internal(e: anyhow::Error) -> Response {
     hub_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-async fn enroll(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
-    let ip = addr.ip();
+async fn enroll(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Body) -> Response {
+    let ip = client_ip(addr, &headers);
     {
         let mut f = st.enroll_fails.lock().unwrap();
-        if let Some((n, since)) = f.get(&ip).copied() {
-            if now() - since > 3600 {
-                f.remove(&ip);
-            } else if n >= 10 {
-                return hub_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts");
-            }
+        let t = now();
+        f.retain(|_, (_, since)| t - *since <= 3600);
+        match f.get(&ip) {
+            Some((n, _)) if *n >= 10 => return hub_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"),
+            None if f.len() >= MAX_ENROLL_TRACKED => return hub_err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"),
+            _ => {}
         }
     }
+    let body = match read_body(body, SMALL_BODY).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
     let req: EnrollReq = match parse(&body) {
         Ok(r) => r,
         Err(e) => return e,
@@ -590,9 +724,9 @@ async fn enroll(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketA
     }
 }
 
-async fn create_pass(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
-    let vendo = match authenticate(&st, "POST", "/v1/passes", &headers, &body) {
-        Ok(v) => v,
+async fn create_pass(State(st): State<Shared>, headers: HeaderMap, body: Body) -> Response {
+    let vendo = match authenticate(&st, "/v1/passes", &headers, body, SMALL_BODY).await {
+        Ok((v, _)) => v,
         Err(e) => return e,
     };
     match st.db.create_pass(&vendo) {
@@ -601,8 +735,8 @@ async fn create_pass(State(st): State<Shared>, headers: HeaderMap, body: Bytes) 
     }
 }
 
-async fn claim(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
-    let vendo = match authenticate(&st, "POST", "/v1/claim", &headers, &body) {
+async fn claim(State(st): State<Shared>, headers: HeaderMap, body: Body) -> Response {
+    let (vendo, body) = match authenticate(&st, "/v1/claim", &headers, body, SMALL_BODY).await {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -611,17 +745,17 @@ async fn claim(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
         Err(e) => return e,
     };
     if normalize_code(&req.code).len() != 16 {
-        return hub_err(StatusCode::NOT_FOUND, "unknown pass");
+        return unknown_pass();
     }
     match st.db.claim(&vendo, &req.code) {
         Ok(Some(r)) => Json(r).into_response(),
-        Ok(None) => hub_err(StatusCode::NOT_FOUND, "unknown pass"),
+        Ok(None) => unknown_pass(),
         Err(e) => internal(e),
     }
 }
 
-async fn sync(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
-    let vendo = match authenticate(&st, "POST", "/v1/sync", &headers, &body) {
+async fn sync(State(st): State<Shared>, headers: HeaderMap, body: Body) -> Response {
+    let (vendo, body) = match authenticate(&st, "/v1/sync", &headers, body, SYNC_BODY).await {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -629,6 +763,12 @@ async fn sync(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Resp
         Ok(r) => r,
         Err(e) => return e,
     };
+    if req.leases.len() > MAX_SYNC_LEASES || req.credits.len() > MAX_SYNC_CREDITS {
+        tracing::warn!(vendo, leases = req.leases.len(), credits = req.credits.len(), "sync too large; refused");
+        return ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many leases or credits in one sync")
+            .with_code("sync_too_large")
+            .into_response();
+    }
     match st.db.sync(&vendo, &req) {
         Ok(mut r) => {
             r.wallet = st.wallet_support();
@@ -642,8 +782,8 @@ async fn sync(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Resp
 
 /// A vendo asks for a wallet pass on behalf of a customer: returns a
 /// single-use download path the customer's phone opens directly.
-async fn wallet_issue(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
-    let vendo = match authenticate(&st, "POST", "/v1/wallet", &headers, &body) {
+async fn wallet_issue(State(st): State<Shared>, headers: HeaderMap, body: Body) -> Response {
+    let (vendo, body) = match authenticate(&st, "/v1/wallet", &headers, body, SMALL_BODY).await {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -655,11 +795,11 @@ async fn wallet_issue(State(st): State<Shared>, headers: HeaderMap, body: Bytes)
         return hub_err(StatusCode::NOT_IMPLEMENTED, "this wallet isn't set up on the hub");
     };
     if normalize_code(&req.code).len() != 16 {
-        return hub_err(StatusCode::NOT_FOUND, "unknown pass");
+        return unknown_pass();
     }
     let pass_id = match st.db.wallet_pass(&vendo, &req.code, req.kind) {
         Ok(Some(id)) => id,
-        Ok(None) => return hub_err(StatusCode::NOT_FOUND, "unknown pass"),
+        Ok(None) => return unknown_pass(),
         Err(e) => return internal(e),
     };
     match wallet.issue(req.kind, &pass_id, &req.code, now()) {
@@ -758,13 +898,75 @@ pub async fn run(cfg: HubConfig) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
 
     fn hub() -> (PathBuf, HubDb) {
         let dir = std::env::temp_dir().join(format!("pisowifi-hub-{}", rand::random::<u64>()));
         let db = HubDb::open(&dir).unwrap();
         (dir, db)
+    }
+
+    /// A real hub on 127.0.0.1 for vendo-side tests. Stops when dropped.
+    pub(crate) struct TestHub {
+        pub url: String,
+        pub st: Arc<HubState>,
+        dir: PathBuf,
+        _stop: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Drop for TestHub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    pub(crate) async fn serve_test_hub() -> TestHub {
+        let (dir, db) = hub();
+        let st = Arc::new(HubState::new(db, None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let limits = crate::server::Limits { max_conns: 64, per_ip: 64, request_timeout: std::time::Duration::from_secs(30) };
+        tokio::spawn(crate::server::serve(listener, router(st.clone()), None, limits, rx));
+        TestHub { url, st, dir, _stop: tx }
+    }
+
+    /// Moves a pass's last report (or grant) into the past.
+    fn age_lease(db: &HubDb, pass_id: &str, secs: i64) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE passes SET lease_reported_at = lease_reported_at - ?2 WHERE id = ?1", params![pass_id, secs])
+            .unwrap();
+    }
+
+    fn lease_of(db: &HubDb, pass_id: &str) -> (i64, Option<String>, i64) {
+        db.lease_for_tests(pass_id)
+    }
+
+    fn credit(id: i64, pass_id: &str, pesos: u32, secs: u64) -> CreditReport {
+        CreditReport { id, pass_id: pass_id.into(), pesos, secs, ts: now() }
+    }
+
+    fn signed_request(key: &ed25519_dalek::SigningKey, vendo: &str, path: &str, body: Body, signed_body: &[u8]) -> http::Request<Body> {
+        use ed25519_dalek::Signer;
+        let (ts, nonce) = (now(), hex::encode(rand::random::<[u8; 16]>()));
+        let sig = key.sign(&signing_message("POST", path, vendo, ts, &nonce, signed_body));
+        http::Request::post(path)
+            .header("x-vendo-id", vendo)
+            .header("x-ts", ts.to_string())
+            .header("x-nonce", nonce)
+            .header("x-sig", hex::encode(sig.to_bytes()))
+            .body(body)
+            .unwrap()
+    }
+
+    fn signed(key: &ed25519_dalek::SigningKey, vendo: &str, path: &str, body: &serde_json::Value) -> http::Request<Body> {
+        let bytes = serde_json::to_vec(body).unwrap();
+        signed_request(key, vendo, path, Body::from(bytes.clone()), &bytes)
     }
 
     fn vendo(db: &HubDb, name: &str) -> String {
@@ -780,10 +982,10 @@ mod tests {
         let (dir, db) = hub();
         let a = vendo(&db, "Branch A");
         let b = vendo(&db, "Branch B");
-        // Customer pays at A: pass created, A reports 2 h paused.
+        // Customer pays at A: pass created, A reports the sale and 2 h paused.
         let p = db.create_pass(&a).unwrap();
         let lease = |remaining, running| LeaseReport { pass_id: p.pass_id.clone(), remaining_secs: remaining, running };
-        db.sync(&a, &SyncReq { leases: vec![lease(7200, false)], credits: vec![] }).unwrap();
+        db.sync(&a, &SyncReq { leases: vec![lease(7200, false)], credits: vec![credit(1, &p.pass_id, 20, 7200)] }).unwrap();
         // They show up at B with their pass.
         let got = db.claim(&b, &p.code.to_lowercase()).unwrap().unwrap();
         assert_eq!(got.secs, 7200);
@@ -795,6 +997,167 @@ mod tests {
         assert_eq!(db.claim(&a, &p.code).unwrap().unwrap().secs, 3600);
         assert!(db.claim(&a, "PASS-AAAA-BBBB-CCCC-DDDD").unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_sync_never_takes_back_a_lease_granted_after_its_snapshot() {
+        let (dir, db) = hub();
+        let a = vendo(&db, "Branch A");
+        let b = vendo(&db, "Branch B");
+        let p = db.create_pass(&b).unwrap();
+        db.sync(&b, &SyncReq { leases: vec![], credits: vec![credit(1, &p.pass_id, 20, 7200)] }).unwrap();
+        db.sync(&b, &SyncReq { leases: vec![LeaseReport { pass_id: p.pass_id.clone(), remaining_secs: 7200, running: false }], credits: vec![] }).unwrap();
+        // A takes its snapshot (no passes yet); the customer claims at A; then
+        // A's sync arrives with the old snapshot.
+        let before_claim = SyncReq::default();
+        assert_eq!(db.claim(&a, &p.code).unwrap().unwrap().secs, 7200);
+        let r = db.sync(&a, &before_claim).unwrap();
+        assert!(r.revoked.is_empty());
+        assert_eq!(lease_of(&db, &p.pass_id), (0, Some(a.clone()), 7200), "the fresh lease is untouched");
+        // A lease A really dropped (or whose grant never reached it) goes back
+        // to the pass, not to zero.
+        age_lease(&db, &p.pass_id, LEASE_GRACE_SECS + 1);
+        db.sync(&a, &SyncReq::default()).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id), (7200, None, 0));
+        assert_eq!(db.claim(&b, &p.code).unwrap().unwrap().secs, 7200, "nothing lost");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reports_cant_raise_a_lease_beyond_what_was_sold() {
+        let (dir, db) = hub();
+        let a = vendo(&db, "Branch A");
+        let p = db.create_pass(&a).unwrap();
+        let report = |secs| SyncReq { leases: vec![LeaseReport { pass_id: p.pass_id.clone(), remaining_secs: secs, running: true }], credits: vec![] };
+        // A stolen vendo key reporting time nobody paid for gets nothing.
+        db.sync(&a, &report(86_400)).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id).2, 0);
+        // A ₱5 sale (30 min) lets the lease grow by exactly that.
+        db.sync(&a, &SyncReq { leases: report(1800).leases, credits: vec![credit(7, &p.pass_id, 5, 1800)] }).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id).2, 1800);
+        db.sync(&a, &report(1700)).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id).2, 1700, "time used is gone");
+        db.sync(&a, &report(1800)).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id).2, 1700, "and can't be reported back");
+        // Re-sending an already stored credit doesn't count twice.
+        db.sync(&a, &SyncReq { leases: report(3500).leases, credits: vec![credit(7, &p.pass_id, 5, 1800)] }).unwrap();
+        assert_eq!(lease_of(&db, &p.pass_id).2, 1700);
+        let capped: i64 = db.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM events WHERE action = 'capped'", [], |r| r.get(0)).unwrap();
+        assert_eq!(capped, 3, "each attempt is in the event log");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claims_say_whether_the_time_was_running() {
+        let (dir, db) = hub();
+        let a = vendo(&db, "Branch A");
+        let b = vendo(&db, "Branch B");
+        let p = db.create_pass(&a).unwrap();
+        let sync = |v: &str, running, credits| {
+            let l = LeaseReport { pass_id: p.pass_id.clone(), remaining_secs: 3600, running };
+            db.sync(v, &SyncReq { leases: vec![l], credits }).unwrap();
+        };
+        // Paused at A: claimed at B, it stays paused.
+        sync(&a, false, vec![credit(1, &p.pass_id, 10, 3600)]);
+        assert!(!db.claim(&b, &p.code).unwrap().unwrap().running);
+        // Running at B: it keeps running at A.
+        sync(&b, true, vec![]);
+        assert!(db.claim(&a, &p.code).unwrap().unwrap().running);
+        // Time sitting in the balance isn't running anywhere.
+        age_lease(&db, &p.pass_id, LEASE_GRACE_SECS + 1);
+        db.sync(&a, &SyncReq::default()).unwrap();
+        let c = db.claim(&b, &p.code).unwrap().unwrap();
+        assert!(c.secs > 0 && !c.running);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_chain_id_is_random_per_hub_and_stays() {
+        let (dir, db) = hub();
+        let chain = db.chain().to_string();
+        assert_eq!(chain.len(), 16);
+        let code = db.add_enroll_code("A").unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let r = db.enroll(&code, key.verifying_key().as_bytes()).unwrap().unwrap();
+        assert_eq!(r.chain, chain);
+        assert_eq!(db.sync(&r.vendo_id, &SyncReq::default()).unwrap().chain, chain);
+        drop(db);
+        assert_eq!(HubDb::open(&dir).unwrap().chain(), chain, "survives a restart");
+        let (dir2, other) = hub();
+        assert_ne!(other.chain(), chain);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[tokio::test]
+    async fn requests_are_checked_before_their_bodies_are_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (dir, db) = hub();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let vendo = db.enroll(&db.add_enroll_code("A").unwrap(), key.verifying_key().as_bytes()).unwrap().unwrap().vendo_id;
+        let pass = db.create_pass(&vendo).unwrap();
+        let app = router(Arc::new(HubState::new(db, None)));
+
+        // A body that notices being read.
+        let read = Arc::new(AtomicBool::new(false));
+        let watched = |read: Arc<AtomicBool>| Body::from_stream(Watched(read, false));
+        let stranger = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let req = signed_request(&stranger, "v_nobody", "/v1/sync", watched(read.clone()), b"");
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(!read.load(Ordering::SeqCst), "an unknown vendo's body is never read");
+        let mut stale = signed_request(&key, &vendo, "/v1/claim", watched(read.clone()), b"");
+        stale.headers_mut().insert("x-ts", (now() - 3600).to_string().parse().unwrap());
+        assert_eq!(app.clone().oneshot(stale).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert!(!read.load(Ordering::SeqCst), "nor a stale request's");
+
+        // A known vendo's body is read, up to 4 KB on small routes.
+        let req = signed_request(&key, &vendo, "/v1/claim", watched(read.clone()), b"");
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(read.load(Ordering::SeqCst));
+        let big = serde_json::json!({ "code": "x".repeat(5000) });
+        assert_eq!(app.clone().oneshot(signed(&key, &vendo, "/v1/claim", &big)).await.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Unknown codes say so in a way a program can check.
+        let r = app.clone().oneshot(signed(&key, &vendo, "/v1/claim", &serde_json::json!({ "code": "PASS-AAAA-BBBB-CCCC-DDDD" }))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["code"], UNKNOWN_PASS);
+
+        // A sync over the cap is refused whole, not cut short.
+        let lease = LeaseReport { pass_id: pass.pass_id.clone(), remaining_secs: 0, running: false };
+        let leases = vec![lease; MAX_SYNC_LEASES + 1];
+        let r = app.clone().oneshot(signed(&key, &vendo, "/v1/sync", &serde_json::json!({ "leases": leases, "credits": [] }))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let leases = vec![LeaseReport { pass_id: pass.pass_id.clone(), remaining_secs: 0, running: false }; MAX_SYNC_LEASES];
+        let r = app.clone().oneshot(signed(&key, &vendo, "/v1/sync", &serde_json::json!({ "leases": leases, "credits": [] }))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "a full-size sync fits the body limit");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 1 MB of junk that flags when it's read.
+    struct Watched(Arc<std::sync::atomic::AtomicBool>, bool);
+
+    impl futures_core::Stream for Watched {
+        type Item = Result<Bytes, std::io::Error>;
+        fn poll_next(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            let done = std::mem::replace(&mut self.1, true);
+            std::task::Poll::Ready((!done).then(|| Ok(Bytes::from(vec![b'x'; 1 << 20]))))
+        }
+    }
+
+    #[test]
+    fn enrol_lockouts_use_the_proxys_client_address() {
+        let peer = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 50000);
+        let mut h = HeaderMap::new();
+        assert_eq!(client_ip(peer("127.0.0.1"), &h), "127.0.0.1".parse::<IpAddr>().unwrap());
+        // Caddy adds the client's address last; anything before it is the client's own claim.
+        h.append("x-forwarded-for", "6.6.6.6, 203.0.113.7".parse().unwrap());
+        assert_eq!(client_ip(peer("127.0.0.1"), &h), "203.0.113.7".parse::<IpAddr>().unwrap());
+        h.append("x-forwarded-for", "198.51.100.2".parse().unwrap());
+        assert_eq!(client_ip(peer("::1"), &h), "198.51.100.2".parse::<IpAddr>().unwrap());
+        // Straight from the internet: the header is the sender's to forge.
+        assert_eq!(client_ip(peer("203.0.113.9"), &h), "203.0.113.9".parse::<IpAddr>().unwrap());
     }
 
     #[test]

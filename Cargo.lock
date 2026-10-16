@@ -1067,6 +1067,7 @@ dependencies = [
  "cms",
  "der",
  "ed25519-dalek",
+ "futures-core",
  "gpiocdev",
  "hex",
  "hkdf",

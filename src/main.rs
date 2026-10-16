@@ -202,7 +202,7 @@ fn main() -> Result<()> {
         }
         Cmd::LeaveHub => {
             hubclient::leave(&open_db(&cfg, cli.dev)?)?;
-            println!("Left the hub. Restart the service.");
+            println!("Left the hub. Restart the service. Phones keep the time they have here; it just stops being a Piso Pass.");
             Ok(())
         }
         Cmd::Hub { .. } => unreachable!(),
@@ -339,6 +339,11 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let enable = gpio::Enable::open(&cfg.coin)?.map(|e| (e, cfg.coin.enable_line.unwrap()));
     let fw = firewall::Firewall::start(&cfg, dev).await?;
+    // Pass links from another hub enrolment (join-hub, leave-hub) are dropped
+    // before the engine loads them.
+    if db.reset_pass_state_if_hub_changed(db.get_setting("hub_vendo_id")?.as_deref())? {
+        tracing::info!("Piso Pass: hub changed; old pass links dropped (customers keep their time here)");
+    }
     // In dev mode coins come from the dashboard's test buttons.
     let reader_ok = Arc::new(std::sync::atomic::AtomicBool::new(dev));
     let engine = engine::Engine::new(
@@ -390,18 +395,14 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let hub_client = hubclient::HubClient::load(&db, &cfg.storage.data_dir)?;
     if let Some(hub) = hub_client.clone() {
         tracing::info!("Piso Pass: connected to hub {} as {}", hub.status().url, hub.status().name);
-        let (e, db2) = (engine.clone(), db.clone());
+        let e = engine.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(if dev { 5 } else { 30 }));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let credits = db2.outbox_list(200).unwrap_or_default();
-                match hub.sync(hub::proto::SyncReq { leases: e.lease_reports(), credits }).await {
-                    Ok(r) => {
-                        e.revoke_passes(&r.revoked);
-                        let _ = db2.outbox_delete(&r.acked);
-                    }
-                    Err(err) => tracing::warn!("hub sync: {err}"),
+                if let Err(err) = hub.sync_once(&e).await {
+                    tracing::warn!("hub sync: {err}");
                 }
             }
         });
