@@ -3,7 +3,7 @@
 //! firewall is told about every change.
 
 use crate::db::{ClientRow, Db, Rate};
-use crate::hub::proto::LeaseReport;
+use crate::hub::proto::{CreditReport, LeaseReport};
 use crate::firewall::Firewall;
 use crate::gpio::Enable;
 use crate::net::Mac;
@@ -25,6 +25,10 @@ const LATE_COIN: Duration = Duration::from_secs(8);
 const EMPTY_SLOT_COOLDOWN: Duration = Duration::from_secs(20);
 /// Longest grant accepted from anywhere (owner, voucher, hub): guards the clock maths.
 pub const MAX_GRANT_SECS: u64 = 400 * 86400;
+/// Paused Piso Pass time only restarts if the hub was heard from this
+/// recently: while out of touch, this vendo wouldn't know the pass had been
+/// claimed at another location. Shorter than any trip between two vendos.
+pub const PASS_TRUST: Duration = Duration::from_secs(120);
 
 pub struct Engine {
     state: Mutex<State>,
@@ -52,6 +56,8 @@ struct State {
     last_slot: Option<(Slot, Instant)>,
     /// Phones whose reservation just ran out with no coins.
     cooldown: HashMap<Mac, Instant>,
+    /// Last successful hub sync (Piso Pass).
+    last_sync: Option<Instant>,
 }
 
 struct Client {
@@ -123,6 +129,13 @@ pub struct SlotAdminView {
     pub reader_ok: bool,
 }
 
+pub enum Resume {
+    Resumed,
+    Nothing,
+    /// Paused Piso Pass time, and the hub hasn't been heard from lately.
+    NeedsHub,
+}
+
 pub enum CoinStart {
     Ok,
     Busy(u64),
@@ -168,6 +181,7 @@ impl Engine {
                 counting: false,
                 last_slot: None,
                 cooldown: HashMap::new(),
+                last_sync: None,
             }),
             db,
             fw,
@@ -305,12 +319,7 @@ impl Engine {
             if let Err(e) = self.db.add_sale(Some(prev.mac), pesos, secs, "coin") {
                 tracing::error!("recording sale: {e:#}");
             }
-            if let Some(pass) = st.links.get(&prev.mac) {
-                if let Err(e) = self.db.outbox_add(pass, pesos, secs) {
-                    tracing::error!("queueing pass credit: {e:#}");
-                }
-            }
-            self.add_time_locked(&mut st, prev.mac, prev.ip, secs);
+            self.grant_locked(&mut st, prev.mac, prev.ip, pesos, secs);
             st.last_slot = Some((Slot { pesos: total, ..prev }, closed));
             return;
         }
@@ -346,23 +355,24 @@ impl Engine {
         paused
     }
 
-    pub fn resume(&self, mac: Mac, ip: Ipv4Addr) -> bool {
+    pub fn resume(&self, mac: Mac, ip: Ipv4Addr) -> Resume {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
         self.rebind(&mut st, mac, ip, now);
-        let resumed = match st.clients.get_mut(&mac) {
+        let untrusted = st.links.contains_key(&mac) && !Self::pass_trusted(&st);
+        match st.clients.get_mut(&mac) {
             Some(c) if c.until.is_none() && !c.banked.is_zero() => {
+                if untrusted {
+                    return Resume::NeedsHub;
+                }
                 c.until = Some(now + c.banked);
                 self.fw.allow(mac, c.ip, c.banked.as_secs());
                 c.banked = Duration::ZERO;
-                true
+                self.persist_locked(&st, now);
+                Resume::Resumed
             }
-            _ => false,
-        };
-        if resumed {
-            self.persist_locked(&st, now);
+            _ => Resume::Nothing,
         }
-        resumed
     }
 
     /// Wrong voucher or pass codes lock a phone out for a while.
@@ -390,7 +400,7 @@ impl Engine {
                 let _ = self.db.add_sale(Some(mac), 0, secs, "voucher");
                 let mut st = self.state.lock().unwrap();
                 st.voucher_fails.remove(&mac);
-                self.add_time_locked(&mut st, mac, ip, secs);
+                self.grant_locked(&mut st, mac, ip, 0, secs);
                 Ok(secs)
             }
             Ok(None) => {
@@ -409,7 +419,7 @@ impl Engine {
     pub fn admin_add_time(&self, mac: Mac, secs: u64) -> bool {
         let mut st = self.state.lock().unwrap();
         let Some(ip) = st.clients.get(&mac).map(|c| c.ip) else { return false };
-        self.add_time_locked(&mut st, mac, ip, secs);
+        self.grant_locked(&mut st, mac, ip, 0, secs);
         true
     }
 
@@ -530,21 +540,31 @@ impl Engine {
         st.links.contains_key(&mac) && st.clients.get(&mac).is_some_and(|c| !c.remaining(Instant::now()).is_zero())
     }
 
-    pub fn link_pass(&self, mac: Mac, pass_id: String) {
+    /// Puts this phone's time here on a pass just created on the hub, and
+    /// reports that time as sold for it (`pesos`: coins paid just now).
+    pub fn link_pass(&self, mac: Mac, pass_id: String, pesos: u32) {
         let mut st = self.state.lock().unwrap();
+        let secs = st.clients.get(&mac).map(|c| c.remaining(Instant::now()).as_secs()).unwrap_or(0);
+        self.queue_credit(&pass_id, pesos, secs);
         st.links.insert(mac, pass_id);
         self.persist_locked(&st, Instant::now());
     }
 
     /// Puts a pass's time (just leased from the hub) on this phone. The hub's
     /// figure already includes any time this vendo held for the pass, so
-    /// that is replaced, never added twice. Unlinked local time is merged in.
-    pub fn claim_into(&self, mac: Mac, ip: Ipv4Addr, pass_id: String, secs: u64) -> u64 {
+    /// that is replaced, never added twice. Unlinked local time is merged in
+    /// and reported as sold for the pass (`pesos`: coins paid just now).
+    ///
+    /// The clock runs if `run` (the customer asked, or the time was running
+    /// where it came from) or if this phone's own time here was running;
+    /// otherwise it stays paused, so a phone that joins the WiFi in a pocket
+    /// doesn't burn paused time. Returns (seconds, running).
+    pub fn claim_into(&self, mac: Mac, ip: Ipv4Addr, pass_id: String, secs: u64, run: bool, pesos: u32) -> (u64, bool) {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
-        let extra = match st.links.get(&mac) {
-            None => st.clients.get(&mac).map(|c| c.remaining(now).as_secs()).unwrap_or(0),
-            Some(_) => 0,
+        let (extra, local_running) = match st.links.get(&mac) {
+            None => st.clients.get(&mac).map(|c| (c.remaining(now).as_secs(), c.until.is_some())).unwrap_or((0, false)),
+            Some(_) => (0, false),
         };
         // Drop every local session tied to this pass (incl. an older MAC of the same phone).
         let holders: Vec<Mac> = st.links.iter().filter(|(_, p)| **p == pass_id).map(|(m, _)| *m).chain([mac]).collect();
@@ -556,21 +576,26 @@ impl Engine {
                 }
             }
         }
+        self.queue_credit(&pass_id, pesos, extra);
         st.links.insert(mac, pass_id);
-        let total = extra + secs;
+        let total = extra.saturating_add(secs).min(MAX_GRANT_SECS);
+        let run = total > 0 && (run || local_running);
         if total > 0 {
-            self.add_time_locked(&mut st, mac, ip, total);
+            self.set_time_locked(&mut st, mac, ip, total, run);
         } else {
             self.persist_locked(&st, now);
         }
-        total
+        (total, run)
     }
 
-    /// Heartbeat payload: what each pass held here has left.
-    pub fn lease_reports(&self) -> Vec<LeaseReport> {
+    /// What to send the hub: each pass held here with its time, and sales
+    /// not yet reported. Taken together under the lock, so the credits sent
+    /// cover every second the reports include.
+    pub fn sync_snapshot(&self, max_credits: u32) -> (Vec<LeaseReport>, Vec<CreditReport>) {
         let now = Instant::now();
         let st = self.state.lock().unwrap();
-        st.links
+        let leases = st
+            .links
             .iter()
             .map(|(mac, pass)| {
                 let c = st.clients.get(mac);
@@ -580,26 +605,55 @@ impl Engine {
                     running: c.is_some_and(|c| c.until.is_some()),
                 }
             })
-            .collect()
+            .collect();
+        let credits = self.db.outbox_list(max_credits).unwrap_or_else(|e| {
+            tracing::error!("reading pass credits: {e:#}");
+            vec![]
+        });
+        (leases, credits)
     }
 
-    /// The customer took their pass to another location: cut this phone off.
-    pub fn revoke_passes(&self, ids: &[String]) {
-        if ids.is_empty() {
-            return;
-        }
+    /// After the hub accepted `sent`: cut off phones whose pass was claimed
+    /// at another location, and forget passes whose time here had run out
+    /// (reported as zero) so links don't pile up. A customer who comes back
+    /// is linked again by claiming their pass.
+    pub fn after_sync(&self, sent: &[LeaseReport], revoked: &[String]) {
+        let now = Instant::now();
         let mut st = self.state.lock().unwrap();
-        let macs: Vec<Mac> = st.links.iter().filter(|(_, p)| ids.contains(p)).map(|(m, _)| *m).collect();
-        for m in macs {
+        st.last_sync = Some(now);
+        let revoked: std::collections::HashSet<&String> = revoked.iter().collect();
+        let spent: std::collections::HashSet<&String> = sent.iter().filter(|r| r.remaining_secs == 0).map(|r| &r.pass_id).collect();
+        let mut changed = false;
+        let drop: Vec<(Mac, bool)> = st
+            .links
+            .iter()
+            .filter_map(|(m, p)| {
+                let has_time = st.clients.get(m).is_some_and(|c| !c.remaining(now).is_zero());
+                if revoked.contains(p) {
+                    Some((*m, true))
+                } else if spent.contains(p) && !has_time {
+                    // Still nothing here (no coins since the report).
+                    Some((*m, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (m, moved) in drop {
             st.links.remove(&m);
             if let Some(c) = st.clients.remove(&m) {
-                tracing::info!(mac = %m, "pass moved to another location");
+                if moved {
+                    tracing::info!(mac = %m, "pass moved to another location");
+                }
                 if c.until.is_some() {
                     self.fw.revoke(m, c.ip);
                 }
             }
+            changed = true;
         }
-        self.persist_locked(&st, Instant::now());
+        if changed {
+            self.persist_locked(&st, now);
+        }
     }
 
     // ---- internals ------------------------------------------------------
@@ -615,13 +669,61 @@ impl Engine {
         if let Err(e) = self.db.add_sale(Some(slot.mac), slot.pesos, secs, "coin") {
             tracing::error!("recording sale: {e:#}");
         }
-        if let Some(pass) = st.links.get(&slot.mac) {
-            if let Err(e) = self.db.outbox_add(pass, slot.pesos, secs) {
-                tracing::error!("queueing pass credit: {e:#}");
-            }
-        }
-        self.add_time_locked(st, slot.mac, slot.ip, secs);
+        self.grant_locked(st, slot.mac, slot.ip, slot.pesos, secs);
         Some((slot.pesos, secs))
+    }
+
+    fn pass_trusted(st: &State) -> bool {
+        st.last_sync.is_some_and(|t| t.elapsed() < PASS_TRUST)
+    }
+
+    fn queue_credit(&self, pass_id: &str, pesos: u32, secs: u64) {
+        if pesos == 0 && secs == 0 {
+            return;
+        }
+        if let Err(e) = self.db.outbox_add(pass_id, pesos, secs) {
+            tracing::error!("queueing pass credit: {e:#}");
+        }
+    }
+
+    /// New time for a phone (coins, voucher, owner), which starts its clock.
+    /// Time added to a pass is reported to the hub as sold for it.
+    fn grant_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, pesos: u32, secs: u64) {
+        // Starting the clock would also restart paused pass time. If the hub
+        // has been out of touch, that pass may have been claimed elsewhere
+        // meanwhile, so the phone lets go of it first: the hub gives the
+        // paused time back to the pass on our next sync, and the portal
+        // claims it again.
+        let paused = st.clients.get(&mac).is_some_and(|c| c.until.is_none() && !c.banked.is_zero());
+        if paused && st.links.contains_key(&mac) && !Self::pass_trusted(st) {
+            tracing::info!(%mac, "hub out of touch: paused pass time set aside");
+            st.links.remove(&mac);
+            st.clients.remove(&mac);
+        }
+        if let Some(pass) = st.links.get(&mac) {
+            self.queue_credit(pass, pesos, secs);
+        }
+        self.add_time_locked(st, mac, ip, secs);
+    }
+
+    /// Sets a phone's time outright, running or paused.
+    fn set_time_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, secs: u64, run: bool) {
+        let now = Instant::now();
+        let left = Duration::from_secs(secs.min(MAX_GRANT_SECS));
+        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO });
+        if run {
+            c.until = Some(now + left);
+            c.banked = Duration::ZERO;
+            self.fw.allow(mac, ip, left.as_secs());
+        } else {
+            if c.until.is_some() {
+                self.fw.revoke(mac, c.ip);
+            }
+            c.until = None;
+            c.banked = left;
+        }
+        c.ip = ip;
+        self.persist_locked(st, now);
     }
 
     fn add_time_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, secs: u64) {
@@ -724,6 +826,109 @@ mod tests {
         let (dir, e) = engine(false).await;
         assert!(matches!(e.coin_start(Mac::parse(PHONE).unwrap(), IP), CoinStart::Offline));
         assert!(!e.slot_admin().reader_ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn paid(e: &Engine, mac: Mac, pesos: u32) -> u64 {
+        assert!(matches!(e.coin_start(mac, IP), CoinStart::Ok));
+        e.test_coin(pesos);
+        e.coin_done(mac).unwrap().1
+    }
+
+    fn report(e: &Engine, pass: &str) -> Option<LeaseReport> {
+        e.sync_snapshot(100).0.into_iter().find(|l| l.pass_id == pass)
+    }
+
+    #[tokio::test]
+    async fn spent_pass_links_are_forgotten_once_the_hub_heard_zero() {
+        let (dir, e) = engine(true).await;
+        let (a, b) = (Mac::parse(PHONE).unwrap(), Mac::parse("02:00:00:00:00:02").unwrap());
+        paid(&e, a, 5);
+        e.link_pass(a, "p_a".into(), 5);
+        paid(&e, b, 5);
+        e.link_pass(b, "p_b".into(), 5);
+        // A's time runs out; B still has time.
+        e.kick(a);
+        let (sent, _) = e.sync_snapshot(100);
+        assert_eq!(report(&e, "p_a").unwrap().remaining_secs, 0);
+        e.after_sync(&sent, &[]);
+        assert!(e.pass_of(a).is_none(), "spent link dropped");
+        assert_eq!(e.pass_of(b).as_deref(), Some("p_b"));
+        assert_eq!(e.db.load_links().unwrap().len(), 1, "and not saved");
+        // Zero was reported, but coins arrived before the hub answered: kept.
+        e.kick(b);
+        let (sent, _) = e.sync_snapshot(100);
+        paid(&e, b, 1);
+        e.after_sync(&sent, &[]);
+        assert_eq!(e.pass_of(b).as_deref(), Some("p_b"));
+        // A pass claimed at another location: cut off.
+        e.after_sync(&[], &["p_b".into()]);
+        assert!(e.pass_of(b).is_none() && !e.has_time(b));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn time_added_to_a_pass_is_reported_as_sold() {
+        let (dir, e) = engine(true).await;
+        let mac = Mac::parse(PHONE).unwrap();
+        let first = paid(&e, mac, 5);
+        e.admin_add_time(mac, 600); // before the pass: plain local time
+        e.link_pass(mac, "p_1".into(), 5);
+        e.after_sync(&[], &[]);
+        let more = paid(&e, mac, 10);
+        e.admin_add_time(mac, 300);
+        let (leases, credits) = e.sync_snapshot(100);
+        let sold: Vec<(u32, u64)> = credits.iter().map(|c| (c.pesos, c.secs)).collect();
+        // Linking covers all the time already on the phone; later grants each add theirs.
+        assert!(sold[0].0 == 5 && first + 600 - sold[0].1 <= 1, "{sold:?}");
+        assert_eq!(&sold[1..], [(10, more), (0, 300)]);
+        let sum: u64 = sold.iter().map(|s| s.1).sum();
+        assert!(leases[0].remaining_secs <= sum, "a report never exceeds what was reported sold");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claimed_pass_time_stays_paused_unless_asked() {
+        let (dir, e) = engine(true).await;
+        let (a, b) = (Mac::parse(PHONE).unwrap(), Mac::parse("02:00:00:00:00:02").unwrap());
+        // Phone joins the WiFi in a pocket: paused time stays paused.
+        assert_eq!(e.claim_into(a, IP, "p_a".into(), 3600, false, 0), (3600, false));
+        assert!(!e.me(a, IP).running && remaining(&e, a) == 3600);
+        // Running where it came from, or the customer typed the code: runs.
+        assert_eq!(e.claim_into(b, IP, "p_b".into(), 3600, true, 0), (3600, true));
+        // Paused pass time joining time already running here runs with it,
+        // and the local time is reported as sold for the pass.
+        let d = Mac::parse("02:00:00:00:00:04").unwrap();
+        let bought = paid(&e, d, 5);
+        let (total, running) = e.claim_into(d, IP, "p_d".into(), 3600, false, 5);
+        assert!(running && total.abs_diff(3600 + bought) <= 1);
+        let credits = e.sync_snapshot(100).1;
+        assert!(credits.iter().any(|c| c.pass_id == "p_d" && c.pesos == 5 && bought - c.secs <= 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn paused_pass_time_waits_for_the_hub() {
+        let (dir, e) = engine(true).await;
+        let (a, b) = (Mac::parse(PHONE).unwrap(), Mac::parse("02:00:00:00:00:02").unwrap());
+        e.claim_into(a, IP, "p_a".into(), 3600, false, 0);
+        // Never synced (or not lately): the pass may have been claimed elsewhere.
+        assert!(matches!(e.resume(a, IP), Resume::NeedsHub));
+        e.after_sync(&[], &[]);
+        assert!(matches!(e.resume(a, IP), Resume::Resumed));
+        // Plain local time doesn't need the hub.
+        paid(&e, b, 5);
+        assert!(e.pause(b));
+        e.state.lock().unwrap().last_sync = Instant::now().checked_sub(PASS_TRUST + Duration::from_secs(1));
+        assert!(matches!(e.resume(b, IP), Resume::Resumed));
+        // Coins would restart paused pass time too: while out of touch, the
+        // phone lets go of the pass (the hub gives the time back to it) and
+        // only the coins run.
+        assert!(e.pause(a));
+        let coins = paid(&e, a, 5);
+        assert!(e.pass_of(a).is_none());
+        assert!(e.me(a, IP).running && coins - remaining(&e, a) <= 1);
+        assert!(e.sync_snapshot(100).1.is_empty(), "nothing reported sold for the pass");
         let _ = std::fs::remove_dir_all(dir);
     }
 

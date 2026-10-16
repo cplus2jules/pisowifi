@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use x509_cert::Certificate;
@@ -46,6 +47,11 @@ use zeroize::Zeroizing;
 pub const TOKEN_TTL_SECS: i64 = 600;
 /// Passes waiting to be downloaded, at most (memory guard: a .pkpass is ~30 KB).
 const MAX_WAITING: usize = 1000;
+/// Waiting links per pass: a new one pushes out the oldest, so one customer
+/// tapping again and again can't fill the queue for everyone.
+const MAX_WAITING_PER_PASS: usize = 2;
+/// Longest brand name: wallets cut off longer ones on the pass's front.
+pub const MAX_BRAND_CHARS: usize = 24;
 /// Apple shows a pass on the lock screen near at most 10 places.
 const MAX_LOCATIONS: usize = 10;
 
@@ -130,6 +136,9 @@ fn parse_color(s: &str, what: &str) -> Result<[u8; 3]> {
 struct Waiting {
     kind: WalletKind,
     expires: i64,
+    pass_id: String,
+    /// Issue order, to find a pass's oldest link.
+    n: u64,
     /// The save URL (Google) or the .pkpass file (Apple). Holds the code.
     item: Zeroizing<Vec<u8>>,
 }
@@ -140,6 +149,7 @@ pub struct Wallet {
     google: Option<Google>,
     apple: Option<Apple>,
     waiting: Mutex<HashMap<String, Waiting>>,
+    issued: AtomicU64,
 }
 
 struct Google {
@@ -177,6 +187,10 @@ impl Wallet {
             parse_color(&cfg.foreground, "foreground")?,
             parse_color(&cfg.label, "label")?,
         ];
+        let brand = cfg.brand_name.chars().count();
+        if brand == 0 || brand > MAX_BRAND_CHARS || cfg.brand_name.chars().any(char::is_control) {
+            bail!("wallet.brand_name must be 1 to {MAX_BRAND_CHARS} characters (it is {brand})");
+        }
         if !(cfg.portal_url.starts_with("http://") || cfg.portal_url.starts_with("https://")) {
             bail!("wallet.portal_url must start with http:// (usually \"http://10.0.0.1\")");
         }
@@ -202,7 +216,7 @@ impl Wallet {
             (None, None, None, None, None) => None,
             _ => bail!("wallet: set all of apple_pass_type_id, apple_team_id, apple_cert_pem, apple_key_pem and apple_wwdr_pem, or none"),
         };
-        Ok(Wallet { cfg, colors, google, apple, waiting: Mutex::new(HashMap::new()) })
+        Ok(Wallet { cfg, colors, google, apple, waiting: Mutex::new(HashMap::new()), issued: AtomicU64::new(0) })
     }
 
     pub fn support(&self) -> WalletSupport {
@@ -227,10 +241,19 @@ impl Wallet {
         let token = hex::encode(rand::rngs::OsRng.gen::<[u8; 32]>());
         let mut w = self.waiting.lock().unwrap();
         w.retain(|_, x| x.expires > now);
+        let mut mine: Vec<(u64, String)> = w.iter().filter(|(_, x)| x.pass_id == pass_id).map(|(t, x)| (x.n, t.clone())).collect();
+        mine.sort();
+        for (_, old) in mine.iter().take((mine.len() + 1).saturating_sub(MAX_WAITING_PER_PASS)) {
+            w.remove(old);
+        }
         if w.len() >= MAX_WAITING {
             bail!("too many wallet passes waiting to be downloaded");
         }
-        w.insert(token.clone(), Waiting { kind, expires: now + TOKEN_TTL_SECS, item: Zeroizing::new(item) });
+        let n = self.issued.fetch_add(1, Ordering::Relaxed);
+        w.insert(
+            token.clone(),
+            Waiting { kind, expires: now + TOKEN_TTL_SECS, pass_id: pass_id.to_string(), n, item: Zeroizing::new(item) },
+        );
         Ok(token)
     }
 
@@ -750,6 +773,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn one_pass_cant_fill_the_download_queue() {
+        let w = test_wallet();
+        let tokens: Vec<String> = (0..5).map(|_| w.issue(WalletKind::Google, "p_1", CODE, NOW).unwrap()).collect();
+        // Only the two newest links for this pass still work.
+        let live: Vec<bool> = tokens.iter().map(|t| w.is_waiting(WalletKind::Google, t, NOW)).collect();
+        assert_eq!(live, [false, false, false, true, true]);
+        assert_eq!(w.waiting.lock().unwrap().len(), 2);
+        // Other passes are untouched.
+        let other = w.issue(WalletKind::Google, "p_2", CODE, NOW).unwrap();
+        assert!(w.is_waiting(WalletKind::Google, &other, NOW));
+        assert!(w.is_waiting(WalletKind::Google, &tokens[4], NOW));
+    }
+
+    #[test]
     fn config_mistakes_are_caught_at_start() {
         let mut c = test_config();
         c.apple_team_id = Some("OTHERTEAM1".into());
@@ -762,6 +799,13 @@ pub(crate) mod tests {
         let mut c = test_config();
         c.google_service_account_json = None;
         assert!(Wallet::load(c, NOW).is_err(), "half-configured Google");
+
+        let mut c = test_config();
+        c.brand_name = "Juan's Super Fast Piso WiFi Station".into();
+        assert!(Wallet::load(c, NOW).err().unwrap().to_string().contains("brand_name"), "too long for a pass");
+        let mut c = test_config();
+        c.brand_name = "Juan's WiFi Barangay 123".into(); // 24 characters
+        assert!(Wallet::load(c, NOW).is_ok());
 
         let mut c = test_config();
         c.locations = (0..11).map(|i| Location { name: format!("L{i}"), latitude: 14.0, longitude: 121.0 }).collect();

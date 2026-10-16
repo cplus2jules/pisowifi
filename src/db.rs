@@ -297,6 +297,35 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Forgets which phone holds which pass and the sales not yet reported:
+    /// both belong to one hub enrolment. Phones keep their time here.
+    pub fn clear_pass_state(&self) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute_batch("DELETE FROM pass_links; DELETE FROM hub_outbox;")?;
+        Ok(())
+    }
+
+    /// At startup: pass links and unsent credits belong to the hub enrolment
+    /// they were made under. After `join-hub` (a new vendo id) or `leave-hub`
+    /// they are dropped, since a running service writes them back on its way
+    /// down. Returns true if anything was cleared.
+    pub fn reset_pass_state_if_hub_changed(&self, vendo_id: Option<&str>) -> Result<bool> {
+        let owner = self.get_setting("pass_links_hub")?;
+        if owner.as_deref() == vendo_id {
+            return Ok(false);
+        }
+        // Links from before this was recorded belong to the current enrolment.
+        let adopt = owner.is_none() && vendo_id.is_some();
+        if !adopt {
+            self.clear_pass_state()?;
+        }
+        match vendo_id {
+            Some(id) => self.set_setting("pass_links_hub", id)?,
+            None => self.delete_setting("pass_links_hub")?,
+        }
+        Ok(!adopt)
+    }
+
     pub fn outbox_delete(&self, ids: &[i64]) -> Result<()> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
@@ -721,6 +750,31 @@ mod tests {
         assert!(Db::open(&path, &v2).is_ok());
         // Already migrated: opens directly.
         assert!(open_migrating(&path, &v2, &v1).is_ok());
+    }
+
+    #[test]
+    fn pass_links_are_dropped_when_the_hub_enrolment_changes() {
+        let (_dir, db) = test_db();
+        let mac = Mac::parse("02:11:22:33:44:55").unwrap();
+        let fill = |db: &Db| {
+            db.save_links(&[(mac, "p_1".into())]).unwrap();
+            db.outbox_add("p_1", 5, 600).unwrap();
+        };
+        let held = |db: &Db| (db.load_links().unwrap().len(), db.outbox_list(10).unwrap().len());
+        // Links made before the owner was recorded belong to the current hub.
+        fill(&db);
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap());
+        assert_eq!(held(&db), (1, 1));
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap(), "same hub: kept");
+        assert_eq!(held(&db), (1, 1));
+        // join-hub as a new vendo: the old service saved its links on the way down.
+        assert!(db.reset_pass_state_if_hub_changed(Some("v_b")).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        // leave-hub.
+        fill(&db);
+        assert!(db.reset_pass_state_if_hub_changed(None).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        assert!(!db.reset_pass_state_if_hub_changed(None).unwrap(), "no hub, nothing to do");
     }
 
     #[test]

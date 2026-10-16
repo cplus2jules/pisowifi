@@ -47,6 +47,10 @@ zeroize = "1"
 # Store-only (no compression codecs): pure Rust, nothing extra to cross-compile.
 zip = { version = "9", default-features = false }
 
+[dev-dependencies]
+# A request body that notices being read (hub tests).
+futures-core = "0.3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 gpiocdev = "0.7"
 

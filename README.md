@@ -42,7 +42,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 **Known limits** (true of every open-WiFi vendo, LPB included):
 - **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break. Fully preventing this needs WPA2 per-user keys.
 - **Client isolation.** Turn it on in the access point so customers can't see each other's devices.
-- **Piso Pass codes travel unencrypted** over the open WiFi, like everything on the portal. Someone sniffing nearby could copy a code and use its time. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
+- **Piso Pass codes are bearer secrets sent over the open WiFi.** Whoever has a code has its time, and the portal (like every vendo's) is plain HTTP, so someone sniffing nearby could copy a code as the phone claims it or buys more time, and use the time first. Tell customers to treat the code like cash. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
 - **SSH works only from the modem's side** (e.g. a laptop on the modem's own WiFi), never from the customer WiFi.
 
 ## Install on the Orange Pi
@@ -179,8 +179,9 @@ Dev mode fakes the firewall and the coin slot. The dashboard shows *Test ₱1/�
 Run the tests with `cargo test`. They cover the encryption-at-rest check,
 wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session
 binding, lockout, rate math, ARP parsing, the firewall rules, Piso Pass
-transfers and wallet passes (JWT claims, .pkpass manifest and signature,
-single-use links).
+(transfers between two vendos against a real hub over HTTP, syncs crossing
+claims, lease caps, pruning, offline vendos) and wallet passes (JWT claims,
+.pkpass manifest and signature, single-use links).
 
 To try wallet passes locally, write a hub config whose `[wallet]` section
 points at the throwaway keys in `testdata/wallet/` and run
@@ -193,11 +194,8 @@ Run several vendos? Customers' time can follow them. Pay ₱20 at your store
 in Barangay A, use an hour, and the remaining time is waiting at your
 branch in Barangay B.
 
-> **Not ready for real money yet.** A review before the first deployment
-> found Piso Pass bugs that can lose or duplicate a customer's time when a
-> sync crosses a claim, plus pass links that pile up over weeks. Run single
-> vendos without a hub until those are fixed. A vendo that never joins a hub
-> is unaffected: all Piso Pass code stays switched off.
+A vendo that never joins a hub is unaffected: all Piso Pass code stays
+switched off.
 
 ```
  Vendo A ──┐  outbound HTTPS only, every request signed (Ed25519)
@@ -208,20 +206,35 @@ branch in Barangay B.
 - **The pass.** The first time a phone pays, it gets a Piso Pass
   (`PASS-XXXX-XXXX-XXXX-XXXX`). The pass is saved in the phone's browser and
   shown on screen to screenshot. All vendos use the same portal address
-  (10.0.0.1), so a phone's saved pass is picked up automatically at any
-  location. It can also be typed into *Have a voucher or Piso Pass?*.
+  (10.0.0.1), so a phone's saved pass is picked up automatically at any of
+  your locations. It can also be typed into *Have a voucher or Piso Pass?*.
+  Phones keep passes per hub, so another owner's vendo never sees yours, and
+  a saved pass is never deleted because something went wrong.
 - **Moving between locations.** A vendo holds a pass's time while the customer is
   there and reports it to the hub every 30 s. Claiming the pass somewhere
   else moves the time there, and the old vendo cuts that phone off on its next
-  report. Paused time moves intact; running time keeps counting.
+  report. Running time keeps counting. Paused time moves intact and stays
+  paused until the customer taps *Resume*, so a phone that joins the WiFi in
+  a pocket doesn't use it up. Buying coins with a pass saved on the phone adds
+  to that pass; it never makes a second one.
 - **If the hub is down**, every vendo keeps working on its own. Coins and
   vouchers work as usual, and passes resume syncing when the hub is back.
+  One exception: a vendo that hasn't reached the hub for 2 minutes won't
+  restart *paused* pass time, because the pass may have been claimed at
+  another location meanwhile. The customer sees a message to try again; their
+  time is safe on the pass.
 - **Wallet passes.** Optionally, customers can add the pass to Google Wallet
   or Apple Wallet (see [Wallet passes](#wallet-passes)).
 - **Security.** Vendos enrol with a single-use code and an Ed25519 key that
   never leaves the box. Requests are signed over the method, path, time,
-  nonce and body hash; stale (±5 min) or replayed requests are refused.
-  Vendos never store pass codes, and the hub only stores HMACs of them.
+  nonce and body hash; stale (±5 min) or replayed requests are refused, and
+  the hub checks who is asking before it reads a request. Vendos never store
+  pass codes, and the hub only stores HMACs of them.
+- **A stolen vendo.** Its signing key (`hub-signing.key`) is a plain file on
+  the SD card. The hub only lets a vendo's reports *lower* a pass's time, or
+  raise it by sales the vendo reported for that pass, so a copied key can't
+  mint free time, and every refused report is logged. If a box goes missing,
+  run `pisowifi hub remove-vendo` for it straight away.
 
 ### Set up the hub (once)
 
@@ -252,6 +265,12 @@ branch in Barangay B.
 
 To see every vendo, its last sync and the passes it holds, run `pisowifi hub vendos` on the hub. `hub remove-vendo --id …` retires a box and returns its customers' time to their passes.
 
+`leave-hub` (or joining another hub) turns Piso Pass off on that vendo after
+the restart: phones there keep the time they have, but it no longer follows
+them. Retire a vendo with both `leave-hub` and `hub remove-vendo`, when no
+customer there has pass time running: time held there at that moment stays
+on the phones *and* goes back to the passes.
+
 ## Wallet passes
 
 Customers can keep their Piso Pass in **Google Wallet** (Android, Samsung
@@ -276,9 +295,10 @@ How it works:
   The phone downloads the pass from the hub over the internet, so the
   customer's time must be running. Links never contain the code.
 - The pass shows the code as a QR code and as text. Its **Use my time** link
-  opens `http://10.0.0.1/?pass=CODE`: on any of your vendos' WiFi, that saves
-  the pass on the phone and claims its time. The pass doesn't show the
-  balance, which changes every second.
+  opens `http://10.0.0.1/?pass=CODE`: on any of your vendos' WiFi, the portal
+  asks before claiming it (a planted link can't collect someone's time), then
+  saves the pass on the phone. The pass doesn't show the balance, which
+  changes every second.
 - The Google key and Apple certificate live **only on the hub**. Vendos never
   see them. On the hub, systemd hands them over with `LoadCredential`, so the
   files can stay readable by root only.
