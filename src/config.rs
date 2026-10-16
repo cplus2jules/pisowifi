@@ -56,6 +56,10 @@ pub struct Admin {
     pub allow_macs: Vec<String>,
     #[serde(default = "default_session_hours")]
     pub session_hours: u64,
+    /// Test layout only (no modem side to log in from): the devices in
+    /// `allow_macs` may also SSH in from the customer side.
+    #[serde(default)]
+    pub owner_ssh_from_lan: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,6 +212,7 @@ impl Config {
                 listen: "127.0.0.1:8443".parse().unwrap(),
                 allow_macs: vec![],
                 session_hours: 8,
+                owner_ssh_from_lan: false,
             },
             coin: Coin {
                 chip: String::new(),

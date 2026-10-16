@@ -21,6 +21,7 @@ listen = "10.0.0.1:8443"    # https://10.0.0.1:8443/
 # "private/random address" for this network first), then run
 # `sudo pisowifi allow-mac <MAC>` or add it here.
 allow_macs = []
+owner_ssh_from_lan = false  # test layout only: allow_macs may SSH in from the customer side
 session_hours = 8
 
 [coin]

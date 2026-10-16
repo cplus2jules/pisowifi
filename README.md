@@ -89,6 +89,12 @@ minute or two. It:
 - runs the coin probe
 - installs a fail-closed boot firewall and DHCP/DNS for the customer side, and starts the service
 
+**No modem or access point yet?** `sudo ./install.sh --test-layout` (fresh
+Armbian card only) makes the built-in port the customer side: plug a laptop
+in and it's the customer. There's no internet in this layout, and only the
+laptop whose adapter MAC you give the installer can open the dashboard or
+SSH in. Run `./install.sh` again for the real layout.
+
 **5. Before you leave it:** check SSH works from the modem side, then
 `sudo reboot` once and check that the portal opens on a phone and a coin
 gives time.
