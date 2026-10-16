@@ -145,7 +145,14 @@ Dev mode fakes the firewall and the coin slot. The dashboard shows *Test ₱1/�
 
 Run the tests with `cargo test`. They cover the encryption-at-rest check,
 wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session
-binding, lockout, rate math, ARP parsing and the firewall rules.
+binding, lockout, rate math, ARP parsing, the firewall rules, Piso Pass
+transfers and wallet passes (JWT claims, .pkpass manifest and signature,
+single-use links).
+
+To try wallet passes locally, write a hub config whose `[wallet]` section
+points at the throwaway keys in `testdata/wallet/` and run
+`cargo run -- --dev hub --hub-config my-hub.toml run`. The passes it makes
+are signed with test keys, so real phones refuse them.
 
 ## Piso Pass: one payment, all your locations
 
@@ -170,6 +177,8 @@ branch in Barangay B.
   report. Paused time moves intact; running time keeps counting.
 - **If the hub is down**, every vendo keeps working on its own. Coins and
   vouchers work as usual, and passes resume syncing when the hub is back.
+- **Wallet passes.** Optionally, customers can add the pass to Google Wallet
+  or Apple Wallet (see [Wallet passes](#wallet-passes)).
 - **Security.** Vendos enrol with a single-use code and an Ed25519 key that
   never leaves the box. Requests are signed over the method, path, time,
   nonce and body hash; stale (±5 min) or replayed requests are refused.
@@ -204,6 +213,147 @@ branch in Barangay B.
 
 To see every vendo, its last sync and the passes it holds, run `pisowifi hub vendos` on the hub. `hub remove-vendo --id …` retires a box and returns its customers' time to their passes.
 
+## Wallet passes
+
+Customers can keep their Piso Pass in **Google Wallet** (Android, Samsung
+included) or **Apple Wallet** (iPhone), next to their cards, and use it at any
+of your locations.
+
+> **Not verified yet.** This follows Google's and Apple's published formats and
+> is tested with throwaway keys: the JWT's claims and RS256 signature, the
+> .pkpass manifest hashes, its CMS signature (also checked with
+> `openssl smime -verify`) and the one-time links. It has **not** been tried
+> with a real Google issuer account or Apple pass certificate, or on a real
+> phone. Add a pass to your own phone before telling customers about it. See
+> [what isn't verified](#what-isnt-verified-yet) below.
+
+How it works:
+
+- After paying, the Piso Pass sheet shows **Add to Apple Wallet** on iPhones
+  and **Add to Google Wallet** on Android, or both on other devices. Buttons
+  only appear for wallets the hub has set up.
+- The vendo asks the hub (a signed request). The hub checks the code, builds
+  and signs the pass, and returns a link that works **once, for 10 minutes**.
+  The phone downloads the pass from the hub over the internet, so the
+  customer's time must be running. Links never contain the code.
+- The pass shows the code as a QR code and as text. Its **Use my time** link
+  opens `http://10.0.0.1/?pass=CODE`: on any of your vendos' WiFi, that saves
+  the pass on the phone and claims its time. The pass doesn't show the
+  balance, which changes every second.
+- The Google key and Apple certificate live **only on the hub**. Vendos never
+  see them. On the hub, systemd hands them over with `LoadCredential`, so the
+  files can stay readable by root only.
+
+Both wallets are configured in the `[wallet]` section of `hub.toml` (see
+`hub.example.toml`). Each one turns on only when all of its lines are set, and
+the hub checks every key and certificate when it starts.
+
+### Google Wallet (free)
+
+1. **Become an issuer.** Sign in to the [Google Pay & Wallet Console](https://pay.google.com/business/console)
+   with your business Google account, open **Google Wallet API** and complete
+   the business profile. Note your **Issuer ID** (a long number).
+2. **Turn on the API.** In the [Google Cloud console](https://console.cloud.google.com/),
+   create a project and enable the **Google Wallet API**.
+3. **Make a service account.** In Cloud console → **IAM & Admin → Service
+   accounts**, create one (it needs no roles), then **Keys → Add key → JSON**.
+   This downloads a key file. Keep it secret: it can issue passes in your name.
+4. **Let it issue passes.** Back in the Pay & Wallet Console → **Users**,
+   invite the service account's email (`…@….iam.gserviceaccount.com`) with
+   **Developer** access.
+5. **Give the key to the hub:**
+
+   ```bash
+   sudo install -D -m 0600 key.json /etc/pisowifi/wallet/google-service-account.json
+   ```
+
+   In `/etc/pisowifi/hub.toml`, uncomment `[wallet]`, `google_issuer_id`,
+   `google_service_account_json` and, to show your logo, `public_url`. In
+   `/etc/systemd/system/pisowifi-hub.service`, uncomment the `google-wallet.json`
+   `LoadCredential` line. Then restart:
+
+   ```bash
+   sudo systemctl daemon-reload && sudo systemctl restart pisowifi-hub && journalctl -u pisowifi-hub -n 5
+   ```
+
+   The log should say `Google Wallet on`.
+6. **Try it, then go live.** New issuer accounts start in demo mode, where only
+   you and test accounts you add can save passes. Once a pass works on your own
+   phone, use **Request publishing access** in the console. The pass class
+   (`<issuer id>.piso_pass`) is created automatically the first time a pass is saved.
+
+### Apple Wallet (US$99 a year)
+
+1. **Join the [Apple Developer Program](https://developer.apple.com/programs/).**
+   Your **Team ID** is under *Membership details*.
+2. **Register a Pass Type ID.** In *Certificates, Identifiers & Profiles* →
+   **Identifiers → +** → **Pass Type IDs**, e.g. `pass.ph.yourstore.pisopass`.
+3. **Make a key and signing request** on any computer with OpenSSL:
+
+   ```bash
+   openssl req -new -newkey rsa:2048 -nodes -keyout pass-key.pem -out pass.csr -subj "/CN=Piso Pass"
+   ```
+
+4. **Get the certificate.** *Certificates → +* → **Pass Type ID Certificate**,
+   pick your pass type ID, upload `pass.csr`, download `pass.cer`, then:
+
+   ```bash
+   openssl x509 -inform der -in pass.cer -out pass-cert.pem
+   ```
+
+   Made the request in Keychain Access instead? Export the certificate with
+   its key as `Certificates.p12`, then split it (OpenSSL 3 may need `-legacy`):
+
+   ```bash
+   openssl pkcs12 -in Certificates.p12 -clcerts -nokeys -out pass-cert.pem && openssl pkcs12 -in Certificates.p12 -nocerts -nodes -out pass-key.pem
+   ```
+
+5. **Get Apple's intermediate certificate.** From
+   [Apple PKI](https://www.apple.com/certificateauthority/), download the
+   *Worldwide Developer Relations* certificate that issued yours (currently
+   **G4**), then `openssl x509 -inform der -in AppleWWDRCAG4.cer -out wwdr.pem`.
+   The hub refuses to start with the wrong one and says so.
+6. **Give them to the hub:**
+
+   ```bash
+   sudo install -D -m 0600 -t /etc/pisowifi/wallet/ pass-cert.pem pass-key.pem wwdr.pem
+   ```
+
+   Set the `apple_*` lines in `hub.toml`, uncomment the three Apple
+   `LoadCredential` lines in the service file, and restart as above. The log
+   should say `Apple Wallet on`. Add up to 10 `[[wallet.locations]]` so iPhones
+   can suggest the pass near your vendos (depending on the iOS version).
+7. **Renew yearly.** The pass certificate lasts one year. The hub warns 30 days
+   before it expires. If it lapses, Apple Wallet turns off (the hub and Piso
+   Pass keep running) until you repeat steps 3 to 6. Passes customers already
+   added stay in their wallets.
+
+### Samsung Wallet (later)
+
+Samsung phones run Android, so they already get **Add to Google Wallet**
+(Google Wallet is preinstalled on most of them, or free from the Play Store).
+Samsung's own Samsung Wallet needs a partner account that Samsung approves,
+with its own card templates and keys, so it isn't built yet. When you have
+that approval, it can plug into the same `/v1/wallet` hub endpoint as a third
+wallet.
+
+### What isn't verified yet
+
+- **The real services.** Without a Google issuer account and an Apple pass
+  certificate, it's untested whether Google accepts the save link (the JWT
+  creates the pass class itself, and the *Use my time* link is plain `http://`)
+  and whether iPhones accept the .pkpass. The menu names in the steps above
+  may also have changed.
+- **Real phones.** The captive-portal pop-up browsers on iOS and Android may
+  not open a .pkpass download or Google's save page. If the buttons do nothing
+  there, customers need to open `10.0.0.1` in Safari or Chrome. Also untested:
+  whether wallet apps open the `http://10.0.0.1` link in the browser.
+- **Hub deployment.** The systemd `LoadCredential` setup hasn't been tried on a
+  real server.
+- **Badges.** Apple's and Google's brand guidelines ask for their official
+  *Add to Wallet* badges. The buttons here match the portal's style. Swap in
+  the official artwork before a wide launch.
+
 ## Roadmap (the LPB feature list)
 
 | Feature | Plan |
@@ -220,8 +370,10 @@ To see every vendo, its last sync and the passes it holds, run `pisowifi hub ven
 
 | Path | What's there |
 |---|---|
-| `src/` | Rust daemon: engine, firewall, gpio, db, auth, portal, admin |
+| `src/` | Rust daemon: engine, firewall, gpio, db, auth, portal, admin, hub, wallet |
 | `web/portal/` | Customer UI (compiled into the binary) |
 | `web/admin/` | Owner dashboard (compiled into the binary) |
+| `web/wallet/` | Wallet pass images (drawn from `web/shared/icon.svg`) |
+| `testdata/wallet/` | Throwaway keys and certificates for the wallet tests |
 | `deploy/` | install/uninstall scripts, systemd unit, dnsmasq config, sample config |
 | `scripts/build-pi.sh` | Cross-compile and bundle for the Orange Pi |

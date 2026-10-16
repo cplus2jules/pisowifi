@@ -30,6 +30,8 @@ pub struct HubStatus {
     pub last_sync: Option<i64>,
     pub last_error: Option<String>,
     pub passes_here: usize,
+    /// Wallet passes the hub can make, as of the last sync.
+    pub wallet: WalletSupport,
 }
 
 #[derive(Debug)]
@@ -171,12 +173,24 @@ impl HubClient {
 
     pub async fn sync(self: &Arc<Self>, req: SyncReq) -> Result<SyncResp, HubError> {
         let n = req.leases.len();
-        let r = self.blocking(move |c| c.call("/v1/sync", &req)).await;
-        if r.is_ok() {
+        let r: Result<SyncResp, HubError> = self.blocking(move |c| c.call("/v1/sync", &req)).await;
+        if let Ok(resp) = &r {
             let mut st = self.status.lock().unwrap();
             st.last_sync = Some(crate::db::now());
             st.passes_here = n;
+            st.wallet = resp.wallet;
         }
         r
+    }
+
+    /// A single-use link on the hub for adding a pass to Google/Apple Wallet.
+    pub async fn wallet(self: &Arc<Self>, code: String, kind: WalletKind) -> Result<String, HubError> {
+        let r: WalletResp = self.blocking(move |c| c.call("/v1/wallet", &WalletReq { code, kind })).await?;
+        // Only ever send the customer to a path on our own hub (no "@host" tricks).
+        let ok = r.path.starts_with("/v1/wallet/") && r.path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+        if !ok {
+            return Err(HubError::Rejected("unexpected wallet link".into()));
+        }
+        Ok(format!("{}{}", self.url, r.path))
     }
 }

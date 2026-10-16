@@ -8,3 +8,34 @@ data_dir = "/var/lib/pisowifi-hub"
 # listen = "0.0.0.0:443"
 # tls_cert = "/etc/letsencrypt/live/hub.example.com/fullchain.pem"
 # tls_key  = "/etc/letsencrypt/live/hub.example.com/privkey.pem"
+
+# ---- Wallet passes (optional) --------------------------------------------------
+# "Add to Google Wallet" / "Add to Apple Wallet" buttons for Piso Passes.
+# Off unless configured; each wallet is on only when all of its lines are set.
+# Setup steps: README → Wallet passes. Keys are handed to the hub with systemd
+# LoadCredential (see pisowifi-hub.service), so they stay readable by root only.
+#
+# [wallet]
+# brand_name = "Juan's WiFi"                # shown on the pass
+# background = "#5A43E6"                    # pass colours
+# foreground = "#FFFFFF"
+# label      = "#D4F04C"
+# portal_url = "http://10.0.0.1"            # where "Use my time" points (your vendos' portal)
+# public_url = "https://hub.yourstore.ph"   # this hub; lets Google show your logo
+#
+# Google Wallet (works on Android, including Samsung phones):
+# google_issuer_id = "3388000000012345678"
+# google_service_account_json = "/run/credentials/pisowifi-hub.service/google-wallet.json"
+#
+# Apple Wallet (iPhone; needs the US$99/yr Apple Developer Program):
+# apple_pass_type_id = "pass.ph.yourstore.pisopass"
+# apple_team_id      = "ABCDE12345"
+# apple_cert_pem     = "/run/credentials/pisowifi-hub.service/pass-cert.pem"
+# apple_key_pem      = "/run/credentials/pisowifi-hub.service/pass-key.pem"
+# apple_wwdr_pem     = "/run/credentials/pisowifi-hub.service/wwdr.pem"
+#
+# Up to 10 vendos; iPhones suggest the pass on the lock screen nearby.
+# [[wallet.locations]]
+# name = "Barangay A"
+# latitude = 14.5995
+# longitude = 120.9842

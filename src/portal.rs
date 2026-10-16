@@ -2,6 +2,7 @@
 
 use crate::app::{self, asset, ApiError, ApiResult, Shared};
 use crate::engine::{CoinStart, MeView};
+use crate::hub::proto::{WalletKind, WalletSupport};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware::{from_fn, from_fn_with_state};
@@ -22,6 +23,7 @@ pub fn router(st: Shared) -> Router {
         .route("/voucher", post(voucher))
         .route("/pass/claim", post(pass_claim))
         .route("/pass/save", post(pass_save))
+        .route("/pass/wallet", post(pass_wallet))
         .layer(from_fn(app::portal_csrf_guard));
     Router::new()
         .route("/", get(|| async {
@@ -71,6 +73,8 @@ struct PassInfo {
     enabled: bool,
     /// This phone's time here belongs to a pass.
     linked: bool,
+    /// "Add to Google/Apple Wallet" buttons the hub supports.
+    wallet: WalletSupport,
 }
 
 #[derive(Serialize)]
@@ -83,7 +87,11 @@ struct MeResponse {
 
 async fn me(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<MeResponse>> {
     let (mac, ip) = st.identify(addr)?;
-    let pass = PassInfo { enabled: st.hub.is_some(), linked: st.engine.pass_of(mac).is_some() };
+    let pass = PassInfo {
+        enabled: st.hub.is_some(),
+        linked: st.engine.pass_of(mac).is_some(),
+        wallet: st.hub.as_ref().map(|h| h.status().wallet).unwrap_or_default(),
+    };
     Ok(Json(MeResponse { brand: st.brand.get(), pass, me: st.engine.me(mac, ip) }))
 }
 
@@ -172,6 +180,44 @@ async fn pass_claim(
         Err(e) => {
             tracing::warn!("pass claim: {e}");
             Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Piso Pass is offline right now. Try again in a minute."))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WalletReq {
+    code: String,
+    kind: WalletKind,
+}
+
+/// "Add to Google/Apple Wallet": the hub builds the pass and returns a
+/// one-time link the phone opens directly (customers are online once they've paid).
+async fn pass_wallet(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<WalletReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (mac, _) = st.identify(addr)?;
+    let Some(hub) = st.hub.clone() else {
+        return Err(ApiError::bad("Piso Pass isn't set up at this location."));
+    };
+    if !hub.status().wallet.has(req.kind) {
+        return Err(ApiError::bad("Adding to your wallet isn't available here yet."));
+    }
+    st.engine.code_attempt_allowed(mac).map_err(ApiError::bad)?;
+    if crate::hub::normalize_code(&req.code).len() != 16 {
+        st.engine.record_code_fail(mac);
+        return Err(ApiError::bad("That Piso Pass code isn't valid."));
+    }
+    match hub.wallet(req.code, req.kind).await {
+        Ok(url) => Ok(Json(json!({ "ok": true, "url": url }))),
+        Err(crate::hubclient::HubError::NotFound) => {
+            st.engine.record_code_fail(mac);
+            Err(ApiError::bad("That Piso Pass code isn't valid."))
+        }
+        Err(e) => {
+            tracing::warn!("wallet pass: {e}");
+            Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "Couldn't make your wallet pass right now. Try again in a minute."))
         }
     }
 }

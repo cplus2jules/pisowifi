@@ -20,11 +20,12 @@
 use crate::app::ApiError;
 use crate::db::apply_key;
 use crate::keys::{read_or_create_secret, DbKey};
+use crate::wallet::Wallet;
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxPath, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -97,6 +98,39 @@ pub mod proto {
         pub revoked: Vec<String>,
         /// Credit ids stored; the vendo can forget them.
         pub acked: Vec<i64>,
+        /// Wallet passes the hub can make (absent from older hubs).
+        #[serde(default)]
+        pub wallet: WalletSupport,
+    }
+    #[derive(Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq, Eq)]
+    pub struct WalletSupport {
+        pub google: bool,
+        pub apple: bool,
+    }
+    impl WalletSupport {
+        pub fn has(&self, kind: WalletKind) -> bool {
+            match kind {
+                WalletKind::Google => self.google,
+                WalletKind::Apple => self.apple,
+            }
+        }
+    }
+    #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum WalletKind {
+        Google,
+        Apple,
+    }
+    #[derive(Serialize, Deserialize)]
+    pub struct WalletReq {
+        pub code: String,
+        pub kind: WalletKind,
+    }
+    #[derive(Serialize, Deserialize)]
+    pub struct WalletResp {
+        /// Download path on the hub, single use.
+        pub path: String,
+        pub expires_in: i64,
     }
 }
 use proto::*;
@@ -133,6 +167,9 @@ pub struct HubConfig {
     pub tls_cert: Option<PathBuf>,
     #[serde(default)]
     pub tls_key: Option<PathBuf>,
+    /// "Add to Google/Apple Wallet" (optional; off when left out).
+    #[serde(default)]
+    pub wallet: Option<crate::wallet::WalletConfig>,
 }
 
 impl HubConfig {
@@ -141,7 +178,7 @@ impl HubConfig {
         Ok(toml::from_str(&raw).context("parsing hub config")?)
     }
     pub fn dev(data_dir: PathBuf) -> HubConfig {
-        HubConfig { listen: "127.0.0.1:8700".parse().unwrap(), data_dir, tls_cert: None, tls_key: None }
+        HubConfig { listen: "127.0.0.1:8700".parse().unwrap(), data_dir, tls_cert: None, tls_key: None, wallet: None }
     }
 }
 
@@ -376,6 +413,21 @@ impl HubDb {
         Ok(Some(ClaimResp { pass_id: id, secs: total as u64 }))
     }
 
+    /// The pass a code belongs to (for a wallet pass), noted in the event log.
+    pub fn wallet_pass(&self, vendo: &str, code: &str, kind: WalletKind) -> Result<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let id: Option<String> =
+            c.query_row("SELECT id FROM passes WHERE code_hash = ?1", [self.code_hash(code)], |r| r.get(0)).optional()?;
+        if let Some(id) = &id {
+            let action = match kind {
+                WalletKind::Google => "wallet_google",
+                WalletKind::Apple => "wallet_apple",
+            };
+            Self::event(&c, Some(vendo), Some(id), action, 0);
+        }
+        Ok(id)
+    }
+
     pub fn sync(&self, vendo: &str, req: &SyncReq) -> Result<SyncResp> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
@@ -430,8 +482,18 @@ impl HubDb {
 
 pub struct HubState {
     pub db: HubDb,
+    pub wallet: Option<Wallet>,
     nonces: Mutex<HashMap<String, i64>>,
     enroll_fails: Mutex<HashMap<IpAddr, (u32, i64)>>,
+}
+
+impl HubState {
+    pub fn new(db: HubDb, wallet: Option<Wallet>) -> HubState {
+        HubState { db, wallet, nonces: Mutex::new(HashMap::new()), enroll_fails: Mutex::new(HashMap::new()) }
+    }
+    fn wallet_support(&self) -> WalletSupport {
+        self.wallet.as_ref().map(Wallet::support).unwrap_or_default()
+    }
 }
 
 type Shared = Arc<HubState>;
@@ -443,6 +505,10 @@ pub fn router(st: Shared) -> Router {
         .route("/v1/passes", post(create_pass))
         .route("/v1/claim", post(claim))
         .route("/v1/sync", post(sync))
+        .route("/v1/wallet", post(wallet_issue))
+        .route("/v1/wallet/apple/{file}", get(wallet_apple).head(wallet_apple_head))
+        .route("/v1/wallet/google/{token}", get(wallet_google).head(wallet_google_head))
+        .route("/v1/wallet/logo.png", get(wallet_logo))
         .layer(axum::middleware::from_fn(crate::server::security_headers))
         .layer(DefaultBodyLimit::max(512 * 1024))
         .with_state(st)
@@ -564,16 +630,115 @@ async fn sync(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Resp
         Err(e) => return e,
     };
     match st.db.sync(&vendo, &req) {
-        Ok(r) => Json(r).into_response(),
+        Ok(mut r) => {
+            r.wallet = st.wallet_support();
+            Json(r).into_response()
+        }
         Err(e) => internal(e),
     }
+}
+
+// ---- wallet passes ------------------------------------------------------------
+
+/// A vendo asks for a wallet pass on behalf of a customer: returns a
+/// single-use download path the customer's phone opens directly.
+async fn wallet_issue(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let vendo = match authenticate(&st, "POST", "/v1/wallet", &headers, &body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let req: WalletReq = match parse(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let Some(wallet) = st.wallet.as_ref().filter(|w| w.support().has(req.kind)) else {
+        return hub_err(StatusCode::NOT_IMPLEMENTED, "this wallet isn't set up on the hub");
+    };
+    if normalize_code(&req.code).len() != 16 {
+        return hub_err(StatusCode::NOT_FOUND, "unknown pass");
+    }
+    let pass_id = match st.db.wallet_pass(&vendo, &req.code, req.kind) {
+        Ok(Some(id)) => id,
+        Ok(None) => return hub_err(StatusCode::NOT_FOUND, "unknown pass"),
+        Err(e) => return internal(e),
+    };
+    match wallet.issue(req.kind, &pass_id, &req.code, now()) {
+        Ok(token) => {
+            let path = match req.kind {
+                WalletKind::Apple => format!("/v1/wallet/apple/{token}.pkpass"),
+                WalletKind::Google => format!("/v1/wallet/google/{token}"),
+            };
+            Json(WalletResp { path, expires_in: crate::wallet::TOKEN_TTL_SECS }).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+fn wallet_gone() -> Response {
+    (
+        StatusCode::GONE,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "This link has expired or was already used. Go back to the WiFi page and tap Add to Wallet again.",
+    )
+        .into_response()
+}
+
+async fn wallet_apple(State(st): State<Shared>, AxPath(file): AxPath<String>) -> Response {
+    let pass = file.strip_suffix(".pkpass").and_then(|t| st.wallet.as_ref()?.take(WalletKind::Apple, t, now()));
+    match pass {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/vnd.apple.pkpass"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"piso-pass.pkpass\""),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes.to_vec(),
+        )
+            .into_response(),
+        None => wallet_gone(),
+    }
+}
+
+async fn wallet_apple_head(State(st): State<Shared>, AxPath(file): AxPath<String>) -> Response {
+    match file.strip_suffix(".pkpass").filter(|t| st.wallet.as_ref().is_some_and(|w| w.is_waiting(WalletKind::Apple, t, now()))) {
+        Some(_) => ([(header::CONTENT_TYPE, "application/vnd.apple.pkpass"), (header::CACHE_CONTROL, "no-store")]).into_response(),
+        None => wallet_gone(),
+    }
+}
+
+async fn wallet_google(State(st): State<Shared>, AxPath(token): AxPath<String>) -> Response {
+    let url = st.wallet.as_ref().and_then(|w| w.take(WalletKind::Google, &token, now()));
+    match url.and_then(|u| String::from_utf8(u.to_vec()).ok()) {
+        Some(url) => Redirect::to(&url).into_response(),
+        None => wallet_gone(),
+    }
+}
+
+async fn wallet_google_head(State(st): State<Shared>, AxPath(token): AxPath<String>) -> Response {
+    if st.wallet.as_ref().is_some_and(|w| w.is_waiting(WalletKind::Google, &token, now())) {
+        StatusCode::OK.into_response()
+    } else {
+        wallet_gone()
+    }
+}
+
+async fn wallet_logo() -> Response {
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], crate::wallet::GOOGLE_LOGO).into_response()
 }
 
 pub async fn run(cfg: HubConfig) -> Result<()> {
     let db = HubDb::open(&cfg.data_dir)?;
     let (passes, held, today) = db.summary()?;
     tracing::info!("hub: {passes} passes, {} h of time held, ₱{today} in the last 24 h", held / 3600);
-    let state = Arc::new(HubState { db, nonces: Mutex::new(HashMap::new()), enroll_fails: Mutex::new(HashMap::new()) });
+    let wallet = match cfg.wallet {
+        Some(w) => Some(Wallet::load(w, now())?),
+        None => None,
+    };
+    if let Some(s) = wallet.as_ref().map(Wallet::support) {
+        let on = |b: bool| if b { "on" } else { "off" };
+        tracing::info!("wallet passes: Google Wallet {}, Apple Wallet {}", on(s.google), on(s.apple));
+    }
+    let state = Arc::new(HubState::new(db, wallet));
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Some(crate::tls::from_files(c, k)?),
         (None, None) => None,
@@ -635,6 +800,85 @@ mod tests {
         assert_eq!(lease_value(600, true, Some(1000), 1100), 500);
         assert_eq!(lease_value(600, false, Some(1000), 1100), 600);
         assert_eq!(lease_value(60, true, Some(1000), 5000), 0);
+    }
+
+    #[tokio::test]
+    async fn wallet_links_are_signed_for_and_work_once() {
+        use axum::body::{to_bytes, Body};
+        use ed25519_dalek::Signer;
+        use tower::ServiceExt;
+
+        let (dir, db) = hub();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let enroll = db.add_enroll_code("A").unwrap();
+        let vendo = db.enroll(&enroll, key.verifying_key().as_bytes()).unwrap().unwrap().vendo_id;
+        let pass = db.create_pass(&vendo).unwrap();
+        let app = router(Arc::new(HubState::new(db, Some(crate::wallet::tests::test_wallet()))));
+
+        let signed = |path: &str, body: serde_json::Value| {
+            let body = serde_json::to_vec(&body).unwrap();
+            let (ts, nonce) = (now(), hex::encode(rand::random::<[u8; 16]>()));
+            let sig = key.sign(&signing_message("POST", path, &vendo, ts, &nonce, &body));
+            http::Request::post(path)
+                .header("x-vendo-id", &vendo)
+                .header("x-ts", ts.to_string())
+                .header("x-nonce", nonce)
+                .header("x-sig", hex::encode(sig.to_bytes()))
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let get = |method: &str, path: &str| http::Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+
+        // Sync tells vendos which buttons to show.
+        let r = app.clone().oneshot(signed("/v1/sync", serde_json::json!({ "leases": [], "credits": [] }))).await.unwrap();
+        let sync: SyncResp = serde_json::from_slice(&to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(sync.wallet, WalletSupport { google: true, apple: true });
+
+        // Unsigned or unknown codes get nothing.
+        let mut unsigned = signed("/v1/wallet", serde_json::json!({ "code": pass.code, "kind": "apple" }));
+        unsigned.headers_mut().remove("x-sig");
+        assert_eq!(app.clone().oneshot(unsigned).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        let r = app.clone().oneshot(signed("/v1/wallet", serde_json::json!({ "code": "PASS-AAAA-BBBB-CCCC-DDDD", "kind": "apple" })));
+        assert_eq!(r.await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        // Apple: a .pkpass, once. HEAD (link previews) doesn't use the link up.
+        let r = app.clone().oneshot(signed("/v1/wallet", serde_json::json!({ "code": pass.code, "kind": "apple" }))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let w: WalletResp = serde_json::from_slice(&to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert!(w.path.starts_with("/v1/wallet/apple/") && w.path.ends_with(".pkpass"));
+        assert!(!w.path.contains(&normalize_code(&pass.code)[..4]), "no code in the link");
+        assert_eq!(w.expires_in, 600);
+        assert_eq!(app.clone().oneshot(get("HEAD", &w.path)).await.unwrap().status(), StatusCode::OK);
+        let r = app.clone().oneshot(get("GET", &w.path)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["content-type"], "application/vnd.apple.pkpass");
+        assert!(to_bytes(r.into_body(), 1 << 20).await.unwrap().starts_with(b"PK"), "zip file");
+        assert_eq!(app.clone().oneshot(get("GET", &w.path)).await.unwrap().status(), StatusCode::GONE);
+
+        // Google: a redirect to the save link, once.
+        let r = app.clone().oneshot(signed("/v1/wallet", serde_json::json!({ "code": pass.code, "kind": "google" }))).await.unwrap();
+        let w: WalletResp = serde_json::from_slice(&to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let r = app.clone().oneshot(get("GET", &w.path)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::SEE_OTHER);
+        assert!(r.headers()["location"].to_str().unwrap().starts_with("https://pay.google.com/gp/v/save/ey"));
+        assert_eq!(app.clone().oneshot(get("GET", &w.path)).await.unwrap().status(), StatusCode::GONE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn example_config_parses_with_and_without_wallet() {
+        let raw = include_str!("../deploy/hub.example.toml");
+        assert!(toml::from_str::<HubConfig>(raw).unwrap().wallet.is_none(), "wallet is off by default");
+        // Uncommenting the wallet section must give a valid config.
+        let (head, wallet) = raw.split_at(raw.find("# ---- Wallet passes").unwrap());
+        let on: Vec<&str> = wallet
+            .lines()
+            .map(|l| l.strip_prefix("# ").filter(|r| r.starts_with('[') || r.contains(" = ")).unwrap_or(l))
+            .collect();
+        let cfg: HubConfig = toml::from_str(&format!("{head}\n{}", on.join("\n"))).unwrap();
+        let w = cfg.wallet.unwrap();
+        assert!(w.google_issuer_id.is_some() && w.apple_wwdr_pem.is_some());
+        assert_eq!(w.locations.len(), 1);
     }
 
     #[test]

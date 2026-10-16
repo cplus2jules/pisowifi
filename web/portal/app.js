@@ -567,8 +567,11 @@ function forgetPass() {
   try { localStorage.removeItem(PASS_KEY); } catch (_) { /* ignore */ }
 }
 
+let sheetCode = null;   // pass shown in the sheet (works even if storage is off)
+
 function showPassSheet(code) {
   const nice = savePass(code);
+  sheetCode = nice;
   $("ps-code").textContent = nice;
   $("ps-brand").textContent = state.brand.name;
   $("pass-sheet").hidden = false;
@@ -589,6 +592,7 @@ $("pass-save").addEventListener("click", () =>
 
 function renderPass() {
   if (!state) return;
+  renderWallet();
   const enabled = state.pass.enabled;
   const code = storedPass();
   $("code-label").textContent = enabled ? "Have a voucher or Piso Pass?" : "Have a voucher code?";
@@ -606,9 +610,84 @@ function renderPass() {
   }
 }
 
+// ---- wallet passes ----------------------------------------------------------------
+
+const UA = navigator.userAgent;
+const IS_IOS = /iPhone|iPad|iPod/.test(UA) || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1);
+const IS_ANDROID = /Android/.test(UA);
+
+// Apple Wallet on iPhones, Google Wallet on Android (Samsung too); both when unsure.
+function walletKinds() {
+  const w = state.pass.wallet || {};
+  const kinds = [];
+  if (w.apple && !IS_ANDROID) kinds.push("apple");
+  if (w.google && !IS_IOS) kinds.push("google");
+  return kinds;
+}
+
+function renderWallet() {
+  const kinds = walletKinds();
+  $("ps-apple").hidden = !kinds.includes("apple");
+  $("ps-google").hidden = !kinds.includes("google");
+  $("ps-wallet").hidden = !kinds.length;
+  $("ps-text").textContent = "This pass is saved on this phone, so at any of our locations your time is waiting for you. "
+    + (kinds.length ? "Add it to your wallet so it's always with you." : "Take a screenshot too, just in case.");
+}
+
+// The hub builds the pass; its one-time link opens over the internet, so the
+// customer's time has to be running.
+function addToWallet(kind, btn) {
+  action(btn, async () => {
+    const left = state.running ? state.remaining_secs - elapsed() : 0;
+    if (!(left > 0)) throw new Error("Adding to your wallet needs internet. Start or resume your time first.");
+    const r = await api("/pass/wallet", { code: sheetCode || storedPass(), kind });
+    location.assign(r.url);
+  });
+}
+$("ps-apple").addEventListener("click", () => addToWallet("apple", $("ps-apple")));
+$("ps-google").addEventListener("click", () => addToWallet("google", $("ps-google")));
+
+// Opened from a wallet pass ("Use my time" → http://10.0.0.1/?pass=CODE):
+// keep the code on this phone, tidy the address bar, then claim it.
+let deepPass = null;
+(() => {
+  const q = new URLSearchParams(location.search);
+  const code = q.get("pass");
+  if (code === null) return;
+  q.delete("pass");
+  const rest = q.toString();
+  history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
+  const raw = code.toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^PASS/, "");
+  if (raw.length !== 16) return;
+  const nice = "PASS-" + raw.match(/.{4}/g).join("-");
+  const stored = storedPass();
+  if (!stored || stored === nice) savePass(nice);
+  else deepPass = nice; // a different pass: only replace the saved one if it claims
+})();
+
+// A different pass than the one saved here: claim it first, keep it if that works.
+async function claimDeepPass() {
+  const code = deepPass;
+  deepPass = null;
+  try {
+    const r = await api("/pass/claim", { code });
+    savePass(code);
+    toast(r.secs > 0 ? "Welcome back! " + human(r.secs) + " from your Piso Pass." : "Piso Pass linked to this phone.");
+    if (r.secs > 0) confetti($("meter"));
+    await refresh();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
 // At another location: bring this phone's saved pass along automatically.
 async function maybeClaimPass() {
-  if (passTried || !state.pass.enabled || state.pass.linked) return;
+  if (passTried || !state.pass.enabled) return;
+  if (deepPass) {
+    passTried = true;
+    return claimDeepPass();
+  }
+  if (state.pass.linked) return;
   passTried = true;
   const code = storedPass();
   if (!code) return;
