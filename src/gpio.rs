@@ -3,12 +3,76 @@
 //!
 //! On the H3 only the PA and PG banks can raise interrupts. A coin wire on
 //! any other header pin (PC, PD) is polled every millisecond instead.
+//!
+//! With `pulse_width_ms` set, a pulse only counts once it has ended and
+//! lasted that long: electrical noise and a wire held low don't add coins.
 
 use crate::config::Coin;
 use anyhow::Result;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// Checks each pulse's width (time from start to end).
+pub struct PulseFilter {
+    min: Duration,
+    max: Duration,
+    started: Option<Duration>,
+    rejected: u32,
+    last_warn: Option<Instant>,
+}
+
+pub enum Edge {
+    /// A pulse ended within the allowed widths: one count.
+    Pulse,
+    /// A pulse ended outside them, with its width.
+    Rejected(Duration),
+    None,
+}
+
+impl PulseFilter {
+    pub fn new([min_ms, max_ms]: [u64; 2]) -> Self {
+        PulseFilter {
+            min: Duration::from_millis(min_ms),
+            max: Duration::from_millis(max_ms),
+            started: None,
+            rejected: 0,
+            last_warn: None,
+        }
+    }
+
+    /// The line changed to `active` at `t` (any monotonic clock).
+    pub fn edge(&mut self, active: bool, t: Duration) -> Edge {
+        if active {
+            self.started = Some(t);
+            return Edge::None;
+        }
+        let Some(start) = self.started.take() else { return Edge::None };
+        let width = t.saturating_sub(start);
+        if (self.min..=self.max).contains(&width) {
+            Edge::Pulse
+        } else {
+            Edge::Rejected(width)
+        }
+    }
+
+    /// Logs rejected pulses without flooding the log when a line is noisy.
+    pub fn note_rejected(&mut self, width: Duration) {
+        self.rejected += 1;
+        if self.last_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            tracing::warn!(
+                "coin slot: ignored {} pulse(s) outside {}–{} ms (latest {} ms)",
+                self.rejected,
+                self.min.as_millis(),
+                self.max.as_millis(),
+                width.as_millis()
+            );
+            self.rejected = 0;
+            self.last_warn = Some(Instant::now());
+        }
+    }
+}
 
 /// Orange Pi One / PC 40-pin header: (physical pin, H3 pin name, line offset
 /// on gpiochip0). Only the pins usable as GPIO are listed.
@@ -32,10 +96,9 @@ pub fn describe_line(offset: u32) -> String {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
-    use gpiocdev::line::{Bias, EdgeDetection, Value};
+    use gpiocdev::line::{Bias, EdgeDetection, EdgeKind, Value};
     use gpiocdev::Request;
     use std::sync::atomic::Ordering;
-    use std::time::{Duration, Instant};
 
     /// Reads pulses forever. `ok` says whether the line is being read, so the
     /// portal can refuse coins (instead of losing them) while it isn't.
@@ -61,8 +124,10 @@ mod imp {
         b.on_chip(&cfg.chip).with_consumer("pisowifi-coin").with_line(cfg.line).as_input().with_bias(Bias::PullUp);
         if edges {
             // With active-low, "rising" means the acceptor started a pulse.
+            // Checking widths needs the end of each pulse too.
+            let detect = if cfg.pulse_width_ms.is_some() { EdgeDetection::BothEdges } else { EdgeDetection::RisingEdge };
             b.with_debounce_period(Duration::from_millis(cfg.debounce_ms))
-                .with_edge_detection(EdgeDetection::RisingEdge)
+                .with_edge_detection(detect)
                 .with_kernel_event_buffer_size(256);
         }
         if cfg.active_low {
@@ -84,9 +149,25 @@ mod imp {
         };
         tracing::info!("coin slot listening on {} {}", cfg.chip, describe_line(cfg.line));
         ok.store(true, Ordering::Relaxed);
+        let mut filter = cfg.pulse_width_ms.map(PulseFilter::new);
         loop {
-            req.read_edge_event()?;
-            if tx.send(()).is_err() {
+            let ev = req.read_edge_event()?;
+            let count = match &mut filter {
+                None => true,
+                Some(f) => {
+                    // Kernel timestamps: exact even if this thread was busy.
+                    let t = Duration::from_nanos(ev.timestamp_ns);
+                    match f.edge(ev.kind == EdgeKind::Rising, t) {
+                        Edge::Pulse => true,
+                        Edge::Rejected(w) => {
+                            f.note_rejected(w);
+                            false
+                        }
+                        Edge::None => false,
+                    }
+                }
+            };
+            if count && tx.send(()).is_err() {
                 return Ok(());
             }
         }
@@ -96,7 +177,9 @@ mod imp {
     fn poll_loop(cfg: &Coin, req: &Request, tx: &mpsc::UnboundedSender<()>, ok: &AtomicBool) -> Result<()> {
         let debounce = Duration::from_millis(cfg.debounce_ms);
         let mut stable = req.value(cfg.line)?;
-        let (mut seen, mut since) = (stable, Instant::now());
+        let start = Instant::now();
+        let (mut seen, mut since) = (stable, start);
+        let mut filter = cfg.pulse_width_ms.map(PulseFilter::new);
         tracing::info!("coin slot polling {} {}", cfg.chip, describe_line(cfg.line));
         ok.store(true, Ordering::Relaxed);
         loop {
@@ -107,7 +190,20 @@ mod imp {
                 (seen, since) = (v, now);
             } else if v != stable && now - since >= debounce {
                 stable = v;
-                if stable == Value::Active && tx.send(()).is_err() {
+                let active = stable == Value::Active;
+                let count = match &mut filter {
+                    None => active,
+                    // The change happened when the level first moved (`since`).
+                    Some(f) => match f.edge(active, since - start) {
+                        Edge::Pulse => true,
+                        Edge::Rejected(w) => {
+                            f.note_rejected(w);
+                            false
+                        }
+                        Edge::None => false,
+                    },
+                };
+                if count && tx.send(()).is_err() {
                     return Ok(());
                 }
             }
@@ -241,3 +337,30 @@ mod imp {
 }
 
 pub use imp::{probe, spawn_reader, Enable};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn only_pulses_of_the_right_width_count() {
+        let mut f = PulseFilter::new([15, 150]);
+        // A normal 50 ms pulse counts when it ends.
+        assert!(matches!(f.edge(true, ms(1000)), Edge::None));
+        assert!(matches!(f.edge(false, ms(1050)), Edge::Pulse));
+        // A 3 ms glitch and a wire held low for a second don't.
+        f.edge(true, ms(2000));
+        assert!(matches!(f.edge(false, ms(2003)), Edge::Rejected(w) if w == ms(3)));
+        f.edge(true, ms(3000));
+        assert!(matches!(f.edge(false, ms(4000)), Edge::Rejected(_)));
+        // An end with no start seen (e.g. the reader started mid-pulse) is ignored.
+        assert!(matches!(f.edge(false, ms(5000)), Edge::None));
+        // Both limits are inclusive.
+        f.edge(true, ms(6000));
+        assert!(matches!(f.edge(false, ms(6150)), Edge::Pulse));
+    }
+}

@@ -469,8 +469,8 @@ mod tests {
         let code = h.st.db.add_enroll_code(name).unwrap();
         let (db2, dir2, url) = (db.clone(), dir.clone(), h.url.clone());
         tokio::task::spawn_blocking(move || join(&db2, &dir2, &url, &code, true)).await.unwrap().unwrap();
-        let fw = crate::firewall::Firewall::start(&crate::config::Config::dev(dir.clone()), true).await.unwrap();
-        let engine = Engine::new(db.clone(), fw, None, 1, 60, Arc::new(AtomicBool::new(true))).unwrap();
+        let (fw, _) = crate::firewall::Firewall::new(&crate::config::Config::dev(dir.clone()), true);
+        let engine = Engine::new(db.clone(), fw, None, 1, 60, Arc::new(AtomicBool::new(true)), None).unwrap();
         let hub = HubClient::load(&db, &dir).unwrap().unwrap();
         Vendo { dir, db, engine, hub }
     }
@@ -520,7 +520,7 @@ mod tests {
         let (bought, r) = a.pay(mac, 5, None).await;
         let AfterPurchase::NewPass(code) = r else { panic!("{r:?}") };
         let pass_id = a.engine.pass_of(mac).unwrap();
-        assert!(a.engine.pause(mac));
+        assert!(a.engine.pause(mac, IP));
         a.hub.sync_once(&a.engine).await.unwrap();
         let (vendo, secs) = hub_lease(&h, &pass_id);
         assert!(vendo == Some(a.hub.status().vendo_id) && bought.abs_diff(secs as u64) <= 1);
@@ -549,7 +549,7 @@ mod tests {
         let (_, r) = a.pay(mac, 5, None).await;
         let AfterPurchase::NewPass(code) = r else { panic!("{r:?}") };
         let pass_id = a.engine.pass_of(mac).unwrap();
-        assert!(a.engine.pause(mac));
+        assert!(a.engine.pause(mac, IP));
         a.hub.sync_once(&a.engine).await.unwrap();
         let held = a.left(mac).0;
         let passes = |h: &TestHub| h.st.db.summary().unwrap().0;
@@ -613,7 +613,7 @@ mod tests {
         let a = vendo(&h, "Branch A").await;
         let mac = Mac::parse(PHONE).unwrap();
         a.pay(mac, 5, None).await;
-        assert!(a.engine.pause(mac));
+        assert!(a.engine.pause(mac, IP));
         let offline = a.cut_off();
         assert!(matches!(offline.resume(&a.engine, mac, IP).await, Resume::NeedsHub));
         assert!(!a.left(mac).1);

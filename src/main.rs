@@ -60,6 +60,11 @@ enum Cmd {
     },
     /// Show the dashboard URL and TLS certificate fingerprint
     AdminInfo,
+    /// Let a device open the dashboard (adds it to [admin] allow_macs; restart to apply)
+    AllowMac {
+        /// The device's WiFi MAC address, e.g. a4:5e:60:11:22:33
+        mac: String,
+    },
     /// Print the nftables ruleset this config would install
     PrintFirewall,
     /// Write a passphrase-encrypted backup of the database
@@ -132,6 +137,18 @@ fn main() -> Result<()> {
         };
         return run_hub(cfg, cmd);
     }
+    if let Cmd::AllowMac { mac } = &cli.cmd {
+        if cli.dev {
+            bail!("allow-mac edits the vendo's config file; dev mode doesn't use one");
+        }
+        let mac = net::Mac::parse(mac).context("that isn't a WiFi (MAC) address like a4:5e:60:11:22:33")?;
+        if config::add_admin_mac(&cli.config, mac)? {
+            println!("{mac} can open the dashboard once the service restarts:\n  sudo systemctl restart pisowifi");
+        } else {
+            println!("{mac} is already allowed. Still locked out? Check the address on the locked page matches.");
+        }
+        return Ok(());
+    }
     let cfg = if cli.dev {
         let n = cli.instance;
         let dir = if n == 0 { "dev-data".to_string() } else { format!("dev-data-{n}") };
@@ -181,7 +198,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::PrintFirewall => {
-            print!("{}", firewall::base_ruleset(&cfg)?);
+            print!("{}", firewall::base_ruleset(&cfg, &[])?);
             Ok(())
         }
         Cmd::Backup { out } => {
@@ -205,7 +222,7 @@ fn main() -> Result<()> {
             println!("Left the hub. Restart the service. Phones keep the time they have here; it just stops being a Piso Pass.");
             Ok(())
         }
-        Cmd::Hub { .. } => unreachable!(),
+        Cmd::Hub { .. } | Cmd::AllowMac { .. } => unreachable!(),
         Cmd::Restore { from } => {
             let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
             let k = keys::derive(&cfg.storage.data_dir, source, false)?;
@@ -338,7 +355,7 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let admin_l = listen(cfg.admin.listen)?;
     let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let enable = gpio::Enable::open(&cfg.coin)?.map(|e| (e, cfg.coin.enable_line.unwrap()));
-    let fw = firewall::Firewall::start(&cfg, dev).await?;
+    let (fw, fw_start) = firewall::Firewall::new(&cfg, dev);
     // Pass links from another hub enrolment (join-hub, leave-hub) are dropped
     // before the engine loads them.
     if db.reset_pass_state_if_hub_changed(db.get_setting("hub_vendo_id")?.as_deref())? {
@@ -353,7 +370,13 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         cfg.coin.pesos_per_pulse,
         cfg.coin.insert_window_secs,
         reader_ok.clone(),
+        (!dev).then(|| cfg.network.dhcp_leases.clone()),
     )?;
+    // Base ruleset and every restored customer in one transaction.
+    let db2 = db.clone();
+    fw_start
+        .start(&engine.grants(), move |what| db2.audit("system", "firewall_restored", what))
+        .await?;
 
     // Coin pulses -> engine.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -376,7 +399,18 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         }
     });
 
-    // Clock: expire sessions every second, save to disk every 30 s.
+    // Firewall: every minute, check nothing else flushed or changed it.
+    let e = engine.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // (fires at once; it was just installed)
+        loop {
+            tick.tick().await;
+            e.reconcile_firewall();
+        }
+    });
+
+    // Clock: expire sessions every second, checkpoint running clocks every 30 s.
     let e = engine.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -443,14 +477,25 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         portal::router(state.clone()),
         None,
         server::Limits { max_conns: cfg.portal.max_connections, per_ip: 24, request_timeout: Duration::from_secs(20) },
+        None,
         stop_rx.clone(),
     ));
+    // Devices not on admin.allow_macs are turned away before TLS, from a
+    // pool of their own, so customers can't use up the owner's connections.
+    let gate = (!state.admin_macs.is_empty()).then(|| {
+        let st = state.clone();
+        server::Gate {
+            allow: Box::new(move |addr| st.identify(addr).is_ok_and(|(mac, _)| st.admin_macs.contains(&mac))),
+            locked: admin::locked_router(state.clone()),
+        }
+    });
     let a = tokio::spawn(server::serve(
         admin_l,
         admin::router(state.clone()),
         admin_tls.map(|t| t.acceptor),
         // Uploads (logo, poster) get longer.
         server::Limits { max_conns: 32, per_ip: 8, request_timeout: Duration::from_secs(60) },
+        gate,
         stop_rx,
     ));
 

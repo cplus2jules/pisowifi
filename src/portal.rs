@@ -249,8 +249,8 @@ async fn pass_save(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Sock
 }
 
 async fn pause(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<serde_json::Value>> {
-    let (mac, _) = st.identify(addr)?;
-    if !st.engine.pause(mac) {
+    let (mac, ip) = st.identify(addr)?;
+    if !st.engine.pause(mac, ip) {
         return Err(ApiError::bad("Nothing to pause"));
     }
     Ok(Json(json!({ "ok": true })))

@@ -1090,6 +1090,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "tower",
  "tracing",
  "tracing-subscriber",

@@ -889,7 +889,7 @@ pub async fn run(cfg: HubConfig) -> Result<()> {
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     // Behind Caddy every connection comes from 127.0.0.1, so no per-address cap.
     let limits = crate::server::Limits { max_conns: 1024, per_ip: 1024, request_timeout: std::time::Duration::from_secs(30) };
-    let srv = tokio::spawn(crate::server::serve(listener, router(state), tls, limits, stop_rx));
+    let srv = tokio::spawn(crate::server::serve(listener, router(state), tls, limits, None, stop_rx));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = srv => {},
@@ -930,7 +930,7 @@ pub(crate) mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let limits = crate::server::Limits { max_conns: 64, per_ip: 64, request_timeout: std::time::Duration::from_secs(30) };
-        tokio::spawn(crate::server::serve(listener, router(st.clone()), None, limits, rx));
+        tokio::spawn(crate::server::serve(listener, router(st.clone()), None, limits, None, rx));
         TestHub { url, st, dir, _stop: tx }
     }
 
