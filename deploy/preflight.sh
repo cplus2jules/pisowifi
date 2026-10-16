@@ -49,6 +49,8 @@ ip -4 -br addr | show
 if ip link show "$LAN_IF" >/dev/null 2>&1; then
   ok "LAN interface $LAN_IF exists"
   if ip -4 addr show "$LAN_IF" | grep -q "inet $PORTAL_IP/"; then ok "$LAN_IF has $PORTAL_IP"
+  elif command -v netplan >/dev/null && systemctl is-enabled -q systemd-networkd 2>/dev/null; then
+    ok "$LAN_IF doesn't have $PORTAL_IP yet; install.sh sets it up (netplan + networkd, a fresh card)"
   else bad "$LAN_IF doesn't have $PORTAL_IP (customers' DHCP, DNS and portal need it)"; fi
 else
   bad "LAN interface '$LAN_IF' doesn't exist. Which one goes to the access point? Rerun with LAN_IF=name"
@@ -76,6 +78,7 @@ ls /etc/cron.d 2>/dev/null | tr '\n' ' ' | sed 's/^/cron.d: /' | show
 crontab -l -u www-data 2>/dev/null | grep -vE '^\s*(#|$)' | sed 's/^/www-data cron: /' | show
 for f in /etc/dnsmasq.conf /etc/dnsmasq.d/*; do [[ -f "$f" ]] && { info "$f:"; grep -vE '^\s*(#|$)' "$f" | show; }; done
 [[ -f /etc/default/dnsmasq ]] && grep -vE '^\s*(#|$)' /etc/default/dnsmasq | sed 's#^#/etc/default/dnsmasq: #' | show
+info "SSH listens on port(s): $(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | paste -sd' ' -)${SSH_CONNECTION:+ (this session: ${SSH_CONNECTION##* })}"
 if [[ -s /root/.ssh/authorized_keys ]]; then warn "root accepts $(grep -c . /root/.ssh/authorized_keys) SSH key(s) (from LPB's seller?): $(awk '{print $NF}' /root/.ssh/authorized_keys | tr '\n' ' ')"; fi
 
 section "Old firewall rules"

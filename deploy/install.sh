@@ -64,16 +64,76 @@ LAN_IF="$(pick_iface "goes to the access point (customers)" "$LAN_IF")"
 WAN_IF="$(pick_iface "goes to the ISP modem" "$WAN_IF")"
 [[ "$LAN_IF" != "$WAN_IF" ]] || { echo "The LAN and WAN interfaces must be different."; exit 1; }
 echo "Customers: $LAN_IF   Modem: $WAN_IF"
+LAN_PREFIX="$(setting lan_cidr "$SRC_CONF" | cut -s -d/ -f2)"
+LAN_PREFIX="${LAN_PREFIX:-19}"
+lan_ip_saved() {
+  grep -rqsE "${LAN_IP//./\\.}(/| |$)" /etc/network /etc/NetworkManager/system-connections /etc/netplan /etc/systemd/network /etc/dhcpcd.conf
+}
+# A fresh Armbian Minimal card: netplan with systemd-networkd, and every
+# ethernet port asking for an address by DHCP.
+netplan_networkd() {
+  command -v netplan >/dev/null && [[ -d /etc/netplan ]] \
+    && systemctl is-enabled -q systemd-networkd 2>/dev/null \
+    && ! grep -rqsiE 'renderer: *NetworkManager' /etc/netplan
+}
 if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
   echo "OK: $LAN_IF has $LAN_IP"
+  if ! lan_ip_saved; then
+    warn "$LAN_IP isn't saved in any network config this installer knows. If LPB sets it at"
+    warn "boot itself, it will be gone after a reboot once LPB is off. Make it permanent with"
+    warn "armbian-config > Network, or tell whoever is helping you, before rebooting."
+  fi
+elif netplan_networkd; then
+  say "Setting up $LAN_IF for customers ($LAN_IP/$LAN_PREFIX)"
+  echo "  $WAN_IF keeps getting its address from the modem. $LAN_IF gets a fixed one;"
+  echo "  the vendo hands out addresses there itself. Armbian's own netplan files"
+  echo "  are moved to $BACKUP/netplan (uninstall.sh puts them back)."
+  ask "Set up the network like this?" || exit 1
+  mkdir -p "$BACKUP/netplan"
+  MOVED=()
+  for f in /etc/netplan/*.yaml; do
+    [[ -e "$f" && "$f" != /etc/netplan/20-pisowifi.yaml ]] || continue
+    mv "$f" "$BACKUP/netplan/" && MOVED+=("$(basename "$f")")
+  done
+  umask 077
+  cat > /etc/netplan/20-pisowifi.yaml <<NETPLAN
+# Written by the pisowifi installer.
+# $WAN_IF: internet side, address from the modem by DHCP.
+# $LAN_IF: customer side, a fixed address with no DHCP client or IPv6
+# (dnsmasq serves DHCP there), kept even while no cable is plugged in.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $WAN_IF:
+      dhcp4: true
+    $LAN_IF:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      ignore-carrier: true
+      addresses: [$LAN_IP/$LAN_PREFIX]
+NETPLAN
+  umask 022
+  if ! netplan generate; then
+    rm -f /etc/netplan/20-pisowifi.yaml
+    for f in "${MOVED[@]}"; do mv "$BACKUP/netplan/$f" /etc/netplan/; done
+    warn "netplan refused that setup. Nothing was changed. Send the output above to whoever is helping you."
+    exit 1
+  fi
+  echo "  Applying. If your SSH connection drops, log in again and run ./install.sh again."
+  netplan apply
+  for _ in $(seq 1 15); do ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/" && break; sleep 1; done
+  if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
+    echo "OK: $LAN_IF has $LAN_IP"
+  else
+    warn "$LAN_IF still doesn't have $LAN_IP. Check 'networkctl status $LAN_IF'."
+    ask "Continue anyway?" || exit 1
+  fi
 else
-  warn "$LAN_IF doesn't have $LAN_IP. Set it up as $LAN_IP/19 (armbian-config > Network) and run this again."
+  warn "$LAN_IF doesn't have $LAN_IP. Set it up as $LAN_IP/$LAN_PREFIX (armbian-config > Network) and run this again."
   ask "Continue anyway?" || exit 1
-fi
-if ! grep -rqsE "${LAN_IP//./\\.}(/| |$)" /etc/network /etc/NetworkManager/system-connections /etc/netplan /etc/systemd/network /etc/dhcpcd.conf; then
-  warn "$LAN_IP isn't saved in any network config this installer knows. If LPB sets it at"
-  warn "boot itself, it will be gone after a reboot once LPB is off. Make it permanent with"
-  warn "armbian-config > Network, or tell whoever is helping you, before rebooting."
 fi
 
 # ---- 2. Packages -------------------------------------------------------------
@@ -102,6 +162,18 @@ else
   install -m 0644 ./config.example.toml "$CONF"
 fi
 sed -i -E "s/^lan_iface *= *\"[^\"]*\"/lan_iface = \"$LAN_IF\"/; s/^wan_iface *= *\"[^\"]*\"/wan_iface = \"$WAN_IF\"/" "$CONF"
+# SSH stays open from the modem's side on every port sshd listens on, plus
+# the one this session came in on, or the new firewall would lock you out.
+SSH_PORTS="$( { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+               [[ -n "${SSH_CONNECTION:-}" ]] && echo "${SSH_CONNECTION##* }"
+             } | grep -E '^[0-9]+$' | sort -un | paste -sd, - | sed 's/,/, /g' || true)"
+SSH_PORTS="${SSH_PORTS:-22}"
+if grep -qE '^ssh_ports *=' "$CONF"; then
+  sed -i -E "s/^ssh_ports *=.*/ssh_ports = [$SSH_PORTS]/" "$CONF"
+else
+  sed -i -E "/^wan_iface *=/a ssh_ports = [$SSH_PORTS]" "$CONF"
+fi
+echo "SSH stays open from the modem's side on port $SSH_PORTS."
 ./pisowifi --config "$CONF" print-firewall > /tmp/pisowifi.nft
 if ! nft -c -f /tmp/pisowifi.nft; then
   warn "This kernel refuses the firewall rules above. Nothing has been changed and LPB is still running."
@@ -280,7 +352,8 @@ cat <<EOF
 
   Before rebooting:
   * SSH now only works from the modem's side (e.g. a laptop on the modem's own
-    WiFi), not from the customer WiFi. Check that you can log in that way.
+    WiFi), on port $SSH_PORTS, not from the customer WiFi. Check that you can
+    log in that way.
   * Then reboot once (sudo reboot) and check everything comes back by itself:
     the portal opens on a phone, and a coin gives time.
 

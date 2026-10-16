@@ -32,6 +32,10 @@ pub struct Network {
     /// a new address that dnsmasq leased to it (stops MAC cloning).
     #[serde(default = "default_leases")]
     pub dhcp_leases: PathBuf,
+    /// Ports SSH listens on, open only from the modem's side. Some images
+    /// move SSH off 22 (LPB's used 320); the installer fills in the real ones.
+    #[serde(default = "default_ssh_ports")]
+    pub ssh_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +103,9 @@ pub struct Storage {
 fn default_leases() -> PathBuf {
     PathBuf::from("/var/lib/misc/dnsmasq.leases")
 }
+fn default_ssh_ports() -> Vec<u16> {
+    vec![22]
+}
 fn default_true() -> bool {
     true
 }
@@ -159,6 +166,9 @@ impl Config {
                 bail!("coin.pulse_width_ms must look like [15, 150] (shortest, longest; at most 1000)");
             }
         }
+        if self.network.ssh_ports.is_empty() || self.network.ssh_ports.contains(&0) {
+            bail!("network.ssh_ports must list at least one port, e.g. [22]");
+        }
         for m in &self.admin.allow_macs {
             crate::net::Mac::parse(m).with_context(|| format!("admin.allow_macs: {m}"))?;
         }
@@ -188,6 +198,7 @@ impl Config {
                 portal_ip: Ipv4Addr::new(127, 0, 0, 1),
                 lan_cidr: "127.0.0.0/8".into(),
                 dhcp_leases: data_dir.join("dnsmasq.leases"),
+                ssh_ports: default_ssh_ports(),
             },
             portal: Portal {
                 listen: "127.0.0.1:8080".parse().unwrap(),

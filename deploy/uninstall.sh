@@ -28,6 +28,14 @@ if [[ -f "$BACKUP/rules.v4" ]]; then
   systemctl enable netfilter-persistent 2>/dev/null || true
 fi
 
+# Network: Armbian's own netplan files, if the installer set up the
+# customer side itself (a fresh card).
+if [[ -d "$BACKUP/netplan" ]] && compgen -G "$BACKUP/netplan/*.yaml" >/dev/null; then
+  rm -f /etc/netplan/20-pisowifi.yaml
+  cp -a "$BACKUP"/netplan/*.yaml /etc/netplan/
+  netplan apply 2>/dev/null || true
+fi
+
 # DNS/DHCP: LPB's dnsmasq settings.
 [[ -f "$BACKUP/dnsmasq.conf" ]] && cp -a "$BACKUP/dnsmasq.conf" /etc/dnsmasq.conf
 [[ -f "$BACKUP/dnsmasq.default" ]] && cp -a "$BACKUP/dnsmasq.default" /etc/default/dnsmasq

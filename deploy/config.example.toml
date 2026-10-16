@@ -9,6 +9,7 @@ portal_ip = "10.0.0.1"
 lan_cidr  = "10.0.0.0/19"   # matches your current dnsmasq range 10.0.0.5–10.0.30.254
 # A customer's time only follows their phone to a new address dnsmasq gave it.
 # dhcp_leases = "/var/lib/misc/dnsmasq.leases"
+ssh_ports = [22]            # SSH, from the modem's side only; install.sh fills in the real port(s)
 
 [portal]
 listen = "10.0.0.1:80"
