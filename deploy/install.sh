@@ -345,7 +345,7 @@ echo "Press Ctrl-C when done (it also stops by itself after 3 minutes)."
 if ask "Run the coin probe now?"; then
   # Ctrl-C stops the probe only, not this installer.
   trap ':' INT
-  timeout --foreground 180 ./pisowifi --config "$CONF" coin-probe || true
+  ./pisowifi --config "$CONF" coin-probe --seconds 180 || true
   trap - INT
   echo
   read -r -p "The line number it showed (blank to set it later): " LINE

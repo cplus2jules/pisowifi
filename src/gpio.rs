@@ -250,7 +250,8 @@ mod imp {
     /// Watches every header pin (each on its own, so a busy pin doesn't hide
     /// the rest) and prints each burst of pulses: which pin, how many pulses,
     /// and how wide they are.
-    pub fn probe(chip: &str) -> Result<()> {
+    pub fn probe(chip: &str, limit: Option<Duration>) -> Result<()> {
+        let deadline = limit.map(|d| Instant::now() + d);
         let mut watches = vec![];
         for &(pin, name, line) in ORANGE_PI_ONE_HEADER {
             let edges = Request::builder()
@@ -275,6 +276,10 @@ mod imp {
         loop {
             std::thread::sleep(Duration::from_millis(1));
             let now = Instant::now();
+            if deadline.is_some_and(|d| now >= d) {
+                println!("Stopped after {} s.", limit.unwrap_or_default().as_secs());
+                return Ok(());
+            }
             for w in &mut watches {
                 let v = w.req.value(w.line)?;
                 if v != w.last {
@@ -331,7 +336,7 @@ mod imp {
         pub fn set(&self, _on: bool, _line: u32) {}
     }
 
-    pub fn probe(_chip: &str) -> Result<()> {
+    pub fn probe(_chip: &str, _limit: Option<std::time::Duration>) -> Result<()> {
         anyhow::bail!("coin-probe only works on the Orange Pi (Linux)")
     }
 }

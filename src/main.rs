@@ -57,6 +57,9 @@ enum Cmd {
     CoinProbe {
         #[arg(long, default_value = "/dev/gpiochip0")]
         chip: String,
+        /// Stop by itself after this many seconds (default: until Ctrl-C)
+        #[arg(long)]
+        seconds: Option<u64>,
     },
     /// Show the dashboard URL and TLS certificate fingerprint
     AdminInfo,
@@ -189,7 +192,7 @@ fn main() -> Result<()> {
             println!("Password saved. Restart the service to sign out existing sessions.");
             Ok(())
         }
-        Cmd::CoinProbe { chip } => gpio::probe(&chip),
+        Cmd::CoinProbe { chip, seconds } => gpio::probe(&chip, seconds.map(Duration::from_secs)),
         Cmd::AdminInfo => {
             let t = tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?;
             println!("Dashboard:   https://{}:{}/", cfg.network.portal_ip, cfg.admin.listen.port());
