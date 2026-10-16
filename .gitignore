@@ -1,0 +1,18 @@
+# Build output
+/target/
+/dist/
+
+# Local dev data: encrypted DBs, keys, dev passwords. Never commit.
+dev-data*/
+dev-hub/
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.pem
+dev-password.txt
+
+.DS_Store
+
+# Local launch config (absolute paths)
+.claude/launch.json

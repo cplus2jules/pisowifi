@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#FFFFFF">
+<meta name="robots" content="noindex">
+<title>Owner dashboard</title>
+<link rel="icon" href="/icon.svg?v=__V__" type="image/svg+xml">
+<link rel="stylesheet" href="/admin.css?v=__V__">
+<script src="/coins.js?v=__V__" defer></script>
+<script src="/admin.js?v=__V__" defer></script>
+</head>
+<body>
+<svg width="0" height="0" class="defs" aria-hidden="true">
+  <symbol id="i-grid" viewBox="0 0 20 20"><rect x="3" y="3" width="5.5" height="5.5" rx="1.5"/><rect x="11.5" y="3" width="5.5" height="5.5" rx="1.5"/><rect x="3" y="11.5" width="5.5" height="5.5" rx="1.5"/><rect x="11.5" y="11.5" width="5.5" height="5.5" rx="1.5"/></symbol>
+  <symbol id="i-devices" viewBox="0 0 20 20"><rect x="6" y="2.5" width="8" height="15" rx="2"/><path d="M9 14.5h2"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 20 20"><path d="M3 10.2V4a1 1 0 0 1 1-1h6.2l6.8 6.8-7.2 7.2L3 10.2z"/><circle cx="7" cy="7" r="1.2"/></symbol>
+  <symbol id="i-ticket" viewBox="0 0 20 20"><path d="M2.5 6.5V5a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v1.5a2.5 2.5 0 0 0 0 5V15a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1v-3.5a2.5 2.5 0 0 0 0-5z"/><path d="M12 4v12" stroke-dasharray="1.5 1.8"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 20 20"><circle cx="10" cy="10" r="2.6"/><path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/></symbol>
+  <symbol id="i-list" viewBox="0 0 20 20"><path d="M7 5h10M7 10h10M7 15h10"/><circle cx="3.5" cy="5" r=".6"/><circle cx="3.5" cy="10" r=".6"/><circle cx="3.5" cy="15" r=".6"/></symbol>
+  <symbol id="i-users" viewBox="0 0 20 20"><circle cx="8" cy="7" r="3"/><path d="M2.5 16.5a5.5 5.5 0 0 1 11 0"/><path d="M13.5 4.2a3 3 0 0 1 0 5.6M15.5 12.2a5.5 5.5 0 0 1 2 4.3"/></symbol>
+  <symbol id="i-coin" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7"/><path d="M8 14V6h2.8a2.3 2.3 0 0 1 0 4.6H8M6.5 8h7M6.5 9.7h7"/></symbol>
+  <symbol id="i-cal" viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2.5v3M13 2.5v3"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 20 20"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 13v-2M10 13V8M13 13v-4"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 20 20"><ellipse cx="10" cy="5" rx="6" ry="2.3"/><path d="M4 5v5c0 1.3 2.7 2.3 6 2.3s6-1 6-2.3V5M4 10v5c0 1.3 2.7 2.3 6 2.3s6-1 6-2.3v-5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 20 20"><path d="M1.8 10S5 4.5 10 4.5 18.2 10 18.2 10 15 15.5 10 15.5 1.8 10 1.8 10z"/><circle cx="10" cy="10" r="2.5"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 20 20"><path d="M3 3l14 14M8.3 4.8A8 8 0 0 1 10 4.5c5 0 8.2 5.5 8.2 5.5a14 14 0 0 1-2.6 3.2M5.4 6.4A13.6 13.6 0 0 0 1.8 10S5 15.5 10 15.5a7.6 7.6 0 0 0 3.6-.9"/><path d="M8.2 8.3a2.5 2.5 0 0 0 3.5 3.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15"/></symbol>
+  <symbol id="i-check" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5"/><path d="M6.8 10.2l2.2 2.2 4.3-4.6"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 20 20"><path d="M5 13.5V9a5 5 0 0 1 10 0v4.5l1.5 1.5h-13L5 13.5zM8.3 17.5h3.4"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 20 20"><path d="M8 5l5 5-5 5"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 20 20"><path d="M2.5 8a11 11 0 0 1 15 0M5 10.8a7.3 7.3 0 0 1 10 0M7.5 13.5a3.5 3.5 0 0 1 5 0"/><circle cx="10" cy="16" r=".8"/></symbol>
+  <symbol id="i-ext" viewBox="0 0 20 20"><path d="M11 3.5h5.5V9M16.5 3.5L9 11M14 12v3.5a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1H8"/></symbol>
+  <symbol id="i-brush" viewBox="0 0 20 20"><path d="M16.5 3.5l-7 7M9.5 10.5l-2 .5-.5 2c-.4 1.6-1.8 2.5-3.5 2.5 1-1 .8-2.6 1.8-3.6l1.9-1.9 2.3 .5z"/><path d="M12.5 5.5l2 2"/></symbol>
+  <symbol id="i-image" viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><circle cx="7" cy="8" r="1.5"/><path d="M17.5 13l-4-4-7.5 7.5"/></symbol>
+  <symbol id="i-print" viewBox="0 0 20 20"><path d="M5.5 7.5v-4h9v4M5.5 14.5h-2a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-2"/><rect x="5.5" y="11.5" width="9" height="5" rx="1"/></symbol>
+  <symbol id="i-up" viewBox="0 0 20 20"><path d="M3 14l5-5 3 3 6-6M12.5 6H17v4.5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 20 20"><path d="M3 6l5 5 3-3 6 6M12.5 14H17V9.5"/></symbol>
+</svg>
+
+<!-- ============ sign in ============ -->
+<main class="login" id="login" hidden>
+  <form class="login-card" id="login-form">
+    <div class="brand"><img src="/icon.svg?v=__V__" alt="" width="36" height="36"><span>PisoWiFi</span></div>
+    <h1>Sign in</h1>
+    <p class="muted" id="login-note">Owner dashboard for your Piso WiFi.</p>
+    <label for="password">Password</label>
+    <div class="pw-field">
+      <input id="password" type="password" autocomplete="current-password" required maxlength="256">
+      <button type="button" class="pw-toggle" id="pw-toggle" aria-label="Show password" aria-pressed="false"><svg class="ic"><use href="#i-eye"/></svg></button>
+    </div>
+    <button class="btn primary" type="submit">Sign in</button>
+    <p class="error" id="login-error" role="alert" hidden></p>
+  </form>
+</main>
+
+<!-- ============ app ============ -->
+<div class="app" id="shell" hidden>
+  <header class="topbar">
+    <div class="brand"><img src="/icon.svg?v=__V__" alt="" width="30" height="30"><span>PisoWiFi</span></div>
+    <div class="chip site">
+      <svg class="ic"><use href="#i-wifi"/></svg>
+      <b id="site-name">Piso WiFi</b>
+      <span class="tag" id="site-tag">Live</span>
+    </div>
+    <div class="chip slot-chip" id="slot-chip">
+      <span class="ring-mini" id="slot-ring"></span>
+      <span>Coin slot</span>
+      <b id="slot-chip-text">Idle</b>
+    </div>
+    <span class="grow"></span>
+    <a class="btn outline" id="open-portal" target="_blank" rel="noopener noreferrer">
+      <svg class="ic"><use href="#i-ext"/></svg><span>Open portal</span>
+    </a>
+    <button class="btn primary" type="button" data-goto="vouchers">Create vouchers</button>
+    <button class="avatar" id="logout" type="button" title="Sign out" aria-label="Sign out">OW</button>
+  </header>
+
+  <aside class="side">
+    <nav class="nav" aria-label="Sections">
+      <button type="button" data-tab="overview" aria-current="page"><svg class="ic"><use href="#i-grid"/></svg>Dashboard</button>
+      <button type="button" data-tab="devices"><svg class="ic"><use href="#i-devices"/></svg>Devices<span class="count" id="nav-count"></span></button>
+      <button type="button" data-tab="rates"><svg class="ic"><use href="#i-tag"/></svg>Rates</button>
+      <button type="button" data-tab="vouchers"><svg class="ic"><use href="#i-ticket"/></svg>Vouchers</button>
+      <button type="button" data-tab="customize"><svg class="ic"><use href="#i-brush"/></svg>Customer page</button>
+      <button type="button" data-tab="activity"><svg class="ic"><use href="#i-list"/></svg>Activity log</button>
+      <button type="button" data-tab="settings"><svg class="ic"><use href="#i-gear"/></svg>Settings</button>
+    </nav>
+    <div class="side-box">
+      <p class="side-box-title"><svg class="ic"><use href="#i-check"/></svg>Protection</p>
+      <ul>
+        <li>Encrypted database</li>
+        <li>HTTPS dashboard</li>
+        <li>Fail-closed firewall</li>
+      </ul>
+    </div>
+    <p class="version" id="version">version —</p>
+  </aside>
+
+  <main class="main">
+    <!-- overview -->
+    <section class="panel" id="tab-overview">
+      <h1 class="page-title" id="page-title">Piso WiFi</h1>
+
+      <div class="banner" id="banner" hidden>
+        <span class="banner-ic"><svg class="ic"><use href="#i-eye"/></svg></span>
+        <p id="banner-text"></p>
+        <button class="btn soft" type="button" id="banner-action"></button>
+        <button class="icon-btn" type="button" id="banner-close" aria-label="Dismiss"><svg class="ic"><use href="#i-x"/></svg></button>
+      </div>
+
+      <div class="grid-top">
+        <div class="statcol">
+          <div class="srow"><span class="sq"><svg class="ic"><use href="#i-users"/></svg></span><div><b id="online">0</b><span>Online now</span></div></div>
+          <div class="srow"><span class="sq"><svg class="ic"><use href="#i-coin"/></svg></span><div><b id="today">₱0</b><span>Earned today</span></div></div>
+          <div class="srow"><span class="sq"><svg class="ic"><use href="#i-cal"/></svg></span><div><b id="week">₱0</b><span>Last 7 days</span></div></div>
+          <div class="srow"><span class="sq"><svg class="ic"><use href="#i-chart"/></svg></span><div><b id="month">₱0</b><span>Last 30 days</span></div></div>
+          <div class="srow"><span class="sq"><svg class="ic"><use href="#i-stack"/></svg></span><div><b id="alltime">₱0</b><span>All time</span></div></div>
+        </div>
+
+        <div class="card earn">
+          <div class="card-head">
+            <div><h2>Earnings</h2><p class="sub">Coins collected per day, last 14 days</p></div>
+            <button class="link" type="button" data-goto="activity">View activity log</button>
+          </div>
+          <div class="earn-body">
+            <div class="chart" id="chart" role="img" aria-label="Daily earnings chart"></div>
+            <div class="top">
+              <p class="top-title">Top customers · 30 days</p>
+              <ul id="top"></ul>
+              <p class="empty small" id="top-empty">No coin sales in the last 30 days.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card activity">
+          <div class="card-head"><div><h2>Activity</h2><p class="sub">Last 30 days vs previous</p></div></div>
+          <div class="card-body">
+            <button class="action-row" type="button" id="action-row">
+              <svg class="ic"><use href="#i-bell"/></svg>
+              <b id="action-count">0</b><span id="action-text">ACTION ITEMS</span>
+              <svg class="ic chev"><use href="#i-chev"/></svg>
+            </button>
+            <div class="metrics">
+              <div><b id="m-trend">—</b><span>Earnings vs previous</span></div>
+              <div><b id="m-sales">0</b><span>Sales</span></div>
+              <div><b id="m-avg">₱0</b><span>Average per day</span></div>
+              <div><b id="m-vouchers">0</b><span>Vouchers redeemed</span></div>
+              <div><b id="m-unclaimed">₱0</b><span>Unclaimed coins</span></div>
+              <div><b id="m-uptime">—</b><span>Running for</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-bottom">
+        <div class="card slotcard">
+          <div class="card-head"><h2>Coin slot</h2></div>
+          <div class="card-body">
+            <div class="slot-line">
+              <div><b id="slot-title">Waiting for a customer</b><p class="sub" id="slot-sub">Customers tap Insert coin on the portal first.</p></div>
+              <div class="row dev-only" id="test-coins" hidden>
+                <button class="btn small coin-btn" type="button" data-coin="1">₱1</button>
+                <button class="btn small coin-btn" type="button" data-coin="5">₱5</button>
+                <button class="btn small coin-btn" type="button" data-coin="10">₱10</button>
+                <button class="btn small coin-btn" type="button" data-coin="20">₱20</button>
+              </div>
+            </div>
+            <div class="progress" aria-hidden="true">
+              <span class="marker" id="slot-marker"><b id="slot-pesos">₱0</b> inserted</span>
+              <div class="track"><div class="fill" id="slot-fill"></div></div>
+            </div>
+            <div class="slot-foot">
+              <span><b id="slot-pulses">0</b> pulses since start · acceptor gate <b id="slot-gate">not wired</b></span>
+              <span><b class="accent" id="slot-secs">—</b> <span id="slot-secs-label">window</span></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card online-card">
+          <div class="card-head"><h2>Connected devices <span class="pill" id="online-pill">0 online</span></h2></div>
+          <div class="card-body">
+            <ul class="mini-devices" id="mini-devices"></ul>
+            <p class="empty small" id="mini-empty">Nobody has time right now.</p>
+            <button class="link" type="button" data-goto="devices">Manage devices</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- devices -->
+    <section class="panel" id="tab-devices" hidden>
+      <h1 class="page-title">Devices</h1>
+      <div class="card">
+        <div class="card-head"><div><h2>Devices with time</h2><p class="sub" id="devices-sub"></p></div></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Device</th><th>IP address</th><th>Status</th><th>Time left</th><th class="r">Actions</th></tr></thead>
+            <tbody id="devices"></tbody>
+          </table>
+        </div>
+        <p class="empty pad" id="devices-empty">No devices have time right now. They appear here after someone inserts coins.</p>
+      </div>
+    </section>
+
+    <!-- rates -->
+    <section class="panel" id="tab-rates" hidden>
+      <h1 class="page-title">Rates</h1>
+      <form class="card" id="rates-form">
+        <div class="card-head"><div><h2>Price list</h2><p class="sub">Customers always get the best mix of these for what they insert. Leftover pesos count at your smallest rate.</p></div></div>
+        <div class="card-body">
+          <div class="rates" id="rates"></div>
+          <div class="row">
+            <button class="btn outline" type="button" id="add-rate">Add rate</button>
+            <span class="grow"></span>
+            <button class="btn primary" type="submit">Save rates</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <!-- vouchers -->
+    <section class="panel" id="tab-vouchers" hidden>
+      <h1 class="page-title">Vouchers</h1>
+      <form class="card" id="voucher-form">
+        <div class="card-head"><div><h2>Create vouchers</h2><p class="sub">Printable codes customers can type on the portal instead of inserting coins.</p></div></div>
+        <div class="card-body">
+          <div class="form-grid">
+            <label>How many <input type="number" id="v-count" min="1" max="100" value="10" required></label>
+            <label>Minutes each <input type="number" id="v-minutes" min="1" max="43200" value="120" required></label>
+            <label class="wide">Note (optional) <input type="text" id="v-label" maxlength="40" placeholder="e.g. Promo, barangay event"></label>
+          </div>
+          <div class="row"><span class="grow"></span><button class="btn primary" type="submit">Create vouchers</button></div>
+        </div>
+      </form>
+
+      <div class="card print-target" id="new-codes" hidden>
+        <div class="card-head no-print">
+          <div><h2>New codes</h2><p class="sub">Shown only once and stored hashed. Print or copy them now.</p></div>
+          <div class="row"><button class="btn outline" type="button" id="copy-codes">Copy</button><button class="btn primary" type="button" id="print">Print</button></div>
+        </div>
+        <div class="card-body"><div class="tickets" id="tickets"></div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div><h2>All vouchers</h2><p class="sub" id="v-sub"></p></div></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>ID</th><th>Time</th><th>Note</th><th>Created</th><th>Status</th><th class="r"></th></tr></thead>
+            <tbody id="vouchers"></tbody>
+          </table>
+        </div>
+        <p class="empty pad" id="vouchers-empty">No vouchers yet.</p>
+      </div>
+    </section>
+
+    <!-- activity -->
+    <section class="panel" id="tab-activity" hidden>
+      <h1 class="page-title">Activity log</h1>
+      <div class="two">
+        <div class="card">
+          <div class="card-head"><div><h2>Recent sales</h2><p class="sub">Coins, vouchers and time you added</p></div></div>
+          <ul class="feed" id="recent"></ul>
+        </div>
+        <div class="card">
+          <div class="card-head"><div><h2>Owner actions</h2><p class="sub">Every sign-in and change, newest first</p></div></div>
+          <ul class="feed" id="audit"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- customer page -->
+    <section class="panel" id="tab-customize" hidden>
+      <h1 class="page-title">Customer page</h1>
+      <div class="custom-grid">
+        <form class="card" id="brand-form">
+          <div class="card-head"><div><h2>Look and feel</h2><p class="sub">What customers see when they connect</p></div></div>
+          <div class="card-body">
+            <div class="form-grid">
+              <label>Name on the page <input type="text" id="b-name" maxlength="40" required placeholder="Piso WiFi"></label>
+              <label>Network name (SSID) for the QR sign <input type="text" id="b-wifi" maxlength="32" placeholder="Exactly as in WiFi settings"></label>
+            </div>
+
+            <fieldset class="swatches">
+              <legend>Accent colour</legend>
+              <div class="swatch-row" id="swatches"></div>
+              <p class="sub warn" id="accent-warn" hidden>This colour is light, so white text on it may be hard to read.</p>
+            </fieldset>
+
+            <div class="uploads">
+              <div class="upload">
+                <div class="thumb logo-thumb" id="logo-thumb"><img id="logo-img" alt=""><svg class="ic"><use href="#i-image"/></svg></div>
+                <div class="upload-text">
+                  <b>Logo</b>
+                  <p class="sub">Square image, shown next to the name. PNG keeps transparency.</p>
+                  <div class="row">
+                    <label class="btn outline small file-btn">Upload logo<input type="file" id="logo-file" accept="image/png,image/jpeg,image/webp"></label>
+                    <button class="btn small danger" type="button" id="logo-remove" hidden>Remove</button>
+                  </div>
+                </div>
+              </div>
+              <div class="upload">
+                <div class="thumb poster-thumb" id="poster-thumb"><img id="poster-img" alt=""><svg class="ic"><use href="#i-image"/></svg></div>
+                <div class="upload-text">
+                  <b>Advert poster</b>
+                  <p class="sub">Shown under the coin slot. Portrait or square photos work best. Location data is removed before upload.</p>
+                  <div class="row">
+                    <label class="btn outline small file-btn">Upload poster<input type="file" id="poster-file" accept="image/png,image/jpeg,image/webp"></label>
+                    <button class="btn small danger" type="button" id="poster-remove" hidden>Remove</button>
+                  </div>
+                  <label>What the poster says (for screen readers) <input type="text" id="b-alt" maxlength="120" placeholder="e.g. Halo-halo ₱35 at the counter"></label>
+                </div>
+              </div>
+            </div>
+            <div class="row"><span class="grow"></span><button class="btn primary" type="submit">Save changes</button></div>
+          </div>
+        </form>
+
+        <div class="preview-col">
+          <p class="preview-label">Live preview</p>
+          <div class="phone" id="phone">
+            <div class="ph-top"><span class="ph-logo" id="ph-logo"></span><span class="ph-title"><b id="ph-name">Piso WiFi</b></span></div>
+            <div class="ph-hero"><small>You're online</small><b>01:59:42</b></div>
+            <div class="ph-slot"><span></span><b>Add more time</b></div>
+            <img class="ph-poster" id="ph-poster" alt="" hidden>
+            <div class="ph-rates"><i></i><i></i></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card print-target" id="sign-card">
+        <div class="card-head no-print">
+          <div><h2>Printable sign</h2><p class="sub">Stick this on the machine. Customers scan to join the WiFi, then scan again to open the page.</p></div>
+          <button class="btn primary" type="button" id="print-sign"><svg class="ic"><use href="#i-print"/></svg>Print sign</button>
+        </div>
+        <div class="card-body">
+          <div class="sign" id="sign">
+            <div class="sign-head"><span class="sign-logo" id="sign-logo"></span><b id="sign-name">Piso WiFi</b></div>
+            <div class="sign-qrs">
+              <figure id="qr-wifi-fig"><img id="qr-wifi" alt="QR code to join the WiFi"><figcaption><b>1</b> Scan to join <span id="sign-ssid"></span></figcaption></figure>
+              <figure><img id="qr-portal" alt="QR code to open the Piso WiFi page"><figcaption><b id="qr-portal-step">2</b> Scan to open the page</figcaption></figure>
+            </div>
+            <ol class="sign-steps"><li>Tap <b>Insert coin</b></li><li>Drop ₱1, ₱5, ₱10 or ₱20 coins</li><li>Tap <b>Start internet</b></li></ol>
+            <p class="sign-rates" id="sign-rates"></p>
+          </div>
+          <p class="sub warn no-print" id="sign-warn" hidden>Add your network name above to get the "join WiFi" QR code.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- settings -->
+    <section class="panel" id="tab-settings" hidden>
+      <h1 class="page-title">Settings</h1>
+      <div class="two">
+        <div class="card">
+          <div class="card-head">
+            <div><h2>Piso Pass locations</h2><p class="sub">Customers' time works at all your vendos</p></div>
+            <span class="status" id="hub-status">Not connected</span>
+          </div>
+          <dl class="facts" id="hub-facts" hidden>
+            <dt>Hub</dt><dd><code id="hub-url"></code></dd>
+            <dt>This vendo</dt><dd id="hub-name"></dd>
+            <dt>Last sync</dt><dd id="hub-sync"></dd>
+            <dt>Passes here</dt><dd id="hub-passes"></dd>
+            <dt id="hub-err-label" hidden>Problem</dt><dd id="hub-err" hidden></dd>
+          </dl>
+          <div class="card-body" id="hub-help">
+            <p class="sub">On your hub server run <code>pisowifi hub add-vendo --name "This store"</code>. Then on this box run <code>sudo pisowifi join-hub --url https://your-hub --code CODE</code> and restart the service.</p>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div><h2>Security</h2><p class="sub">How this box protects your data</p></div></div>
+          <dl class="facts">
+            <dt>Database</dt><dd>SQLCipher, AES-256 with HMAC-SHA512 on every page. The key comes from this board's chip ID, so a copied SD card can't be opened elsewhere.</dd>
+            <dt>Certificate</dt><dd><code id="fp">—</code></dd>
+          </dl>
+        </div>
+        <form class="card wide" id="pw-form">
+          <div class="card-head"><div><h2>Change password</h2><p class="sub">Use 4+ random words or 14+ random characters, used nowhere else (never the old LPB password). Changing it signs out every device.</p></div></div>
+          <div class="card-body">
+            <div class="form-grid three">
+              <label>Current password <input type="password" id="pw-current" autocomplete="current-password" required></label>
+              <label>New password <input type="password" id="pw-new" autocomplete="new-password" minlength="12" required></label>
+              <label>Repeat new password <input type="password" id="pw-repeat" autocomplete="new-password" minlength="12" required></label>
+            </div>
+            <div class="row"><span class="grow"></span><button class="btn primary" type="submit">Change password</button></div>
+          </div>
+        </form>
+      </div>
+    </section>
+  </main>
+</div>
+
+<p class="toast" id="toast" role="status" hidden></p>
+</body>
+</html>

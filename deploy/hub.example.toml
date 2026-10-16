@@ -1,0 +1,10 @@
+# /etc/pisowifi/hub.toml — the Piso Pass hub on your cloud server.
+# Recommended: let Caddy handle HTTPS (see Caddyfile) and keep the hub on localhost.
+listen = "127.0.0.1:8700"
+data_dir = "/var/lib/pisowifi-hub"
+
+# Or let the hub serve HTTPS itself with an existing certificate (port 443 also
+# needs AmbientCapabilities=CAP_NET_BIND_SERVICE in pisowifi-hub.service):
+# listen = "0.0.0.0:443"
+# tls_cert = "/etc/letsencrypt/live/hub.example.com/fullchain.pem"
+# tls_key  = "/etc/letsencrypt/live/hub.example.com/privkey.pem"

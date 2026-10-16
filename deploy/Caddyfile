@@ -1,0 +1,5 @@
+# /etc/caddy/Caddyfile — automatic HTTPS (Let's Encrypt) in front of the hub.
+# Point a DNS name at the server first, then replace hub.example.com.
+hub.example.com {
+	reverse_proxy 127.0.0.1:8700
+}

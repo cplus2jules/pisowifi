@@ -1,0 +1,36 @@
+# /etc/pisowifi/config.toml
+# Static device settings. Rates and the portal name are changed from the
+# dashboard instead and live in the encrypted database.
+
+[network]
+lan_iface = "eth1"          # USB LAN adapter -> outdoor access point
+wan_iface = "eth0"          # built-in port   -> ISP modem
+portal_ip = "10.0.0.1"
+lan_cidr  = "10.0.0.0/19"   # matches your current dnsmasq range 10.0.0.5–10.0.30.254
+
+[portal]
+listen = "10.0.0.1:80"
+
+[admin]
+listen = "10.0.0.1:8443"    # https://10.0.0.1:8443/
+# Lock the dashboard to your own phone/laptop. Find your MAC on the
+# dashboard's Devices tab or in your phone's WiFi settings (turn off
+# "private/random address" for this network first).
+allow_macs = []
+session_hours = 8
+
+[coin]
+chip = "/dev/gpiochip0"
+line = 12                   # PLACEHOLDER: find yours with `sudo pisowifi coin-probe`
+active_low = true           # ALLAN acceptors pull the signal to ground on each pulse
+debounce_ms = 5
+coin_gap_ms = 250           # silence that ends one coin's pulse burst
+pesos_per_pulse = 1         # program the acceptor: ₱1=1, ₱5=5, ₱10=10, ₱20=20 pulses
+insert_window_secs = 60
+# Optional: a GPIO that powers/enables the acceptor only while a customer
+# is inserting (via a relay or transistor). Stops "unclaimed" coins.
+# enable_line = 11
+# enable_active_low = false
+
+[storage]
+data_dir = "/var/lib/pisowifi"
