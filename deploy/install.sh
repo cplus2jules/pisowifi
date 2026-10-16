@@ -235,13 +235,16 @@ say "Locking the dashboard to your phone"
 if ((TEST_LAYOUT)); then
   echo "  Test layout: enter the MAC of the laptop's network adapter that will be"
   echo "  plugged into the customer side. Only it can open the dashboard and SSH in."
+  MAC_PROMPT="The laptop adapter's MAC (e.g. 00:e0:4c:11:22:33): "
+else
+  echo "  Customers share this network, so it's safest if only your phone can open"
+  echo "  the dashboard. In your phone's WiFi settings for this network, turn OFF"
+  echo "  the private/random address (iPhone: Private Wi-Fi Address; Android:"
+  echo "  MAC address type = Phone MAC), then copy the WiFi address shown there."
+  MAC_PROMPT="Your phone's WiFi MAC (e.g. a4:5e:60:11:22:33), or blank to skip: "
 fi
-echo "  Customers share this network, so it's safest if only your phone can open"
-echo "  the dashboard. In your phone's WiFi settings for this network, turn OFF"
-echo "  the private/random address (iPhone: Private Wi-Fi Address; Android:"
-echo "  MAC address type = Phone MAC), then copy the WiFi address shown there."
 while true; do
-  read -r -p "Your phone's WiFi MAC (e.g. a4:5e:60:11:22:33), or blank to skip: " OWNER_MAC
+  read -r -p "$MAC_PROMPT" OWNER_MAC
   if [[ -z "$OWNER_MAC" ]] && ((TEST_LAYOUT)); then
     warn "The test layout needs it: without it, nothing could log in after the restart."
     continue
