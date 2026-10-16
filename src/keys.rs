@@ -48,19 +48,61 @@ pub struct DerivedKeys {
     pub source: &'static str,
 }
 
-pub fn derive(data_dir: &Path, dev: bool) -> Result<DerivedKeys> {
-    let salt = read_or_create_secret(&data_dir.join("db.salt"))?;
-    let (ikm, source) = match (!dev).then(read_sid).flatten() {
-        Some(sid) => (sid, "SoC unique ID + salt"),
-        None => {
-            if !dev {
-                tracing::warn!(
-                    "no readable SoC ID; using a key file on the SD card. \
-                     The database is still encrypted, but someone with the card can decrypt it."
-                );
-            }
-            (read_or_create_secret(&data_dir.join("db.key"))?, "key file + salt")
+/// Which secret a database is locked to. It's recorded next to the database
+/// (`db.keysource`) the first time it opens, so a later boot never silently
+/// switches: a kernel that hides the chip ID, or starts showing it, must not
+/// make the database unreadable or start a new, empty one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Chip,
+    File,
+}
+
+const MARKER: &str = "db.keysource";
+
+pub fn chip_id_readable(dev: bool) -> bool {
+    !dev && read_sid().is_some()
+}
+
+pub fn recorded_source(data_dir: &Path) -> Option<Source> {
+    match fs::read_to_string(data_dir.join(MARKER)).ok()?.trim() {
+        "chip" => Some(Source::Chip),
+        "file" => Some(Source::File),
+        _ => None,
+    }
+}
+
+pub fn record_source(data_dir: &Path, source: Source) -> Result<()> {
+    let text = match source {
+        Source::Chip => "chip\n",
+        Source::File => "file\n",
+    };
+    if recorded_source(data_dir) != Some(source) {
+        fs::write(data_dir.join(MARKER), text).context("writing db.keysource")?;
+    }
+    Ok(())
+}
+
+/// Derives the key for `source`. With an existing database (`db_exists`),
+/// missing key material is an error, never silently replaced.
+pub fn derive(data_dir: &Path, source: Source, db_exists: bool) -> Result<DerivedKeys> {
+    for f in ["db.salt"].into_iter().chain((source == Source::File).then_some("db.key")) {
+        if db_exists && !data_dir.join(f).exists() {
+            bail!("{} is missing, so the database can't be opened. Restore it, or restore from a backup.", data_dir.join(f).display());
         }
+    }
+    let salt = read_or_create_secret(&data_dir.join("db.salt"))?;
+    let (ikm, source) = match source {
+        Source::Chip => match read_sid() {
+            Some(sid) => (sid, "SoC unique ID + salt"),
+            None => bail!(
+                "this database is locked to the board's chip ID, but the chip ID can't be read now \
+                 ({} is missing: a kernel change?). Nothing was changed. Boot the previous kernel, \
+                 or restore from a backup with `pisowifi restore`.",
+                SID_PATHS[0]
+            ),
+        },
+        Source::File => (read_or_create_secret(&data_dir.join("db.key"))?, "key file + salt"),
     };
     // v1: HKDF only (kept to open and upgrade old databases).
     let legacy = hkdf32(&salt, &ikm, b"pisowifi sqlcipher key v1")?;
@@ -116,4 +158,26 @@ pub fn read_or_create_secret(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     f.write_all(&b)?;
     f.sync_all()?;
     Ok(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_key_source_sticks_and_missing_material_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("pisowifi-keys-{}", rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(recorded_source(&dir), None);
+        record_source(&dir, Source::File).unwrap();
+        assert_eq!(recorded_source(&dir), Some(Source::File));
+        // A database that exists but whose key file is gone is never re-keyed.
+        let e = derive(&dir, Source::File, true).err().unwrap();
+        assert!(e.to_string().contains("missing"), "{e}");
+        // Fresh: key material is created, and derivation is repeatable.
+        let a = derive(&dir, Source::File, false).unwrap();
+        let b = derive(&dir, Source::File, true).unwrap();
+        assert_eq!(*a.key.0, *b.key.0);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

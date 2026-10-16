@@ -123,7 +123,8 @@ $("pw-toggle").addEventListener("click", () => {
 
 $("login-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const btn = ev.submitter;
+  // ev.submitter is missing before iOS 15.4.
+  const btn = ev.submitter || $("login-form").querySelector("button[type=submit]");
   const err = $("login-error");
   err.hidden = true;
   btn.disabled = true;
@@ -343,9 +344,12 @@ function renderSlot(slot, dev) {
   $("slot-chip").classList.toggle("busy", inserting);
   $("slot-chip-text").textContent = inserting ? peso(slot.pesos) + " in" : "Idle";
   $("slot-title").textContent = inserting ? "Device " + shortMac(slot.mac) + " is inserting" : "Waiting for a customer";
-  $("slot-sub").textContent = inserting
-    ? "Coins go to this device when they tap Done or the window ends."
-    : "Customers tap Insert coin on the portal first.";
+  $("slot-sub").textContent = !slot.reader_ok
+    ? "The coin slot can't be read, so customers can't insert coins. Check the [coin] settings and run: journalctl -u pisowifi"
+    : inserting
+      ? "Coins go to this device when they tap Done or the window ends."
+      : "Customers tap Insert coin on the portal first.";
+  if (!slot.reader_ok) $("slot-title").textContent = "Coin slot offline";
   const pct = inserting ? (100 * slot.secs_left) / slot.window_secs : 0;
   $("slot-fill").style.width = pct + "%";
   $("slot-marker").style.left = Math.min(pct, 82) + "%";

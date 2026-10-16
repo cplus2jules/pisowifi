@@ -1,8 +1,13 @@
 [Unit]
 Description=Piso WiFi vending service
 Documentation=file:///usr/local/share/doc/pisowifi/README.md
-After=network-online.target nftables.service dnsmasq.service
-Wants=network-online.target
+# Doesn't wait for the internet: the portal and coin slot work without it,
+# and the listeners don't need the LAN address yet (IP_FREEBIND).
+After=network.target nftables.service dnsmasq.service
+# Restarting nftables flushes customers' access; restarting with it puts it back.
+PartOf=nftables.service
+# Keep retrying (e.g. while something else still holds port 80).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

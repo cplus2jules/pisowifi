@@ -12,7 +12,7 @@ cargo zigbuild --release --target "$TARGET"
 OUT=dist/pisowifi
 rm -rf dist && mkdir -p "$OUT"
 cp "target/$TARGET/release/pisowifi" "$OUT/"
-cp deploy/install.sh deploy/uninstall.sh deploy/pisowifi.service deploy/dnsmasq-pisowifi.conf deploy/config.example.toml README.md "$OUT/"
+cp deploy/preflight.sh deploy/install.sh deploy/uninstall.sh deploy/pisowifi.service deploy/dnsmasq-pisowifi.conf deploy/config.example.toml README.md "$OUT/"
 chmod +x "$OUT"/*.sh "$OUT/pisowifi"
 (cd dist && tar czf pisowifi-armv7.tar.gz pisowifi && shasum -a 256 pisowifi-armv7.tar.gz > pisowifi-armv7.tar.gz.sha256)
 

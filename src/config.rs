@@ -139,6 +139,10 @@ impl Config {
         if !(80..=2000).contains(&self.coin.coin_gap_ms) {
             bail!("coin.coin_gap_ms must be between 80 and 2000");
         }
+        // Longer than a real pulse (20 ms and up) and no pulse is ever counted.
+        if self.coin.debounce_ms > 15 {
+            bail!("coin.debounce_ms must be 15 or less");
+        }
         for m in &self.admin.allow_macs {
             crate::net::Mac::parse(m).with_context(|| format!("admin.allow_macs: {m}"))?;
         }
