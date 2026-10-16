@@ -11,11 +11,20 @@ use crate::rates;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const VOUCHER_MAX_FAILS: u32 = 5;
 const VOUCHER_LOCKOUT: Duration = Duration::from_secs(10 * 60);
+/// A coin finishing within this long after its slot closed still counts
+/// for that customer (they tapped "Start internet" as it dropped).
+const LATE_COIN: Duration = Duration::from_secs(8);
+/// After a reservation expires with no coins, that phone waits this long
+/// before reserving again, so one phone can't hog the slot.
+const EMPTY_SLOT_COOLDOWN: Duration = Duration::from_secs(20);
+/// Longest grant accepted from anywhere (owner, voucher, hub): guards the clock maths.
+pub const MAX_GRANT_SECS: u64 = 400 * 86400;
 
 pub struct Engine {
     state: Mutex<State>,
@@ -25,6 +34,8 @@ pub struct Engine {
     pesos_per_pulse: u32,
     window: Duration,
     started: Instant,
+    /// The GPIO line is being read. While it isn't, coins are refused.
+    reader_ok: Arc<AtomicBool>,
 }
 
 struct State {
@@ -35,6 +46,12 @@ struct State {
     pulses_total: u64,
     /// Piso Pass held by each phone at this vendo (time leased from the hub).
     links: HashMap<Mac, String>,
+    /// Pulses have arrived and the coin isn't complete yet.
+    counting: bool,
+    /// The slot that closed most recently, for a coin still dropping then.
+    last_slot: Option<(Slot, Instant)>,
+    /// Phones whose reservation just ran out with no coins.
+    cooldown: HashMap<Mac, Instant>,
 }
 
 struct Client {
@@ -54,6 +71,7 @@ impl Client {
     }
 }
 
+#[derive(Clone)]
 struct Slot {
     mac: Mac,
     ip: Ipv4Addr,
@@ -101,11 +119,17 @@ pub struct SlotAdminView {
     pub pulses_total: u64,
     pub gated: bool,
     pub window_secs: u64,
+    /// The coin line is being read (false: coins are refused, check the log).
+    pub reader_ok: bool,
 }
 
 pub enum CoinStart {
     Ok,
     Busy(u64),
+    /// The coin reader isn't working: taking coins now would lose them.
+    Offline,
+    /// This phone's last reservation expired empty; try again in N s.
+    Wait(u64),
 }
 
 impl Engine {
@@ -115,6 +139,7 @@ impl Engine {
         enable: Option<(Enable, u32)>,
         pesos_per_pulse: u32,
         window_secs: u64,
+        reader_ok: Arc<AtomicBool>,
     ) -> anyhow::Result<Arc<Engine>> {
         let now = Instant::now();
         let mut clients = HashMap::new();
@@ -140,6 +165,9 @@ impl Engine {
                 voucher_fails: HashMap::new(),
                 pulses_total: 0,
                 links,
+                counting: false,
+                last_slot: None,
+                cooldown: HashMap::new(),
             }),
             db,
             fw,
@@ -147,6 +175,7 @@ impl Engine {
             pesos_per_pulse,
             window: Duration::from_secs(window_secs),
             started: now,
+            reader_ok,
         }))
     }
 
@@ -209,19 +238,32 @@ impl Engine {
     pub fn coin_start(&self, mac: Mac, ip: Ipv4Addr) -> CoinStart {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
-        if let Some(s) = &mut st.slot {
+        if let Some(s) = &st.slot {
             if s.mac != mac {
                 return CoinStart::Busy(s.deadline.saturating_duration_since(now).as_secs());
             }
-            s.deadline = now + self.window;
+            // Already yours. Only coins extend the window, so a phone can't
+            // hold the slot forever by tapping again.
             return CoinStart::Ok;
+        }
+        if !self.reader_ok.load(Ordering::Relaxed) {
+            return CoinStart::Offline;
+        }
+        if let Some(until) = st.cooldown.get(&mac).map(|t| *t + EMPTY_SLOT_COOLDOWN).filter(|t| *t > now) {
+            return CoinStart::Wait((until - now).as_secs() + 1);
         }
         st.slot = Some(Slot { mac, ip, pesos: 0, coins: vec![], deadline: now + self.window });
         self.set_acceptor(true);
         CoinStart::Ok
     }
 
+    /// A coin is still being counted (pulses arrived, burst not over yet).
+    pub fn counting(&self) -> bool {
+        self.state.lock().unwrap().counting
+    }
+
     /// Ends this phone's coin session; returns (pesos, seconds) credited.
+    /// Callers should wait while `counting()` so a coin mid-count isn't cut off.
     pub fn coin_done(&self, mac: Mac) -> Option<(u32, u64)> {
         let mut st = self.state.lock().unwrap();
         if st.slot.as_ref().is_some_and(|s| s.mac == mac) {
@@ -231,29 +273,64 @@ impl Engine {
         None
     }
 
+    /// A raw pulse from the acceptor: a coin is being counted.
+    pub fn pulse(&self) {
+        self.state.lock().unwrap().counting = true;
+    }
+
     /// One coin, decoded from a burst of `pulses` pulses.
     pub fn on_coin(&self, pesos: u32, pulses: u32) {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
+        st.counting = false;
         st.pulses_total += pulses as u64;
-        match &mut st.slot {
-            Some(s) => {
-                s.pesos += pesos;
-                s.coins.push(pesos);
-                s.deadline = now + self.window;
+        if ![1, 5, 10, 20].contains(&pesos) {
+            // Not a real coin's worth: two coins merged, a misread, or tampering.
+            tracing::warn!(pesos, pulses, "unusual pulse burst");
+            self.db.audit("coin", "unusual_burst", &format!("{pulses} pulses = ₱{pesos}"));
+        }
+        if let Some(s) = &mut st.slot {
+            s.pesos += pesos;
+            s.coins.push(pesos);
+            s.deadline = now + self.window;
+            return;
+        }
+        // The customer tapped "Start internet" (or time ran out) as this coin
+        // dropped: it's still theirs, priced as part of what they paid.
+        if let Some((prev, closed)) = st.last_slot.take().filter(|(_, t)| now - *t < LATE_COIN) {
+            let before = rates::secs_for(prev.pesos, &st.rates);
+            let total = prev.pesos + pesos;
+            let secs = rates::secs_for(total, &st.rates).saturating_sub(before);
+            tracing::info!(mac = %prev.mac, pesos, secs, "late coin credited");
+            if let Err(e) = self.db.add_sale(Some(prev.mac), pesos, secs, "coin") {
+                tracing::error!("recording sale: {e:#}");
             }
-            None => {
-                // Acceptor isn't gated and nobody tapped "Insert coin".
-                tracing::warn!(pesos, "coin received with no customer waiting");
-                let _ = self.db.add_sale(None, pesos, 0, "unclaimed");
+            if let Some(pass) = st.links.get(&prev.mac) {
+                if let Err(e) = self.db.outbox_add(pass, pesos, secs) {
+                    tracing::error!("queueing pass credit: {e:#}");
+                }
             }
+            self.add_time_locked(&mut st, prev.mac, prev.ip, secs);
+            st.last_slot = Some((Slot { pesos: total, ..prev }, closed));
+            return;
+        }
+        // Acceptor isn't gated and nobody tapped "Insert coin".
+        tracing::warn!(pesos, "coin received with no customer waiting");
+        let _ = self.db.add_sale(None, pesos, 0, "unclaimed");
+    }
+
+    /// On shutdown: credit coins already inserted instead of dropping them.
+    pub fn finish_open_slot(&self) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(slot) = st.slot.take() {
+            self.finish_slot(&mut st, slot);
         }
     }
 
     pub fn pause(&self, mac: Mac) -> bool {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
-        match st.clients.get_mut(&mac) {
+        let paused = match st.clients.get_mut(&mac) {
             Some(c) if c.until.is_some() => {
                 c.banked = c.remaining(now);
                 c.until = None;
@@ -261,14 +338,19 @@ impl Engine {
                 true
             }
             _ => false,
+        };
+        if paused {
+            // Saved now: a power cut must not bring it back as running.
+            self.persist_locked(&st, now);
         }
+        paused
     }
 
     pub fn resume(&self, mac: Mac, ip: Ipv4Addr) -> bool {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
         self.rebind(&mut st, mac, ip, now);
-        match st.clients.get_mut(&mac) {
+        let resumed = match st.clients.get_mut(&mac) {
             Some(c) if c.until.is_none() && !c.banked.is_zero() => {
                 c.until = Some(now + c.banked);
                 self.fw.allow(mac, c.ip, c.banked.as_secs());
@@ -276,7 +358,11 @@ impl Engine {
                 true
             }
             _ => false,
+        };
+        if resumed {
+            self.persist_locked(&st, now);
         }
+        resumed
     }
 
     /// Wrong voucher or pass codes lock a phone out for a while.
@@ -376,6 +462,7 @@ impl Engine {
             pulses_total: st.pulses_total,
             gated: self.enable.is_some(),
             window_secs: self.window.as_secs(),
+            reader_ok: self.reader_ok.load(Ordering::Relaxed),
         }
     }
 
@@ -397,10 +484,16 @@ impl Engine {
                 self.fw.revoke(mac, c.ip);
             }
         }
-        if st.slot.as_ref().is_some_and(|s| s.deadline <= now) {
+        // Never close the slot in the middle of counting a coin.
+        if !st.counting && st.slot.as_ref().is_some_and(|s| s.deadline <= now) {
             let slot = st.slot.take().unwrap();
+            if slot.pesos == 0 {
+                st.cooldown.insert(slot.mac, now);
+            }
             self.finish_slot(&mut st, slot);
         }
+        st.cooldown.retain(|_, t| now - *t < EMPTY_SLOT_COOLDOWN);
+        st.voucher_fails.retain(|_, (_, t)| t.elapsed() < VOUCHER_LOCKOUT);
     }
 
     pub fn snapshot(&self) -> Vec<ClientRow> {
@@ -426,6 +519,10 @@ impl Engine {
 
     pub fn pass_of(&self, mac: Mac) -> Option<String> {
         self.state.lock().unwrap().links.get(&mac).cloned()
+    }
+
+    pub fn has_time(&self, mac: Mac) -> bool {
+        self.state.lock().unwrap().clients.get(&mac).is_some_and(|c| !c.remaining(Instant::now()).is_zero())
     }
 
     pub fn holds_pass_time(&self, mac: Mac) -> bool {
@@ -512,6 +609,7 @@ impl Engine {
         if slot.pesos == 0 {
             return None;
         }
+        st.last_slot = Some((Slot { coins: vec![], ..slot.clone() }, Instant::now()));
         let secs = rates::secs_for(slot.pesos, &st.rates);
         tracing::info!(mac = %slot.mac, pesos = slot.pesos, secs, "coins credited");
         if let Err(e) = self.db.add_sale(Some(slot.mac), slot.pesos, secs, "coin") {
@@ -528,10 +626,10 @@ impl Engine {
 
     fn add_time_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, secs: u64) {
         let now = Instant::now();
-        let add = Duration::from_secs(secs);
+        let add = Duration::from_secs(secs.min(MAX_GRANT_SECS));
         let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO });
         // Paying (or a voucher) always starts the clock.
-        let total = c.remaining(now) + add;
+        let total = (c.remaining(now) + add).min(Duration::from_secs(MAX_GRANT_SECS));
         c.until = Some(now + total);
         c.banked = Duration::ZERO;
         c.ip = ip;
@@ -563,5 +661,82 @@ impl Engine {
         if let Some((en, line)) = &self.enable {
             en.set(on, *line);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::DbKey;
+    use zeroize::Zeroizing;
+
+    async fn engine(reader_ok: bool) -> (std::path::PathBuf, Arc<Engine>) {
+        let dir = std::env::temp_dir().join(format!("pisowifi-engine-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("t.db"), &DbKey(Zeroizing::new([7u8; 32]))).unwrap());
+        let fw = Firewall::start(&crate::config::Config::dev(dir.clone()), true).await.unwrap();
+        let e = Engine::new(db, fw, None, 1, 60, Arc::new(AtomicBool::new(reader_ok))).unwrap();
+        (dir, e)
+    }
+
+    const PHONE: &str = "02:11:22:33:44:55";
+    const IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 9);
+
+    fn remaining(e: &Engine, mac: Mac) -> u64 {
+        e.me(mac, IP).remaining_secs
+    }
+
+    #[tokio::test]
+    async fn a_coin_still_dropping_after_start_internet_is_credited() {
+        let (dir, e) = engine(true).await;
+        let mac = Mac::parse(PHONE).unwrap();
+        let rates = e.state.lock().unwrap().rates.clone();
+        assert!(matches!(e.coin_start(mac, IP), CoinStart::Ok));
+        e.pulse();
+        e.on_coin(5, 5);
+        assert_eq!(e.coin_done(mac), Some((5, rates::secs_for(5, &rates))));
+        // The ₱20 finishes counting just after "Start internet": still theirs,
+        // priced as ₱25 in total.
+        e.pulse();
+        assert!(e.counting());
+        e.on_coin(20, 20);
+        assert!(!e.counting());
+        // (The clock is running, so allow a second.)
+        assert!(rates::secs_for(25, &rates) - remaining(&e, mac) <= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_slot_owner_cant_extend_it_by_tapping_again() {
+        let (dir, e) = engine(true).await;
+        let (a, b) = (Mac::parse(PHONE).unwrap(), Mac::parse("02:00:00:00:00:02").unwrap());
+        assert!(matches!(e.coin_start(a, IP), CoinStart::Ok));
+        let deadline = e.state.lock().unwrap().slot.as_ref().unwrap().deadline;
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(matches!(e.coin_start(a, IP), CoinStart::Ok));
+        assert_eq!(e.state.lock().unwrap().slot.as_ref().unwrap().deadline, deadline);
+        assert!(matches!(e.coin_start(b, IP), CoinStart::Busy(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn coins_are_refused_while_the_reader_is_down() {
+        let (dir, e) = engine(false).await;
+        assert!(matches!(e.coin_start(Mac::parse(PHONE).unwrap(), IP), CoinStart::Offline));
+        assert!(!e.slot_admin().reader_ok);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pausing_is_saved_straight_away() {
+        let (dir, e) = engine(true).await;
+        let mac = Mac::parse(PHONE).unwrap();
+        e.coin_start(mac, IP);
+        e.on_coin(5, 5);
+        e.coin_done(mac);
+        assert!(e.pause(mac));
+        let row = e.db.load_clients().unwrap().into_iter().find(|r| r.mac == mac).unwrap();
+        assert!(row.paused, "a power cut now must not bring it back as running");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -28,7 +28,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Threat | What stops it |
 |---|---|
 | Customer gets online without paying | nftables forward policy is **drop**. Only devices whose MAC **and** IP are both in the paid set are routed. If the service dies, the table stays: it **fails closed**. |
-| Bypass over IPv6, DNS tunnels to outside resolvers | IPv6 from customers is dropped. Every DNS query is forced to the box's own resolver and rate-limited per device. |
+| Bypass over IPv6, DNS tunnels ("SlowDNS" apps) | IPv6 from customers is dropped. Every DNS query is forced to the box's own resolver; unpaid devices get only 10 lookups a second, enough to find the portal but too little for a usable tunnel. |
 | Customer pokes the ISP modem, SSH, or the box | Customers can reach only DHCP, DNS, the portal and the dashboard. Private ranges (192.168.x, 10.x, …) are unreachable. SSH works only from the modem side. |
 | Stolen or cloned SD card | The DB key is derived from the **H3 chip's factory ID** plus a random salt, stretched with Argon2id (64 MiB, 3 passes) so guessing the ID is slow. The key is never stored, so the card can't be opened on another board. **Stealing the whole box (chip and card) still opens the database**; at that point the Argon2id-hashed admin password is what protects your account. |
 | Admin password sniffed on the open WiFi | The dashboard is HTTPS only (TLS 1.2/1.3, rustls). The password is Argon2id-hashed (64 MiB, 3 passes). Sessions are bound to your IP with HttpOnly, Secure, SameSite=Strict cookies plus a CSRF token. |
@@ -42,6 +42,8 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 **Known limits** (true of every open-WiFi vendo, LPB included):
 - **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break. Fully preventing this needs WPA2 per-user keys.
 - **Client isolation.** Turn it on in the access point so customers can't see each other's devices.
+- **Piso Pass codes travel unencrypted** over the open WiFi, like everything on the portal. Someone sniffing nearby could copy a code and use its time. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
+- **SSH works only from the modem's side** (e.g. a laptop on the modem's own WiFi), never from the customer WiFi.
 
 ## Install on the Orange Pi
 
@@ -54,24 +56,42 @@ your guaranteed way back to LPB.
 ./scripts/build-pi.sh
 ```
 
-**2. Copy to the Pi.** Find its IP on your modem's device list, or run `ip addr` on the Pi:
+**2. Copy to the Pi.** Connect your computer to the **modem's** network (not
+the Piso WiFi), find the Pi's IP on the modem's device list, then:
 
 ```bash
 scp dist/pisowifi-armv7.tar.gz root@PI_IP:/root/
 ```
 
-**3. On the Pi:**
+**3. Check the board first.** `preflight.sh` changes nothing. It prints the
+OS, kernel, network interfaces, what LPB starts at boot, and whether this
+kernel accepts the firewall rules. Any `FAIL` line must be sorted out before
+installing:
 
 ```bash
-cd /root && tar xzf pisowifi-armv7.tar.gz && cd pisowifi && sudo ./install.sh
+cd /root && tar xzf pisowifi-armv7.tar.gz && cd pisowifi && sudo ./preflight.sh
 ```
 
-The installer asks before each step. It:
-- disables (doesn't delete) LPB's nginx, PHP, MariaDB and any `lpb` services
-- saves the old firewall and dnsmasq configs to `/root/lpb-backup-<date>/`
-- installs a fail-closed boot firewall and DHCP/DNS for `eth1`
-- prompts for your dashboard password
-- runs the coin probe and starts the service
+**4. Install:**
+
+```bash
+sudo ./install.sh
+```
+
+The installer asks before each step, and checks everything before touching
+LPB, so customers keep using LPB until step 5 of 7 and are offline for only a
+minute or two. It:
+- checks the interfaces (and asks if `eth0`/`eth1` are named differently) and dry-runs the firewall
+- installs nftables and dnsmasq if they're missing
+- prompts for your dashboard password and your phone's WiFi address
+- disables (doesn't delete) LPB's nginx, PHP, MariaDB and any `lpb` services, and lists other things LPB starts at boot (`rc.local`, cron, SSH keys) for you to check
+- saves LPB's firewall and dnsmasq settings to `/root/lpb-backup-<date>/`
+- runs the coin probe
+- installs a fail-closed boot firewall and DHCP/DNS for the customer side, and starts the service
+
+**5. Before you leave it:** check SSH works from the modem side, then
+`sudo reboot` once and check that the portal opens on a phone and a coin
+gives time.
 
 Roll back any time with `sudo ./uninstall.sh /root/lpb-backup-<date>`.
 
@@ -88,9 +108,15 @@ anything, measure the coin wire against ground with the Pi disconnected:
 | Measurement | Meaning |
 |---|---|
 | ~0 V, or floating | Safe to connect. |
-| 5–12 V | Put a PC817 optocoupler (or a 10k/4.7k voltage divider) in between. |
+| 5–12 V | Put a PC817 optocoupler in between (best). A resistor divider also works: 10k on top and 3.3k to ground for 12 V, or 10k and 20k for 5 V. Never connect it straight to the pin. |
 
-Also connect the 12 V supply's ground to the Pi's ground.
+Also connect the 12 V supply's ground to the Pi's ground. The Pi's built-in
+pull-up is weak; if coins are missed or counted twice, add a 10k resistor
+from the coin pin to 3.3 V (header pin 1).
+
+**Pin choice.** Only the PA and PG pins (header pins 3, 5, 7, 8, 10, 11, 13,
+15, 22, 26–29, 31–33, 35–38, 40) can signal each pulse instantly. Pins 12, 16,
+18, 19, 21, 23 and 24 work too, but are checked every millisecond instead.
 
 **Program the acceptor** for 1 pulse = ₱1 (₱1 = 1, ₱5 = 5, ₱10 = 10, ₱20 = 20 pulses).
 That's the usual LPB setting. If yours differs, change `pesos_per_pulse`.
@@ -104,8 +130,9 @@ quick coins ever show up as one, lower it; if one coin shows up as two, raise it
 sudo systemctl stop pisowifi && sudo pisowifi coin-probe
 ```
 
-Drop a coin and it prints something like `line 12 = PA12, header pin 3`. Put
-that number in `/etc/pisowifi/config.toml` under `[coin] line = …`, then:
+Drop a coin and it prints something like
+`header pin 3 (PA12): 5 pulses, each 48–52 ms long → set [coin] line = 12`.
+Put that number in `/etc/pisowifi/config.toml` under `[coin] line = …`, then:
 
 ```bash
 sudo systemctl start pisowifi
@@ -124,11 +151,17 @@ coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
 | Logs | `journalctl -u pisowifi -f` |
 | Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. |
 | Restore onto a replacement board | Stop the service, move `/var/lib/pisowifi/pisowifi.db` aside, then run `sudo pisowifi restore --from …`. |
+| Changed `config.toml`? | Restart (`sudo systemctl restart pisowifi`). If you changed interfaces or ports, also refresh the boot firewall: `sudo sh -c '{ echo "flush ruleset"; pisowifi print-firewall; } > /etc/nftables.conf'`. |
+| Coin slot offline | The dashboard says so, and the portal refuses coins instead of losing them. Check `[coin]` in the config and `journalctl -u pisowifi`. |
+| Dashboard certificate | Valid for 800 days and renewed automatically a month before it expires; your browser then warns once more, so check the new fingerprint with `sudo pisowifi admin-info`. |
 | Reset the password | `sudo pisowifi set-password`. Use 4+ random words or 14+ random characters, used nowhere else. Never reuse the old LPB password: LPB stored it in plain text in MariaDB on the SD card. |
 
 Because the DB key comes from the chip, **a dead board means the database
 can only be recovered from a `backup` file.** Make one after setup and
-whenever you change rates.
+whenever you change rates, and before any kernel upgrade (`apt upgrade`):
+the database stays locked to whichever key opened it first, and a kernel
+that can no longer read the chip ID stops the service with a clear message
+rather than starting an empty database.
 
 ## Develop on the Mac
 
@@ -159,6 +192,12 @@ are signed with test keys, so real phones refuse them.
 Run several vendos? Customers' time can follow them. Pay ₱20 at your store
 in Barangay A, use an hour, and the remaining time is waiting at your
 branch in Barangay B.
+
+> **Not ready for real money yet.** A review before the first deployment
+> found Piso Pass bugs that can lose or duplicate a customer's time when a
+> sync crosses a claim, plus pass links that pile up over weeks. Run single
+> vendos without a hub until those are fixed. A vendo that never joins a hub
+> is unaffected: all Piso Pass code stays switched off.
 
 ```
  Vendo A ──┐  outbound HTTPS only, every request signed (Ed25519)

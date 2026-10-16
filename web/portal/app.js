@@ -2,6 +2,14 @@
 // textContent, so nothing from the server can inject markup.
 "use strict";
 
+// Older phones (iOS 12/13, old Android WebViews) lack replaceChildren.
+if (!Element.prototype.replaceChildren) {
+  Element.prototype.replaceChildren = function (...nodes) {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    this.append(...nodes);
+  };
+}
+
 const $ = (id) => document.getElementById(id);
 const el = (tag, text, cls) => {
   const e = document.createElement(tag);
@@ -298,6 +306,7 @@ function confetti(from) {
     p.style.top = box.top + box.height / 2 + "px";
     layer.append(p);
     const dx = (Math.random() - 0.5) * 360, up = 160 + Math.random() * 200, spin = (Math.random() - 0.5) * 900;
+    if (!p.animate) { p.remove(); continue; }
     const a = p.animate([
       { transform: "translate(0, 0) rotate(0)", opacity: 1 },
       { transform: `translate(${dx * 0.6}px, ${-up}px) rotate(${spin / 2}deg)`, opacity: 1, offset: 0.35 },
@@ -480,6 +489,12 @@ async function action(btn, fn) {
   }
 }
 
+// Phones decide whether this WiFi "has internet" when the sign-in page loads.
+// Load it again after paying so the sign-in sheet closes and apps use WiFi.
+function recheckSoon() {
+  setTimeout(() => location.replace(location.pathname), 1800);
+}
+
 // ---- events -----------------------------------------------------------------
 
 $("slot").addEventListener("click", () =>
@@ -499,7 +514,10 @@ $("done").addEventListener("click", () =>
     if (before > 0) {
       confetti($("done"));
       if (r.pass_code) showPassSheet(r.pass_code);
-      else toast("You're online. Enjoy!");
+      else {
+        toast("You're online. Enjoy!");
+        recheckSoon();
+      }
     }
   }));
 
@@ -513,6 +531,7 @@ $("resume").addEventListener("click", () =>
   action($("resume"), async () => {
     await api("/resume", {});
     toast("Welcome back. You're online.");
+    recheckSoon();
   }));
 
 $("voucher-form").addEventListener("submit", (ev) => {
@@ -526,12 +545,14 @@ $("voucher-form").addEventListener("submit", (ev) => {
       $("code").value = "";
       confetti(btn);
       toast(r.secs > 0 ? "Piso Pass added: " + human(r.secs) + "." : "Piso Pass linked to this phone.");
+      if (r.secs > 0) recheckSoon();
       return;
     }
     const r = await api("/voucher", { code });
     $("code").value = "";
     confetti(btn);
     toast("Voucher added: " + human(r.secs) + ".");
+    recheckSoon();
   });
 });
 
@@ -541,7 +562,7 @@ $("code").addEventListener("input", (ev) => {
   const pass = raw.startsWith("PASS") || raw.length > 12;
   if (raw.startsWith("PASS")) raw = raw.slice(4);
   raw = raw.slice(0, pass ? 16 : 12);
-  const grouped = raw.match(/.{1,4}/g)?.join("-") ?? "";
+  const grouped = (raw.match(/.{1,4}/g) || []).join("-");
   ev.target.value = pass && grouped ? "PASS-" + grouped : grouped;
 });
 
@@ -578,7 +599,11 @@ function showPassSheet(code) {
   $("ps-box").focus({ preventScroll: true });
   renderPass();
 }
-$("ps-done").addEventListener("click", () => { $("pass-sheet").hidden = true; toast("You're online. Enjoy!"); });
+$("ps-done").addEventListener("click", () => {
+  $("pass-sheet").hidden = true;
+  toast("You're online. Enjoy!");
+  if (state && state.running) recheckSoon();
+});
 $("pass-sheet").addEventListener("click", (ev) => { if (ev.target === $("pass-sheet")) $("pass-sheet").hidden = true; });
 $("pass-show").addEventListener("click", () => {
   const code = storedPass();
@@ -648,7 +673,8 @@ $("ps-apple").addEventListener("click", () => addToWallet("apple", $("ps-apple")
 $("ps-google").addEventListener("click", () => addToWallet("google", $("ps-google")));
 
 // Opened from a wallet pass ("Use my time" → http://10.0.0.1/?pass=CODE):
-// keep the code on this phone, tidy the address bar, then claim it.
+// tidy the address bar, then offer to claim it. Never adopted silently, so a
+// planted link can't collect other customers' time.
 let deepPass = null;
 (() => {
   const q = new URLSearchParams(location.search);
@@ -658,34 +684,40 @@ let deepPass = null;
   const rest = q.toString();
   history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
   const raw = code.toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^PASS/, "");
-  if (raw.length !== 16) return;
-  const nice = "PASS-" + raw.match(/.{4}/g).join("-");
-  const stored = storedPass();
-  if (!stored || stored === nice) savePass(nice);
-  else deepPass = nice; // a different pass: only replace the saved one if it claims
+  if (raw.length === 16) deepPass = "PASS-" + raw.match(/.{4}/g).join("-");
 })();
 
-// A different pass than the one saved here: claim it first, keep it if that works.
-async function claimDeepPass() {
-  const code = deepPass;
-  deepPass = null;
-  try {
+function askDeepPass(code) {
+  $("cs-code").textContent = code;
+  $("claim-sheet").hidden = false;
+  $("cs-box").focus({ preventScroll: true });
+}
+const closeClaimSheet = () => { $("claim-sheet").hidden = true; deepPass = null; };
+$("cs-no").addEventListener("click", closeClaimSheet);
+$("claim-sheet").addEventListener("click", (ev) => { if (ev.target === $("claim-sheet")) closeClaimSheet(); });
+$("cs-yes").addEventListener("click", () =>
+  action($("cs-yes"), async () => {
+    const code = deepPass;
+    closeClaimSheet();
     const r = await api("/pass/claim", { code });
     savePass(code);
     toast(r.secs > 0 ? "Welcome back! " + human(r.secs) + " from your Piso Pass." : "Piso Pass linked to this phone.");
-    if (r.secs > 0) confetti($("meter"));
-    await refresh();
-  } catch (e) {
-    toast(e.message, true);
-  }
-}
+    if (r.secs > 0) {
+      confetti($("meter"));
+      recheckSoon();
+    }
+  }));
 
 // At another location: bring this phone's saved pass along automatically.
 async function maybeClaimPass() {
   if (passTried || !state.pass.enabled) return;
   if (deepPass) {
-    passTried = true;
-    return claimDeepPass();
+    // The pass already saved on this phone: nothing to ask.
+    if (deepPass === storedPass()) deepPass = null;
+    else {
+      passTried = true;
+      return askDeepPass(deepPass);
+    }
   }
   if (state.pass.linked) return;
   passTried = true;
@@ -696,6 +728,7 @@ async function maybeClaimPass() {
     if (r.secs > 0) {
       toast("Welcome back! " + human(r.secs) + " from your Piso Pass.");
       confetti($("meter"));
+      recheckSoon();
     }
     await refresh();
   } catch (e) {

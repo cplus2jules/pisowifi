@@ -142,7 +142,10 @@ fn main() -> Result<()> {
     } else {
         Config::load(&cli.config)?
     };
-    ensure_data_dir(&cfg.storage.data_dir)?;
+    // Read-only commands (used by preflight.sh) don't create anything.
+    if !matches!(cli.cmd, Cmd::PrintFirewall | Cmd::CoinProbe { .. }) {
+        ensure_data_dir(&cfg.storage.data_dir)?;
+    }
 
     match cli.cmd {
         Cmd::Run => tokio::runtime::Builder::new_multi_thread()
@@ -204,9 +207,11 @@ fn main() -> Result<()> {
         }
         Cmd::Hub { .. } => unreachable!(),
         Cmd::Restore { from } => {
-            let k = keys::derive(&cfg.storage.data_dir, cli.dev)?;
+            let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
+            let k = keys::derive(&cfg.storage.data_dir, source, false)?;
             let pass = rpassword::prompt_password("Backup passphrase: ")?;
             db::import_backup(&from, &pass, &db_path(&cfg), &k.key)?;
+            keys::record_source(&cfg.storage.data_dir, source)?;
             println!("Restored. Start the service again.");
             Ok(())
         }
@@ -260,26 +265,95 @@ fn db_path(cfg: &Config) -> PathBuf {
 }
 
 fn open_db(cfg: &Config, dev: bool) -> Result<db::Db> {
-    let k = keys::derive(&cfg.storage.data_dir, dev)?;
-    let db = db::open_migrating(&db_path(cfg), &k.key, &k.legacy)?;
-    tracing::info!("database unlocked (key from {})", k.source);
-    Ok(db)
+    use keys::Source;
+    let dir = &cfg.storage.data_dir;
+    let exists = db_path(cfg).exists();
+    let chip = keys::chip_id_readable(dev);
+    let candidates = match keys::recorded_source(dir) {
+        Some(s) => vec![s],
+        None if !exists => vec![if chip { Source::Chip } else { Source::File }],
+        // Made before the source was recorded: whichever key opens it.
+        None => [(chip, Source::Chip), (dir.join("db.key").exists(), Source::File)]
+            .into_iter()
+            .filter_map(|(ok, s)| ok.then_some(s))
+            .collect(),
+    };
+    let mut last = anyhow::anyhow!("no key material for {}", db_path(cfg).display());
+    for source in candidates {
+        if source == Source::File && !dev {
+            tracing::warn!(
+                "no readable SoC ID; using a key file on the SD card. \
+                 The database is still encrypted, but someone with the card can decrypt it."
+            );
+        }
+        let k = keys::derive(dir, source, exists)?;
+        match db::open_migrating(&db_path(cfg), &k.key, &k.legacy) {
+            Ok(db) => {
+                keys::record_source(dir, source)?;
+                tracing::info!("database unlocked (key from {})", k.source);
+                return Ok(db);
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 fn tls_names(cfg: &Config) -> Vec<String> {
     vec![cfg.network.portal_ip.to_string(), "pisowifi.local".into()]
 }
 
+/// Listens even before the address is on the interface (IP_FREEBIND), so a
+/// LAN adapter that comes up late doesn't stop the service.
+fn listen(addr: std::net::SocketAddr) -> Result<TcpListener> {
+    let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    sock.set_reuseaddr(true)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let on: libc::c_int = 1;
+        // SAFETY: plain setsockopt on a socket we own, with a correctly sized int.
+        let r = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_FREEBIND,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            tracing::warn!("IP_FREEBIND: {}", std::io::Error::last_os_error());
+        }
+    }
+    sock.bind(addr).with_context(|| format!("binding {addr} (is something else, like LPB's web server, using it?)"))?;
+    Ok(sock.listen(1024)?)
+}
+
 async fn run(cfg: Config, dev: bool) -> Result<()> {
     let db = Arc::new(open_db(&cfg, dev)?);
-    let fw = firewall::Firewall::start(&cfg, dev).await?;
+    // Everything that can fail goes before the firewall is replaced, so a
+    // failing start can't cut paying customers off over and over.
+    let portal_l = listen(cfg.portal.listen)?;
+    let admin_l = listen(cfg.admin.listen)?;
+    let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let enable = gpio::Enable::open(&cfg.coin)?.map(|e| (e, cfg.coin.enable_line.unwrap()));
-    let engine = engine::Engine::new(db.clone(), fw, enable, cfg.coin.pesos_per_pulse, cfg.coin.insert_window_secs)?;
+    let fw = firewall::Firewall::start(&cfg, dev).await?;
+    // In dev mode coins come from the dashboard's test buttons.
+    let reader_ok = Arc::new(std::sync::atomic::AtomicBool::new(dev));
+    let engine = engine::Engine::new(
+        db.clone(),
+        fw,
+        enable,
+        cfg.coin.pesos_per_pulse,
+        cfg.coin.insert_window_secs,
+        reader_ok.clone(),
+    )?;
 
     // Coin pulses -> engine.
     let (tx, mut rx) = mpsc::unbounded_channel();
     if !dev {
-        gpio::spawn_reader(&cfg.coin, tx);
+        gpio::spawn_reader(&cfg.coin, tx, reader_ok);
     }
     // The acceptor sends one burst per coin (₱5 = 5 pulses). A quiet gap
     // ends the burst, which tells us exactly which coin went in.
@@ -288,11 +362,12 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let ppp = cfg.coin.pesos_per_pulse;
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
+            e.pulse();
             let mut pulses = 1u32;
             while let Ok(Some(())) = tokio::time::timeout(gap, rx.recv()).await {
                 pulses += 1;
             }
-            e.on_coin(pulses * ppp, pulses);
+            e.on_coin(pulses.saturating_mul(ppp), pulses);
         }
     });
 
@@ -332,7 +407,6 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         });
     }
 
-    let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let fingerprint = admin_tls.as_ref().map(|t| t.fingerprint.clone()).unwrap_or_default();
     if db.get_setting(auth::PASSWORD_KEY)?.is_none() {
         if dev {
@@ -360,8 +434,6 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     });
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let portal_l = TcpListener::bind(cfg.portal.listen).await.with_context(|| format!("binding {}", cfg.portal.listen))?;
-    let admin_l = TcpListener::bind(cfg.admin.listen).await.with_context(|| format!("binding {}", cfg.admin.listen))?;
     let scheme = if dev { "http" } else { "https" };
     tracing::info!("portal on http://{}  dashboard on {scheme}://{}", cfg.portal.listen, cfg.admin.listen);
 
@@ -369,19 +441,21 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         portal_l,
         portal::router(state.clone()),
         None,
-        cfg.portal.max_connections,
+        server::Limits { max_conns: cfg.portal.max_connections, per_ip: 24, request_timeout: Duration::from_secs(20) },
         stop_rx.clone(),
     ));
     let a = tokio::spawn(server::serve(
         admin_l,
         admin::router(state.clone()),
         admin_tls.map(|t| t.acceptor),
-        32,
+        // Uploads (logo, poster) get longer.
+        server::Limits { max_conns: 32, per_ip: 8, request_timeout: Duration::from_secs(60) },
         stop_rx,
     ));
 
     shutdown_signal().await;
     tracing::info!("shutting down; saving sessions");
+    engine.finish_open_slot();
     engine.persist();
     let _ = stop_tx.send(true);
     let _ = tokio::join!(p, a);

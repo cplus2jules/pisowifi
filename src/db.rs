@@ -641,7 +641,7 @@ pub(crate) fn apply_key(conn: &Connection, key: &DbKey) -> Result<()> {
         .context("cannot decrypt database (wrong board, or the salt file changed)")?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
+         PRAGMA synchronous = FULL;
          PRAGMA secure_delete = ON;
          PRAGMA foreign_keys = ON;
          PRAGMA temp_store = MEMORY;",

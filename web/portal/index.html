@@ -156,6 +156,21 @@
   </div>
 </div>
 
+<!-- Piso Pass from a link: confirm before moving any time ------------------->
+<div class="onboard" id="claim-sheet" role="dialog" aria-modal="true" aria-labelledby="cs-title" hidden>
+  <div class="ob-sheet pass-sheet" tabindex="-1" id="cs-box">
+    <div class="ticket-big">
+      <small>Piso Pass</small>
+      <b id="cs-code">PASS-0000-0000-0000-0000</b>
+      <span>From the link you opened</span>
+    </div>
+    <h2 id="cs-title">Use this pass here?</h2>
+    <p>Its time moves to this phone, and any time already on this phone is added to it. Only continue if this is your own pass.</p>
+    <button type="button" class="btn primary block" id="cs-yes">Use my time</button>
+    <button type="button" class="btn ghost" id="cs-no">Not now</button>
+  </div>
+</div>
+
 <!-- onboarding ------------------------------------------------------------>
 <div class="onboard" id="onboard" role="dialog" aria-modal="true" aria-labelledby="ob-title" hidden>
   <div class="ob-sheet" id="ob-sheet" tabindex="-1">

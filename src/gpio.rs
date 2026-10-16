@@ -1,8 +1,13 @@
 //! Coin acceptor I/O through the Linux GPIO character device (/dev/gpiochipN).
 //! Each pulse from the acceptor arrives as one `()` on the channel.
+//!
+//! On the H3 only the PA and PG banks can raise interrupts. A coin wire on
+//! any other header pin (PC, PD) is polled every millisecond instead.
 
 use crate::config::Coin;
 use anyhow::Result;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Orange Pi One / PC 40-pin header: (physical pin, H3 pin name, line offset
@@ -29,17 +34,21 @@ mod imp {
     use super::*;
     use gpiocdev::line::{Bias, EdgeDetection, Value};
     use gpiocdev::Request;
-    use std::time::Duration;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    pub fn spawn_reader(cfg: &Coin, tx: mpsc::UnboundedSender<()>) {
+    /// Reads pulses forever. `ok` says whether the line is being read, so the
+    /// portal can refuse coins (instead of losing them) while it isn't.
+    pub fn spawn_reader(cfg: &Coin, tx: mpsc::UnboundedSender<()>, ok: Arc<AtomicBool>) {
         let cfg = cfg.clone();
         std::thread::Builder::new()
             .name("coin-reader".into())
             .spawn(move || loop {
-                match read_loop(&cfg, &tx) {
+                match read_loop(&cfg, &tx, &ok) {
                     Ok(()) => return,
                     Err(e) => {
-                        tracing::error!("coin slot: {e:#}; retrying in 5s");
+                        ok.store(false, Ordering::Relaxed);
+                        tracing::error!("coin slot: {e:#}; retrying in 5s (the portal refuses coins until then)");
                         std::thread::sleep(Duration::from_secs(5));
                     }
                 }
@@ -47,25 +56,60 @@ mod imp {
             .expect("spawn coin reader");
     }
 
-    fn read_loop(cfg: &Coin, tx: &mpsc::UnboundedSender<()>) -> Result<()> {
+    fn input(cfg: &Coin, edges: bool) -> gpiocdev::Result<Request> {
         let mut b = Request::builder();
-        b.on_chip(&cfg.chip)
-            .with_consumer("pisowifi-coin")
-            .with_line(cfg.line)
-            .as_input()
-            .with_bias(Bias::PullUp)
-            .with_debounce_period(Duration::from_millis(cfg.debounce_ms))
+        b.on_chip(&cfg.chip).with_consumer("pisowifi-coin").with_line(cfg.line).as_input().with_bias(Bias::PullUp);
+        if edges {
             // With active-low, "rising" means the acceptor started a pulse.
-            .with_edge_detection(EdgeDetection::RisingEdge);
+            b.with_debounce_period(Duration::from_millis(cfg.debounce_ms))
+                .with_edge_detection(EdgeDetection::RisingEdge)
+                .with_kernel_event_buffer_size(256);
+        }
         if cfg.active_low {
             b.as_active_low();
         }
-        let req = b.request()?;
+        b.request()
+    }
+
+    fn read_loop(cfg: &Coin, tx: &mpsc::UnboundedSender<()>, ok: &AtomicBool) -> Result<()> {
+        let req = match input(cfg, true) {
+            Ok(r) => r,
+            Err(e) => {
+                // No interrupts on this pin (or no debounce support in an old
+                // kernel): poll it. A busy or missing line fails here too.
+                let r = input(cfg, false)?;
+                tracing::warn!("coin slot: {} can't signal edges ({e}); polling it every 1 ms", describe_line(cfg.line));
+                return poll_loop(cfg, &r, tx, ok);
+            }
+        };
         tracing::info!("coin slot listening on {} {}", cfg.chip, describe_line(cfg.line));
+        ok.store(true, Ordering::Relaxed);
         loop {
             req.read_edge_event()?;
             if tx.send(()).is_err() {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Software debounce: a level counts once it has held for `debounce_ms`.
+    fn poll_loop(cfg: &Coin, req: &Request, tx: &mpsc::UnboundedSender<()>, ok: &AtomicBool) -> Result<()> {
+        let debounce = Duration::from_millis(cfg.debounce_ms);
+        let mut stable = req.value(cfg.line)?;
+        let (mut seen, mut since) = (stable, Instant::now());
+        tracing::info!("coin slot polling {} {}", cfg.chip, describe_line(cfg.line));
+        ok.store(true, Ordering::Relaxed);
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            let v = req.value(cfg.line)?;
+            let now = Instant::now();
+            if v != seen {
+                (seen, since) = (v, now);
+            } else if v != stable && now - since >= debounce {
+                stable = v;
+                if stable == Value::Active && tx.send(()).is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -92,42 +136,85 @@ mod imp {
         }
     }
 
-    /// Watches every free line on the chip and prints which ones toggle.
+    /// One header pin being watched by `probe`.
+    struct Watch {
+        pin: u8,
+        name: &'static str,
+        line: u32,
+        req: Request,
+        edges: bool,
+        last: Value,
+        /// Current burst: pulse count, first/last edge, shortest/longest low time.
+        pulses: u32,
+        low_since: Option<Instant>,
+        last_edge: Option<Instant>,
+        widths: (u128, u128),
+    }
+
+    /// Watches every header pin (each on its own, so a busy pin doesn't hide
+    /// the rest) and prints each burst of pulses: which pin, how many pulses,
+    /// and how wide they are.
     pub fn probe(chip: &str) -> Result<()> {
-        let c = gpiocdev::Chip::from_path(chip)?;
-        let n = c.info()?.num_lines;
-        let free: Vec<u32> = (0..n).filter(|&o| c.line_info(o).map(|i| !i.used).unwrap_or(false)).collect();
-        println!("Watching {} free lines on {chip}. Drop a coin (Ctrl-C to stop)…", free.len());
-        let mut handles = vec![];
-        for chunk in free.chunks(64) {
-            let mut b = Request::builder();
-            b.on_chip(chip)
+        let mut watches = vec![];
+        for &(pin, name, line) in ORANGE_PI_ONE_HEADER {
+            let edges = Request::builder()
+                .on_chip(chip)
                 .with_consumer("pisowifi-probe")
-                .with_lines(chunk)
+                .with_line(line)
                 .as_input()
-                .with_bias(Bias::PullUp)
-                .with_edge_detection(EdgeDetection::BothEdges);
-            let req = match b.request() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("skipping lines {chunk:?}: {e}");
-                    continue;
+                .with_edge_detection(EdgeDetection::BothEdges)
+                .request()
+                .is_ok();
+            let req = Request::builder().on_chip(chip).with_consumer("pisowifi-probe").with_line(line).as_input().with_bias(Bias::PullUp).request();
+            match req {
+                Ok(req) => {
+                    let last = req.value(line)?;
+                    watches.push(Watch { pin, name, line, req, edges, last, pulses: 0, low_since: None, last_edge: None, widths: (u128::MAX, 0) });
                 }
-            };
-            handles.push(std::thread::spawn(move || loop {
-                match req.read_edge_event() {
-                    Ok(ev) => println!("pulse edge on {}", describe_line(ev.offset)),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        return;
+                Err(e) => println!("  header pin {pin:>2} ({name}): can't watch it ({e}); in use by something else?"),
+            }
+        }
+        println!("Watching {} header pins on {chip}. Drop a few coins (Ctrl-C to stop)…", watches.len());
+        println!("(If nothing shows up, check the acceptor has power and its COIN wire goes to a header pin.)\n");
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            let now = Instant::now();
+            for w in &mut watches {
+                let v = w.req.value(w.line)?;
+                if v != w.last {
+                    w.last = v;
+                    w.last_edge = Some(now);
+                    // The acceptor pulls the wire low for each pulse.
+                    match v {
+                        Value::Inactive => {
+                            w.pulses += 1;
+                            w.low_since = Some(now);
+                        }
+                        Value::Active => {
+                            if let Some(t) = w.low_since.take() {
+                                let ms = (now - t).as_millis();
+                                w.widths = (w.widths.0.min(ms), w.widths.1.max(ms));
+                            }
+                        }
                     }
                 }
-            }));
+                if w.pulses > 0 && w.last_edge.is_some_and(|t| now - t > Duration::from_millis(400)) {
+                    let (lo, hi) = w.widths;
+                    let width = if hi == 0 { String::new() } else { format!(", each {lo}–{hi} ms long") };
+                    let polled = if w.edges { "" } else { " (no interrupts on this pin: pisowifi will poll it)" };
+                    println!(
+                        "header pin {} ({}): {} pulse{}{width} → set [coin] line = {}{polled}",
+                        w.pin,
+                        w.name,
+                        w.pulses,
+                        if w.pulses == 1 { "" } else { "s" },
+                        w.line
+                    );
+                    w.pulses = 0;
+                    w.widths = (u128::MAX, 0);
+                }
+            }
         }
-        for h in handles {
-            let _ = h.join();
-        }
-        Ok(())
     }
 }
 
@@ -135,7 +222,7 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn spawn_reader(_cfg: &Coin, _tx: mpsc::UnboundedSender<()>) {
+    pub fn spawn_reader(_cfg: &Coin, _tx: mpsc::UnboundedSender<()>, _ok: Arc<AtomicBool>) {
         tracing::warn!("GPIO is only available on Linux; use the dashboard's test-coin button");
     }
 

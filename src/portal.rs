@@ -104,11 +104,23 @@ async fn coin_start(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Soc
             Json(json!({ "error": "Someone else is inserting coins. Please wait.", "secs_left": secs })),
         )
             .into_response()),
+        CoinStart::Offline => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The coin slot isn't working right now. Please don't insert coins; tell the owner.",
+        )),
+        CoinStart::Wait(secs) => Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("Please wait {secs} s, then tap Insert coin again."))),
     }
 }
 
 async fn coin_done(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<serde_json::Value>> {
     let (mac, _) = st.identify(addr)?;
+    // A coin still dropping (a ₱20 is 20 pulses, ~2 s) counts before we close.
+    for _ in 0..80 {
+        if !st.engine.counting() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let credited = st.engine.coin_done(mac);
     // First purchase in a chain: give this phone a Piso Pass.
     if let (Some(hub), Some((pesos, secs))) = (&st.hub, credited) {
@@ -170,8 +182,9 @@ async fn pass_claim(
     }
     match hub.claim(req.code).await {
         Ok(r) => {
-            let total = st.engine.claim_into(mac, ip, r.pass_id, r.secs);
-            Ok(Json(json!({ "ok": true, "secs": r.secs, "total": total })))
+            let secs = r.secs.min(crate::engine::MAX_GRANT_SECS);
+            let total = st.engine.claim_into(mac, ip, r.pass_id, secs);
+            Ok(Json(json!({ "ok": true, "secs": secs, "total": total })))
         }
         Err(crate::hubclient::HubError::NotFound) => {
             st.engine.record_code_fail(mac);
@@ -230,6 +243,9 @@ async fn pass_save(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Sock
     };
     if st.engine.pass_of(mac).is_some() {
         return Err(ApiError::bad("This phone already has a Piso Pass."));
+    }
+    if !st.engine.has_time(mac) {
+        return Err(ApiError::bad("There's no time on this phone to save."));
     }
     let code = new_pass(&st, &hub, mac, None).await?;
     Ok(Json(json!({ "ok": true, "pass_code": code })))

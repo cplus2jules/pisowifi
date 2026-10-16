@@ -6,7 +6,9 @@
 //!   to the local resolver;
 //! * customers can never reach the ISP modem, other private ranges, SSH, or
 //!   anything on this box besides DHCP, DNS, the portal and the dashboard;
-//! * IPv6 from customers is dropped so it can't be used to bypass the portal.
+//! * IPv6 from customers is dropped so it can't be used to bypass the portal;
+//! * unpaid phones get a small DNS allowance (enough to find the portal, too
+//!   little for DNS-tunnel "free internet" apps).
 //!
 //! It fails closed: if the daemon dies, the table stays and nobody new gets
 //! online; existing grants expire by themselves via kernel set timeouts.
@@ -75,10 +77,12 @@ impl Firewall {
 }
 
 async fn allow(mac: Mac, ip: Ipv4Addr, secs: u64) -> Result<()> {
-    // Re-adding an element doesn't refresh its timeout, so delete first.
-    let _ = run_nft(&del_element(mac, ip)).await;
+    // Re-adding an element doesn't refresh its timeout, so it's replaced. All
+    // in one transaction: a customer topping up never loses connectivity in
+    // between (the first add makes sure the delete has something to delete).
     run_nft(&format!(
-        "add element inet pisowifi allowed {{ {mac} . {ip} timeout {}s }}\n",
+        "add element inet pisowifi allowed {{ {mac} . {ip} }}\n{}add element inet pisowifi allowed {{ {mac} . {ip} timeout {}s }}\n",
+        del_element(mac, ip),
         secs + KERNEL_GRACE_SECS
     ))
     .await
@@ -90,7 +94,8 @@ fn del_element(mac: Mac, ip: Ipv4Addr) -> String {
 
 async fn run_nft(script: &str) -> Result<()> {
     let mut child = Command::new("nft")
-        .args(["-f", "-"])
+        // /dev/stdin rather than "-": older nft releases don't know "-".
+        .args(["-f", "/dev/stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -128,7 +133,7 @@ table inet pisowifi {{
     }}
 
     chain prerouting {{
-        type nat hook prerouting priority dstnat; policy accept;
+        type nat hook prerouting priority -100; policy accept;
         iifname "{lan}" ip daddr != {portal} udp dport 53 dnat ip to {portal}:53
         iifname "{lan}" ip daddr != {portal} tcp dport 53 dnat ip to {portal}:53
         iifname "{lan}" ether saddr . ip saddr @allowed return
@@ -136,7 +141,7 @@ table inet pisowifi {{
     }}
 
     chain input {{
-        type filter hook input priority filter; policy accept;
+        type filter hook input priority 0; policy accept;
         iifname "lo" accept
         iifname "{lan}" jump lan_in
         iifname "{wan}" jump wan_in
@@ -150,10 +155,13 @@ table inet pisowifi {{
         icmp type echo-request limit rate 5/second accept
         udp dport 67 accept
         udp dport 53 meter dns_flood {{ ip saddr limit rate over 50/second burst 100 packets }} drop
+        meta l4proto {{ tcp, udp }} th dport 53 ether saddr . ip saddr @allowed accept
+        meta l4proto {{ tcp, udp }} th dport 53 meter dns_unpaid {{ ip saddr limit rate over 10/second burst 30 packets }} drop
         meta l4proto {{ tcp, udp }} th dport 53 accept
-        tcp dport {portal_port} meter portal_flood {{ ip saddr limit rate over 20/second burst 40 packets }} drop
+        tcp dport {portal_port} ct state new meter portal_flood {{ ip saddr limit rate over 20/second burst 40 packets }} drop
         tcp dport {admin_port} ct state new meter admin_flood {{ ip saddr limit rate over 3/second burst 12 packets }} drop
         tcp dport {{ {portal_port}, {admin_port} }} accept
+        tcp dport 443 reject with tcp reset
         drop
     }}
 
@@ -167,7 +175,7 @@ table inet pisowifi {{
     }}
 
     chain forward {{
-        type filter hook forward priority filter; policy drop;
+        type filter hook forward priority 0; policy drop;
         ct state invalid drop
         iifname "{wan}" oifname "{lan}" ct state established,related accept
         iifname "{lan}" meta nfproto ipv6 drop
@@ -178,7 +186,7 @@ table inet pisowifi {{
     }}
 
     chain postrouting {{
-        type nat hook postrouting priority srcnat; policy accept;
+        type nat hook postrouting priority 100; policy accept;
         oifname "{wan}" masquerade
     }}
 }}
@@ -203,5 +211,10 @@ mod tests {
         assert!(r.contains("dnat ip to 10.0.0.1:80"));
         assert!(r.contains("ip saddr != 10.0.0.0/19"));
         assert!(r.contains("policy drop"));
+        // Flood limits count new connections, not every packet of a page load.
+        assert!(r.contains("tcp dport 80 ct state new meter portal_flood"));
+        // Paid phones' DNS is accepted before the unpaid allowance applies.
+        let paid = r.find("th dport 53 ether saddr . ip saddr @allowed accept").unwrap();
+        assert!(paid < r.find("meter dns_unpaid").unwrap());
     }
 }
