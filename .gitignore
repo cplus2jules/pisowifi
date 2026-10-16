@@ -16,3 +16,6 @@ dev-password.txt
 
 # Local launch config (absolute paths)
 .claude/launch.json
+
+# Throwaway wallet test fixtures (not secrets)
+!testdata/**/*.pem

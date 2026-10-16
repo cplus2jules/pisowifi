@@ -11,6 +11,14 @@ DynamicUser=yes
 StateDirectory=pisowifi-hub
 StateDirectoryMode=0700
 UMask=0077
+# Wallet passes (optional, README → Wallet passes): hand the signing keys to
+# the hub without making the files readable by anyone else. Uncomment the
+# lines for the wallets you use; the hub sees them under
+# /run/credentials/pisowifi-hub.service/.
+#LoadCredential=google-wallet.json:/etc/pisowifi/wallet/google-service-account.json
+#LoadCredential=pass-cert.pem:/etc/pisowifi/wallet/pass-cert.pem
+#LoadCredential=pass-key.pem:/etc/pisowifi/wallet/pass-key.pem
+#LoadCredential=wwdr.pem:/etc/pisowifi/wallet/wwdr.pem
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict

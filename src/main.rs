@@ -18,6 +18,7 @@ mod pwpolicy;
 mod rates;
 mod server;
 mod tls;
+mod wallet;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -78,8 +79,9 @@ enum Cmd {
     LeaveHub,
     /// Run or manage the hub (on your cloud server)
     Hub {
-        #[arg(long, default_value = "/etc/pisowifi/hub.toml")]
-        hub_config: PathBuf,
+        /// Path to hub.toml [default: /etc/pisowifi/hub.toml; with --dev, built-in dev settings]
+        #[arg(long)]
+        hub_config: Option<PathBuf>,
         #[command(subcommand)]
         cmd: HubCmd,
     },
@@ -123,7 +125,11 @@ fn main() -> Result<()> {
     }
 
     if let Cmd::Hub { hub_config, cmd } = &cli.cmd {
-        let cfg = if cli.dev { hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")) } else { hub::HubConfig::load(hub_config)? };
+        let cfg = match (hub_config, cli.dev) {
+            (Some(path), _) => hub::HubConfig::load(path)?,
+            (None, true) => hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")),
+            (None, false) => hub::HubConfig::load(Path::new("/etc/pisowifi/hub.toml"))?,
+        };
         return run_hub(cfg, cmd);
     }
     let cfg = if cli.dev {
