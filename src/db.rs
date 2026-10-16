@@ -335,15 +335,6 @@ impl Db {
         Ok(out)
     }
 
-    pub fn outbox_add(&self, pass_id: &str, pesos: u32, secs: u64) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO hub_outbox (pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4)",
-            params![pass_id, pesos, secs as i64, now()],
-        )?;
-        Ok(())
-    }
-
     pub fn outbox_list(&self, limit: u32) -> Result<Vec<crate::hub::proto::CreditReport>> {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare("SELECT id, pass_id, pesos, secs, ts FROM hub_outbox ORDER BY id LIMIT ?1")?;
@@ -876,8 +867,12 @@ mod tests {
         let (_dir, db) = test_db();
         let mac = Mac::parse("02:11:22:33:44:55").unwrap();
         let fill = |db: &Db| {
-            db.save(&Batch { links: vec![(mac, "p_1".into())], ..Default::default() }).unwrap();
-            db.outbox_add("p_1", 5, 600).unwrap();
+            db.save(&Batch {
+                links: vec![(mac, "p_1".into())],
+                ledger: vec![Ledger::PassCredit { pass_id: "p_1".into(), pesos: 5, secs: 600 }],
+                ..Default::default()
+            })
+            .unwrap();
         };
         let held = |db: &Db| (db.load_links().unwrap().len(), db.outbox_list(10).unwrap().len());
         // Links made before the owner was recorded belong to the current hub.
