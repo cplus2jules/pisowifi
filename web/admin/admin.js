@@ -217,7 +217,7 @@ function renderOverview() {
   renderActivity(o);
   renderSlot(o.slot, o.dev);
   renderMiniDevices(o.clients);
-  if (currentTab === "devices") renderDevices(o.clients);
+  if (currentTab === "devices") renderDevices(o.clients, o.lan_devices || []);
   if (currentTab === "activity") renderRecent(s.recent);
 }
 
@@ -390,21 +390,23 @@ for (const b of document.querySelectorAll("[data-coin]")) {
 
 // ---- devices --------------------------------------------------------------
 
-function renderDevices(clients) {
+function addTimeButton(mac, mins, label) {
+  return el("button", {
+    class: "btn small outline", type: "button", text: label,
+    onclick: (ev) => busy(ev.currentTarget, async () => {
+      const r = await api("POST", "/clients/" + encodeURIComponent(mac) + "/time", { minutes: mins });
+      toast("Added " + label.slice(1) + " to " + shortMac(mac) + (r.paused ? " (paused: it starts when they resume)" : ""));
+      poll();
+    }),
+  });
+}
+
+function renderDevices(clients, others) {
   const tb = $("devices");
   tb.replaceChildren();
   $("devices-empty").hidden = clients.length > 0;
   $("devices-sub").textContent = overview.active + " online · " + (clients.length - overview.active) + " paused";
   for (const c of clients) {
-    const add = (mins, label) =>
-      el("button", {
-        class: "btn small outline", type: "button", text: label,
-        onclick: (ev) => busy(ev.currentTarget, async () => {
-          await api("POST", "/clients/" + encodeURIComponent(c.mac) + "/time", { minutes: mins });
-          toast("Added " + label.slice(1) + " to " + shortMac(c.mac));
-          poll();
-        }),
-      });
     const kick = el("button", {
       class: "btn small danger", type: "button", text: "Disconnect",
       onclick: (ev) => {
@@ -421,7 +423,18 @@ function renderDevices(clients) {
       el("td", { class: "mono", text: c.ip }),
       el("td", {}, el("span", { class: "status " + (c.running ? "on" : "off"), text: c.running ? "Online" : "Paused" })),
       el("td", { class: "time", text: clock(c.remaining_secs) }),
-      el("td", { class: "r" }, el("span", { class: "actions" }, add(30, "+30 min"), add(60, "+1 hr"), kick))));
+      el("td", { class: "r" }, el("span", { class: "actions" }, addTimeButton(c.mac, 30, "+30 min"), addTimeButton(c.mac, 60, "+1 hr"), kick))));
+  }
+
+  const ob = $("lan-devices");
+  ob.replaceChildren();
+  $("lan-empty").hidden = others.length > 0;
+  for (const d of others) {
+    // The name is whatever the device told the DHCP server: shown as text only.
+    ob.append(el("tr", {},
+      el("td", {}, el("span", { class: "mono", text: d.mac }), d.name ? el("div", { class: "sub", text: d.name }) : null),
+      el("td", { class: "mono", text: d.ip }),
+      el("td", { class: "r" }, el("span", { class: "actions" }, addTimeButton(d.mac, 30, "+30 min"), addTimeButton(d.mac, 60, "+1 hr")))));
   }
 }
 

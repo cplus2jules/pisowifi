@@ -28,6 +28,10 @@ pub struct Network {
     pub portal_ip: Ipv4Addr,
     /// LAN subnet, e.g. "10.0.0.0/19".
     pub lan_cidr: String,
+    /// dnsmasq's lease file. A customer's time only follows their device to
+    /// a new address that dnsmasq leased to it (stops MAC cloning).
+    #[serde(default = "default_leases")]
+    pub dhcp_leases: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +83,10 @@ pub struct Coin {
     pub enable_line: Option<u32>,
     #[serde(default)]
     pub enable_active_low: bool,
+    /// Only count pulses this long, in ms, e.g. [15, 150]. Off when absent.
+    /// Measure your acceptor with `pisowifi coin-probe` before turning it on.
+    #[serde(default)]
+    pub pulse_width_ms: Option<[u64; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +96,9 @@ pub struct Storage {
     pub data_dir: PathBuf,
 }
 
+fn default_leases() -> PathBuf {
+    PathBuf::from("/var/lib/misc/dnsmasq.leases")
+}
 fn default_true() -> bool {
     true
 }
@@ -143,6 +154,11 @@ impl Config {
         if self.coin.debounce_ms > 15 {
             bail!("coin.debounce_ms must be 15 or less");
         }
+        if let Some([lo, hi]) = self.coin.pulse_width_ms {
+            if lo >= hi || hi > 1000 {
+                bail!("coin.pulse_width_ms must look like [15, 150] (shortest, longest; at most 1000)");
+            }
+        }
         for m in &self.admin.allow_macs {
             crate::net::Mac::parse(m).with_context(|| format!("admin.allow_macs: {m}"))?;
         }
@@ -171,6 +187,7 @@ impl Config {
                 wan_iface: "en0".into(),
                 portal_ip: Ipv4Addr::new(127, 0, 0, 1),
                 lan_cidr: "127.0.0.0/8".into(),
+                dhcp_leases: data_dir.join("dnsmasq.leases"),
             },
             portal: Portal {
                 listen: "127.0.0.1:8080".parse().unwrap(),
@@ -191,6 +208,7 @@ impl Config {
                 insert_window_secs: 60,
                 enable_line: None,
                 enable_active_low: false,
+                pulse_width_ms: None,
             },
             storage: Storage { data_dir },
         }
@@ -200,4 +218,69 @@ impl Config {
 pub fn in_subnet(ip: Ipv4Addr, net: Ipv4Addr, prefix: u8) -> bool {
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
     (u32::from(ip) & mask) == (u32::from(net) & mask)
+}
+
+/// Adds `mac` to `[admin] allow_macs` in the config file, keeping its
+/// comments and layout. Returns false if it was already there.
+pub fn add_admin_mac(path: &Path, mac: crate::net::Mac) -> Result<bool> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = raw.parse().context("parsing config")?;
+    let admin = doc
+        .entry("admin")
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .context("[admin] in the config isn't a table")?;
+    let list = admin
+        .entry("allow_macs")
+        .or_insert(toml_edit::value(toml_edit::Array::new()))
+        .as_array_mut()
+        .context("admin.allow_macs isn't a list")?;
+    if list.iter().any(|v| v.as_str().and_then(|s| crate::net::Mac::parse(s).ok()) == Some(mac)) {
+        return Ok(false);
+    }
+    list.push(mac.to_string());
+    let out = doc.to_string();
+    // Never leave a config the service can't start with.
+    let cfg: Config = toml::from_str(&out).context("parsing the updated config")?;
+    cfg.validate()?;
+    let tmp = path.with_extension("toml.new");
+    std::fs::write(&tmp, out).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::set_permissions(&tmp, std::fs::metadata(path)?.permissions())?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_mac_edits_the_config_in_place() {
+        let dir = std::env::temp_dir().join(format!("pisowifi-cfg-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, include_str!("../deploy/config.example.toml")).unwrap();
+        let mac = crate::net::Mac::parse("A4-5E-60-11-22-33").unwrap();
+        assert!(add_admin_mac(&path, mac).unwrap());
+        assert!(!add_admin_mac(&path, mac).unwrap(), "already there");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# Lock the dashboard to your own phone"), "comments kept");
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.admin.allow_macs, vec!["a4:5e:60:11:22:33".to_string()]);
+        assert!(add_admin_mac(&path, crate::net::Mac::parse("02:00:00:00:00:01").unwrap()).unwrap());
+        assert_eq!(Config::load(&path).unwrap().admin.allow_macs.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn example_config_loads_and_pulse_widths_are_checked() {
+        let mut cfg: Config = toml::from_str(include_str!("../deploy/config.example.toml")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.network.dhcp_leases, PathBuf::from("/var/lib/misc/dnsmasq.leases"));
+        assert_eq!(cfg.coin.pulse_width_ms, None);
+        cfg.coin.pulse_width_ms = Some([150, 15]);
+        assert!(cfg.validate().is_err());
+        cfg.coin.pulse_width_ms = Some([15, 150]);
+        cfg.validate().unwrap();
+    }
 }

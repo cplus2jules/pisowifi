@@ -7,6 +7,8 @@ lan_iface = "eth1"          # USB LAN adapter -> outdoor access point
 wan_iface = "eth0"          # built-in port   -> ISP modem
 portal_ip = "10.0.0.1"
 lan_cidr  = "10.0.0.0/19"   # matches your current dnsmasq range 10.0.0.5–10.0.30.254
+# A customer's time only follows their phone to a new address dnsmasq gave it.
+# dhcp_leases = "/var/lib/misc/dnsmasq.leases"
 
 [portal]
 listen = "10.0.0.1:80"
@@ -15,7 +17,8 @@ listen = "10.0.0.1:80"
 listen = "10.0.0.1:8443"    # https://10.0.0.1:8443/
 # Lock the dashboard to your own phone/laptop. Find your MAC on the
 # dashboard's Devices tab or in your phone's WiFi settings (turn off
-# "private/random address" for this network first).
+# "private/random address" for this network first), then run
+# `sudo pisowifi allow-mac <MAC>` or add it here.
 allow_macs = []
 session_hours = 8
 
@@ -27,6 +30,8 @@ debounce_ms = 5
 coin_gap_ms = 250           # silence that ends one coin's pulse burst
 pesos_per_pulse = 1         # program the acceptor: ₱1=1, ₱5=5, ₱10=10, ₱20=20 pulses
 insert_window_secs = 60
+# Only count pulses this long (ms). Measure yours with coin-probe first.
+# pulse_width_ms = [15, 150]
 # Optional: a GPIO that powers/enables the acceptor only while a customer
 # is inserting (via a relay or transistor). Stops "unclaimed" coins.
 # enable_line = 11

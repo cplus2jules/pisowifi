@@ -33,6 +33,50 @@ pub struct ClientRow {
     pub paused: bool,
 }
 
+/// Coins in the slot that haven't been credited yet. Saved on every coin,
+/// so a power cut mid-insert doesn't lose them: they're credited on boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct OpenSlot {
+    pub mac: Mac,
+    pub ip: std::net::Ipv4Addr,
+    pub coins: Vec<u32>,
+    /// The rates when the customer tapped Insert coin (what they were shown).
+    pub rates: Vec<Rate>,
+}
+
+/// Money and log entries that go in with the time they paid for.
+#[derive(Debug, Clone)]
+pub enum Ledger {
+    Sale { mac: Option<Mac>, pesos: u32, secs: u64, source: &'static str },
+    PassCredit { pass_id: String, pesos: u32, secs: u64 },
+    Audit { actor: &'static str, action: &'static str, detail: String },
+}
+
+/// Everything that changed since the last save, written in one transaction.
+#[derive(Debug, Default)]
+pub struct Batch {
+    pub clients: Vec<ClientRow>,
+    pub clients_gone: Vec<Mac>,
+    pub links: Vec<(Mac, String)>,
+    pub links_gone: Vec<Mac>,
+    /// Some(Some): coins are in the slot; Some(None): they've been credited.
+    pub slot: Option<Option<OpenSlot>>,
+    pub ledger: Vec<Ledger>,
+}
+
+impl Batch {
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+            && self.clients_gone.is_empty()
+            && self.links.is_empty()
+            && self.links_gone.is_empty()
+            && self.slot.is_none()
+            && self.ledger.is_empty()
+    }
+}
+
+pub const OPEN_SLOT_KEY: &str = "open_slot";
+
 #[derive(Debug, Serialize)]
 pub struct Sale {
     pub ts: i64,
@@ -262,17 +306,6 @@ impl Db {
         Ok(out)
     }
 
-    pub fn save_links(&self, links: &[(Mac, String)]) -> Result<()> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = c.transaction()?;
-        tx.execute("DELETE FROM pass_links", [])?;
-        for (mac, pass) in links {
-            tx.execute("INSERT INTO pass_links (mac, pass_id) VALUES (?1, ?2)", params![mac.to_string(), pass])?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     pub fn outbox_add(&self, pass_id: &str, pesos: u32, secs: u64) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
@@ -345,17 +378,69 @@ impl Db {
         Ok(out)
     }
 
-    /// Replaces the stored client table with a snapshot of live sessions.
-    pub fn save_clients(&self, rows: &[ClientRow]) -> Result<()> {
+    pub fn open_slot(&self) -> Result<Option<OpenSlot>> {
+        let Some(raw) = self.get_setting(OPEN_SLOT_KEY)? else { return Ok(None) };
+        serde_json::from_str(&raw).map(Some).context("reading the saved coin slot")
+    }
+
+    /// Writes one batch of changes atomically: a coin's sale, the time it
+    /// bought and the cleared slot either all land or none do.
+    pub fn save(&self, b: &Batch) -> Result<()> {
+        if b.is_empty() {
+            return Ok(());
+        }
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        tx.execute("DELETE FROM clients", [])?;
         let ts = now();
-        for r in rows.iter().filter(|r| r.remaining_secs > 0) {
+        for r in &b.clients {
             tx.execute(
-                "INSERT INTO clients (mac, ip, remaining_secs, paused, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs as i64, r.paused, ts],
+                "INSERT INTO clients (mac, ip, remaining_secs, paused, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(mac) DO UPDATE SET ip = excluded.ip, remaining_secs = excluded.remaining_secs,
+                 paused = excluded.paused, updated_at = excluded.updated_at",
+                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs.min(i64::MAX as u64) as i64, r.paused, ts],
             )?;
+        }
+        for m in &b.clients_gone {
+            tx.execute("DELETE FROM clients WHERE mac = ?1", [m.to_string()])?;
+        }
+        for (m, pass) in &b.links {
+            tx.execute(
+                "INSERT INTO pass_links (mac, pass_id) VALUES (?1, ?2)
+                 ON CONFLICT(mac) DO UPDATE SET pass_id = excluded.pass_id",
+                params![m.to_string(), pass],
+            )?;
+        }
+        for m in &b.links_gone {
+            tx.execute("DELETE FROM pass_links WHERE mac = ?1", [m.to_string()])?;
+        }
+        match &b.slot {
+            None => {}
+            Some(Some(slot)) => {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![OPEN_SLOT_KEY, serde_json::to_string(slot)?],
+                )?;
+            }
+            Some(None) => {
+                tx.execute("DELETE FROM settings WHERE key = ?1", [OPEN_SLOT_KEY])?;
+            }
+        }
+        for e in &b.ledger {
+            match e {
+                Ledger::Sale { mac, pesos, secs, source } => tx.execute(
+                    "INSERT INTO sales (ts, mac, pesos, secs, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![ts, mac.map(|m| m.to_string()), pesos, *secs as i64, source],
+                )?,
+                Ledger::PassCredit { pass_id, pesos, secs } => tx.execute(
+                    "INSERT INTO hub_outbox (pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4)",
+                    params![pass_id, pesos, *secs as i64, ts],
+                )?,
+                Ledger::Audit { actor, action, detail } => tx.execute(
+                    "INSERT INTO audit (ts, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+                    params![ts, actor, action, detail],
+                )?,
+            };
         }
         tx.commit()?;
         Ok(())
@@ -562,6 +647,11 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) {
+        self.conn.lock().unwrap().execute_batch(sql).unwrap();
+    }
+
     // ---- backup ---------------------------------------------------------
 
     /// Writes a copy encrypted with an owner passphrase (SQLCipher's
@@ -721,6 +811,40 @@ mod tests {
         assert!(Db::open(&path, &v2).is_ok());
         // Already migrated: opens directly.
         assert!(open_migrating(&path, &v2, &v1).is_ok());
+    }
+
+    #[test]
+    fn batches_upsert_and_delete_single_rows() {
+        let (_d, db) = test_db();
+        let (a, b) = (Mac::parse("02:00:00:00:00:0a").unwrap(), Mac::parse("02:00:00:00:00:0b").unwrap());
+        let row = |mac, secs, paused| ClientRow { mac, ip: "10.0.0.9".parse().unwrap(), remaining_secs: secs, paused };
+        db.save(&Batch { clients: vec![row(a, 100, false), row(b, 200, true)], ..Default::default() }).unwrap();
+        db.save(&Batch { clients: vec![row(a, 70, false)], ..Default::default() }).unwrap();
+        let mut rows = db.load_clients().unwrap();
+        rows.sort_by_key(|r| r.mac);
+        assert_eq!(rows.iter().map(|r| r.remaining_secs).collect::<Vec<_>>(), vec![70, 200]);
+        db.save(&Batch { clients_gone: vec![a], links: vec![(b, "P1".into())], ..Default::default() }).unwrap();
+        assert_eq!(db.load_clients().unwrap().len(), 1);
+        assert_eq!(db.load_links().unwrap(), vec![(b, "P1".to_string())]);
+        db.save(&Batch { links_gone: vec![b], ..Default::default() }).unwrap();
+        assert!(db.load_links().unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_slot_is_saved_and_cleared_with_its_sale() {
+        let (_d, db) = test_db();
+        let slot = OpenSlot {
+            mac: Mac::parse("02:00:00:00:00:0a").unwrap(),
+            ip: "10.0.0.9".parse().unwrap(),
+            coins: vec![5, 1],
+            rates: vec![Rate { pesos: 1, minutes: 20 }],
+        };
+        db.save(&Batch { slot: Some(Some(slot.clone())), ..Default::default() }).unwrap();
+        assert_eq!(db.open_slot().unwrap(), Some(slot.clone()));
+        let sale = Ledger::Sale { mac: Some(slot.mac), pesos: 6, secs: 7200, source: "coin" };
+        db.save(&Batch { slot: Some(None), ledger: vec![sale], ..Default::default() }).unwrap();
+        assert_eq!(db.open_slot().unwrap(), None);
+        assert_eq!(db.sales_summary(1).unwrap().today_pesos, 6);
     }
 
     #[test]

@@ -27,12 +27,12 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 
 | Threat | What stops it |
 |---|---|
-| Customer gets online without paying | nftables forward policy is **drop**. Only devices whose MAC **and** IP are both in the paid set are routed. If the service dies, the table stays: it **fails closed**. |
+| Customer gets online without paying | nftables forward policy is **drop**. Only devices whose MAC **and** IP are both in the paid set are routed. If the service dies, the table stays: it **fails closed**. Every minute the service checks the kernel still matches: if something flushed the table (an nftables reload, a leftover LPB script), it's reinstalled with every customer in one step, and the audit log says so. |
 | Bypass over IPv6, DNS tunnels ("SlowDNS" apps) | IPv6 from customers is dropped. Every DNS query is forced to the box's own resolver; unpaid devices get only 10 lookups a second, enough to find the portal but too little for a usable tunnel. |
 | Customer pokes the ISP modem, SSH, or the box | Customers can reach only DHCP, DNS, the portal and the dashboard. Private ranges (192.168.x, 10.x, …) are unreachable. SSH works only from the modem side. |
 | Stolen or cloned SD card | The DB key is derived from the **H3 chip's factory ID** plus a random salt, stretched with Argon2id (64 MiB, 3 passes) so guessing the ID is slow. The key is never stored, so the card can't be opened on another board. **Stealing the whole box (chip and card) still opens the database**; at that point the Argon2id-hashed admin password is what protects your account. |
 | Admin password sniffed on the open WiFi | The dashboard is HTTPS only (TLS 1.2/1.3, rustls). The password is Argon2id-hashed (64 MiB, 3 passes). Sessions are bound to your IP with HttpOnly, Secure, SameSite=Strict cookies plus a CSRF token. |
-| Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC, and the dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
+| Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC. Other devices are turned away before any TLS work, from a separate small pool, so customers can't tie up the dashboard; they see a page explaining the lock. The dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
 | Customer "claims" a fresh box | The password can only be set from the device's shell (`set-password`), never from the web. |
 | Web attacks (XSS, CSRF, clickjacking, DNS rebinding) | Strict CSP (no inline scripts), no `innerHTML`, custom-header CSRF checks, Host-header checks, `frame-ancestors 'none'`. |
 | Slowloris / connection floods | Connection caps, 10 s header timeout, 4–16 KB body limits, one Argon2 hash at a time. |
@@ -40,7 +40,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Compromised service | The systemd unit drops all capabilities except networking, the filesystem is read-only except `/var/lib/pisowifi`, and only GPIO devices are allowed. |
 
 **Known limits** (true of every open-WiFi vendo, LPB included):
-- **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break. Fully preventing this needs WPA2 per-user keys.
+- **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break, and a customer's time only moves to a new IP that dnsmasq actually leased to that MAC (anything else is refused and logged as a possible MAC clone). A clone that also copies the IP still gets through; fully preventing this needs WPA2 per-user keys.
 - **Client isolation.** Turn it on in the access point so customers can't see each other's devices.
 - **Piso Pass codes travel unencrypted** over the open WiFi, like everything on the portal. Someone sniffing nearby could copy a code and use its time. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
 - **SSH works only from the modem's side** (e.g. a laptop on the modem's own WiFi), never from the customer WiFi.
@@ -138,6 +138,12 @@ Put that number in `/etc/pisowifi/config.toml` under `[coin] line = …`, then:
 sudo systemctl start pisowifi
 ```
 
+**Optional: check pulse widths.** `coin-probe` prints how long each pulse
+lasts (ALLAN: usually 20–100 ms). Once you've seen yours, set
+`pulse_width_ms = [15, 150]` (shortest, longest) under `[coin]`: pulses
+outside that range, like electrical noise or a wire held low, are then
+ignored and logged instead of counted. Leave it out until you've measured.
+
 **Optional: gate the acceptor.** Wire a relay or transistor to the acceptor's
 power (or INHIBIT input) and set `enable_line`. The slot then only accepts
 coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
@@ -147,11 +153,12 @@ coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
 | Task | How |
 |---|---|
 | Dashboard | `https://10.0.0.1:8443/` from a phone on the WiFi. Accept the certificate once **after checking the fingerprint** from `sudo pisowifi admin-info`. |
-| Lock the dashboard to your phone | Add your phone's MAC to `admin.allow_macs` in the config. Turn off "private address" for this network on the phone. |
+| Lock the dashboard to your phone | Turn off "private address" for this network on the phone, then `sudo pisowifi allow-mac a4:5e:60:11:22:33` and `sudo systemctl restart pisowifi`. Locked out? Open the dashboard anyway: the page shows the address to allow. |
 | Logs | `journalctl -u pisowifi -f` |
 | Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. |
 | Restore onto a replacement board | Stop the service, move `/var/lib/pisowifi/pisowifi.db` aside, then run `sudo pisowifi restore --from …`. |
 | Changed `config.toml`? | Restart (`sudo systemctl restart pisowifi`). If you changed interfaces or ports, also refresh the boot firewall: `sudo sh -c '{ echo "flush ruleset"; pisowifi print-firewall; } > /etc/nftables.conf'`. |
+| Give someone time | Dashboard › Devices. Works for any device on the WiFi, even with no time yet. A paused customer stays paused: the time waits with theirs. |
 | Coin slot offline | The dashboard says so, and the portal refuses coins instead of losing them. Check `[coin]` in the config and `journalctl -u pisowifi`. |
 | Dashboard certificate | Valid for 800 days and renewed automatically a month before it expires; your browser then warns once more, so check the new fingerprint with `sudo pisowifi admin-info`. |
 | Reset the password | `sudo pisowifi set-password`. Use 4+ random words or 14+ random characters, used nowhere else. Never reuse the old LPB password: LPB stored it in plain text in MariaDB on the SD card. |
@@ -178,9 +185,10 @@ Dev mode fakes the firewall and the coin slot. The dashboard shows *Test ₱1/�
 
 Run the tests with `cargo test`. They cover the encryption-at-rest check,
 wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session
-binding, lockout, rate math, ARP parsing, the firewall rules, Piso Pass
-transfers and wallet passes (JWT claims, .pkpass manifest and signature,
-single-use links).
+binding, lockout, rate math, ARP and lease parsing, the firewall rules and
+their self-repair, coins surviving a power cut, the MAC-clone check, the
+dashboard lock, Piso Pass transfers and wallet passes (JWT claims, .pkpass
+manifest and signature, single-use links).
 
 To try wallet passes locally, write a hub config whose `[wallet]` section
 points at the throwaway keys in `testdata/wallet/` and run

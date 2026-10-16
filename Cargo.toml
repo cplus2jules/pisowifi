@@ -38,6 +38,8 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "process", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "0.8"
+# Already built for `toml`; used by `pisowifi allow-mac` to keep the config's comments.
+toml_edit = "0.22"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
