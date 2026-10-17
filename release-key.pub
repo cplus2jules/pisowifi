@@ -1,0 +1,3 @@
+# Piso WiFi release key (Ed25519, public half). Vendos and hubs built
+# with this file only install updates signed by the matching secret key.
+8c9dfb1a74fbcf528ff9bf16d94326d0b7d886c933efc9d22112d789ae00f0d2
