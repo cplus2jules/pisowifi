@@ -6,10 +6,16 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 - **Customer portal** on `http://10.0.0.1/`: tap *Insert coin*, drop coins,
   get online. Pause and resume to save time. Voucher codes. Each coin you drop
   animates on screen as the real ₱1/₱5/₱10/₱20 coin it is. First-time visitors
-  get a three-step onboarding (reopen it with the **?** button).
+  get a three-step onboarding (reopen it with the **?** button). Customers
+  with time can add the portal to their home screen: an icon in your colour
+  (or your logo), with steps for whichever browser they use.
+  Sound effects (made in the browser, no files): a chime when the slot opens,
+  a ding for each coin, a jingle once online. Customers can mute them.
 - **Your branding**: name, tagline, accent colour, logo and an advert poster,
-  set on the dashboard's *Customer page*. That page also prints a QR sign: one
-  code joins the WiFi from the phone camera, the other opens the portal.
+  sound effects on or off, and the page customers land on once online (a
+  Google search for cats until you change it), set on the dashboard's
+  *Customer page*. That page also prints a QR sign: one code joins the WiFi
+  from the phone camera, the other opens the portal.
 - **Owner dashboard** on `https://10.0.0.1:8443/`: earnings, connected
   devices, coin slot status, rates, printable vouchers, activity log.
 - **Encrypted database**: SQLCipher (AES-256 with an HMAC-SHA512 check on every page).
@@ -571,8 +577,13 @@ wallet.
 - **Hub deployment.** The systemd `LoadCredential` setup hasn't been tried on a
   real server.
 - **Badges.** Apple's and Google's brand guidelines ask for their official
-  *Add to Wallet* badges. The buttons here match the portal's style. Swap in
-  the official artwork before a wide launch.
+  *Add to Wallet* badges. Google's is in: `web/portal/add-to-google-wallet.svg`
+  is the unaltered English primary button from Google's
+  [brand guidelines](https://developers.google.com/wallet/generic/resources/brand-guidelines).
+  Apple's button still matches the portal's style. Apple's badge files need
+  their artwork license accepted first (*Download badge files* on Apple's
+  [badge guidelines](https://developer.apple.com/wallet/add-to-apple-wallet-guidelines/)).
+  Swap it in before a wide launch.
 
 ## Roadmap (the LPB feature list)
 

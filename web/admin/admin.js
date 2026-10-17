@@ -195,6 +195,7 @@ async function poll() {
   try {
     overview = await api("GET", "/overview");
     renderOverview();
+    backfillHomeIcon(overview.brand);
   } catch (_) { /* toast-free polling */ }
   pollTimer = setTimeout(poll, overview && overview.slot.state !== "idle" ? 1000 : 4000);
 }
@@ -647,6 +648,8 @@ function loadBrand(b) {
   $("b-name").value = b.name;
   $("b-wifi").value = b.wifi_name;
   $("b-alt").value = b.poster ? b.poster.alt : "";
+  $("b-after").value = b.after_url;
+  $("b-sounds").checked = b.sounds;
   renderSwatches(b.accent);
   $("accent-warn").hidden = luminance(b.accent) < 0.45;
   renderThumbs(b);
@@ -684,6 +687,8 @@ $("brand-form").addEventListener("submit", (ev) => {
       accent: brandDraft.accent,
       poster_alt: $("b-alt").value,
       wifi_name: $("b-wifi").value,
+      after_url: $("b-after").value,
+      sounds: $("b-sounds").checked,
     });
     overview.brand = r.brand;
     overview.name = r.brand.name;
@@ -715,8 +720,46 @@ async function prepareImage(file, maxW, maxH, preferPng) {
   throw new Error("That image is too large even after shrinking.");
 }
 
+// The home-screen icon: the logo on a white square, cropped like the
+// customer page's header shows it. Made here: the box can't decode images.
+async function makeHomeIcon(source) {
+  const bmp = await createImageBitmap(source);
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, size, size);
+  const k = Math.max(size / bmp.width, size / bmp.height);
+  const w = bmp.width * k, h = bmp.height * k;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bmp, (size - w) / 2, (size - h) / 2, w, h);
+  const png = await new Promise((res) => canvas.toBlob(res, "image/png"));
+  if (!png) throw new Error("Couldn't make the home-screen icon");
+  return png;
+}
+
+// Logos uploaded before home-screen icons existed get theirs on the next visit.
+let iconBackfilled = false;
+async function backfillHomeIcon(b) {
+  if (iconBackfilled || !b.logo || b.icon) return;
+  iconBackfilled = true;
+  try {
+    const logo = await (await fetch(b.logo, { credentials: "same-origin" })).blob();
+    overview.brand = await putImage("icon", await makeHomeIcon(logo));
+  } catch (_) { /* customers get the coin mark until then */ }
+}
+
 async function uploadImage(name, file) {
   const blob = name === "logo" ? await prepareImage(file, 256, 256, true) : await prepareImage(file, 1080, 1440, false);
+  let brand = await putImage(name, blob);
+  if (name === "logo") {
+    try { brand = await putImage("icon", await makeHomeIcon(blob)); } catch (_) { /* the coin mark stands in */ }
+  }
+  return brand;
+}
+
+async function putImage(name, blob) {
   const res = await fetch("/api/brand/" + name, {
     method: "PUT",
     headers: { "x-pisowifi": "1", "x-csrf-token": csrf, "content-type": blob.type },

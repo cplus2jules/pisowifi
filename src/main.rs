@@ -9,6 +9,7 @@ mod db;
 mod engine;
 mod firewall;
 mod gpio;
+mod homeicon;
 mod hub;
 mod hubclient;
 mod keys;

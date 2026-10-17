@@ -207,6 +207,7 @@ pub fn asset_version() -> &'static str {
             include_str!("../web/admin/admin.css"),
             include_str!("../web/shared/coins.js"),
             include_str!("../web/shared/icon.svg"),
+            include_str!("../web/portal/add-to-google-wallet.svg"),
         ] {
             h.update(part.as_bytes());
         }

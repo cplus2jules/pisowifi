@@ -5,7 +5,7 @@ use crate::engine::{CoinStart, MeView, Resume};
 use crate::hub::proto::{WalletKind, WalletSupport, UNKNOWN_PASS};
 use crate::hubclient::{AfterPurchase, HubError, PassError};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -35,6 +35,12 @@ pub fn router(st: Shared) -> Router {
         .route("/app.css", get(|| async { asset("text/css; charset=utf-8", include_str!("../web/portal/app.css")) }))
         .route("/icon.svg", get(|| async { asset("image/svg+xml", include_str!("../web/shared/icon.svg")) }))
         .route("/coins.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/shared/coins.js")) }))
+        .route("/add-to-google-wallet.svg", get(|| async { asset("image/svg+xml", include_str!("../web/portal/add-to-google-wallet.svg")) }))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/home-icon.png", get(|st: State<Shared>| home_icon(st, 180, false)))
+        .route("/home-icon-192.png", get(|st: State<Shared>| home_icon(st, 192, true)))
+        .route("/home-icon-512.png", get(|st: State<Shared>| home_icon(st, 512, true)))
+        .route("/home-icon-maskable.png", get(|st: State<Shared>| home_icon(st, 512, false)))
         .route("/captive-api", get(captive_api))
         .route("/brand/{name}", get(app::brand_image))
         .nest("/api", api)
@@ -62,6 +68,64 @@ async fn captive_api(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<So
         body["can-extend-session"] = json!(true);
     }
     ([(axum::http::header::CONTENT_TYPE, "application/captive+json")], body.to_string()).into_response()
+}
+
+/// Lets phones add the portal to the home screen, named and coloured like
+/// the owner's page. Opening it with `?home` tells the page it was added.
+async fn manifest(State(st): State<Shared>) -> Response {
+    let b = st.brand.get();
+    let icons = match (st.brand.asset("icon"), &b.icon) {
+        (Some(a), Some(url)) => {
+            let side = crate::homeicon::square_png_side(&a.data).unwrap_or(256);
+            json!([{ "src": url, "sizes": format!("{side}x{side}"), "type": "image/png" }])
+        }
+        _ => json!([
+            { "src": "/home-icon-192.png", "sizes": "192x192", "type": "image/png" },
+            { "src": "/home-icon-512.png", "sizes": "512x512", "type": "image/png" },
+            { "src": "/home-icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+        ]),
+    };
+    let body = json!({
+        "id": "/",
+        "name": b.name,
+        "short_name": b.name,
+        "start_url": "/?home",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#FFFFFF",
+        "theme_color": "#FFFFFF",
+        "icons": icons,
+    });
+    ([(header::CONTENT_TYPE, "application/manifest+json"), (header::CACHE_CONTROL, "no-cache")], body.to_string()).into_response()
+}
+
+/// Drawn icons by (accent, size, rounded corners).
+type IconCache = std::sync::Mutex<Vec<((String, u32, bool), bytes::Bytes)>>;
+
+/// The owner's logo icon when there is one, else the mark in their accent.
+/// Unversioned URLs (the page's link is fixed), so phones check each time.
+async fn home_icon(State(st): State<Shared>, size: u32, round: bool) -> Response {
+    static CACHE: IconCache = std::sync::Mutex::new(Vec::new());
+    let png = match st.brand.asset("icon") {
+        Some(a) => a.data.clone(),
+        None => {
+            let key = (st.brand.get().accent, size, round);
+            let hit = CACHE.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone());
+            match hit {
+                Some(png) => png,
+                None => {
+                    let png = bytes::Bytes::from(crate::homeicon::png(&key.0, size, round));
+                    let mut c = CACHE.lock().unwrap();
+                    if c.len() >= 8 {
+                        c.remove(0);
+                    }
+                    c.push((key, png.clone()));
+                    png
+                }
+            }
+        }
+    };
+    ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "no-cache")], png).into_response()
 }
 
 async fn fallback(State(st): State<Shared>) -> Response {

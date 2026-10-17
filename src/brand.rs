@@ -1,5 +1,6 @@
 //! The owner's customisation of the customer page: name, accent
-//! colour, logo and an advert poster. Images live in the encrypted DB and
+//! colour, logo (and its home-screen icon), an advert poster, sound effects
+//! and the page customers land on once online. Images live in the encrypted DB and
 //! are cached in RAM so customers' phones don't trigger a decrypt each.
 
 use crate::db::Db;
@@ -8,9 +9,13 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-pub const ASSETS: &[&str] = &["logo", "poster"];
+/// "icon" is the logo on a white square, made by the dashboard when the
+/// logo is uploaded (this box has no image decoders).
+pub const ASSETS: &[&str] = &["logo", "poster", "icon"];
 pub const MAX_ASSET_BYTES: usize = 1536 * 1024;
 pub const DEFAULT_ACCENT: &str = "#5A43E6";
+/// Where customers land once online, until the owner picks another page (or none).
+pub const DEFAULT_AFTER_URL: &str = "https://www.google.com/search?q=cats";
 
 #[derive(Clone, Serialize)]
 pub struct Brand {
@@ -18,7 +23,11 @@ pub struct Brand {
     pub accent: String,
     pub wifi_name: String,
     pub logo: Option<String>,
+    pub icon: Option<String>,
     pub poster: Option<Poster>,
+    pub sounds: bool,
+    /// Empty: customers stay on the portal.
+    pub after_url: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -59,6 +68,27 @@ pub fn valid_accent(s: &str) -> bool {
     s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The page customers land on once online, tidied: "google.com" becomes
+/// "https://google.com". Only plain web pages; empty means none.
+pub fn clean_after_url(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(String::new());
+    }
+    let url = if s.contains("://") { s.to_string() } else { format!("https://{s}") };
+    let lower = url.to_ascii_lowercase();
+    let rest = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://"))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (name, port) = host.split_once(':').unwrap_or((host, "0"));
+    let ok = url.len() <= 300
+        && !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || ".-".contains(c))
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '<' | '>' | '\\'));
+    ok.then_some(url)
+}
+
 fn asset_name(name: &str) -> Option<&'static str> {
     ASSETS.iter().copied().find(|n| *n == name)
 }
@@ -79,7 +109,10 @@ impl BrandStore {
                 accent: DEFAULT_ACCENT.into(),
                 wifi_name: String::new(),
                 logo: None,
+                icon: None,
                 poster: None,
+                sounds: true,
+                after_url: String::new(),
             }),
             assets: RwLock::new(assets),
         };
@@ -103,22 +136,50 @@ impl BrandStore {
         self.refresh(db)
     }
 
+    /// `after_url` must already be cleaned by [`clean_after_url`].
+    pub fn set_online(&self, db: &Db, sounds: bool, after_url: &str) -> Result<()> {
+        db.set_setting("portal_sounds", if sounds { "1" } else { "0" })?;
+        db.set_setting("after_url", after_url)?;
+        self.refresh(db)
+    }
+
     pub fn set_asset(&self, db: &Db, name: &str, data: Vec<u8>) -> Result<Result<(), &'static str>> {
         let Some(name) = asset_name(name) else { return Ok(Err("Unknown image")) };
         if data.len() > MAX_ASSET_BYTES {
             return Ok(Err("Image is too large (max 1.5 MB)"));
         }
         let Some(mime) = sniff(&data) else { return Ok(Err("Use a JPEG, PNG or WebP image")) };
+        if name == "icon" {
+            if !crate::homeicon::square_png_side(&data).is_some_and(|s| (96..=1024).contains(&s)) {
+                return Ok(Err("The home-screen icon must be a square PNG"));
+            }
+            if self.asset("logo").is_none() {
+                return Ok(Err("Upload a logo first"));
+            }
+        }
         let version = db.put_asset(name, mime, &data)?;
-        self.assets.write().unwrap().insert(name, Arc::new(Asset { mime, data: data.into(), version }));
+        let mut assets = self.assets.write().unwrap();
+        assets.insert(name, Arc::new(Asset { mime, data: data.into(), version }));
+        if name == "logo" {
+            // Made from the old logo: the dashboard sends a new one next.
+            db.delete_asset("icon")?;
+            assets.remove("icon");
+        }
+        drop(assets);
         self.refresh(db)?;
         Ok(Ok(()))
     }
 
     pub fn remove_asset(&self, db: &Db, name: &str) -> Result<bool> {
         let Some(name) = asset_name(name) else { return Ok(false) };
-        let removed = db.delete_asset(name)?;
-        self.assets.write().unwrap().remove(name);
+        let mut removed = db.delete_asset(name)?;
+        let mut assets = self.assets.write().unwrap();
+        assets.remove(name);
+        if name == "logo" {
+            removed |= db.delete_asset("icon")?;
+            assets.remove("icon");
+        }
+        drop(assets);
         self.refresh(db)?;
         Ok(removed)
     }
@@ -132,7 +193,10 @@ impl BrandStore {
             accent,
             wifi_name: db.get_setting("wifi_name")?.unwrap_or_default(),
             logo: url("logo"),
+            icon: url("icon"),
             poster: url("poster").map(|u| Poster { url: u, alt: db.get_setting("poster_alt").ok().flatten().unwrap_or_default() }),
+            sounds: db.get_setting("portal_sounds")?.is_none_or(|v| v != "0"),
+            after_url: db.get_setting("after_url")?.unwrap_or_else(|| DEFAULT_AFTER_URL.into()),
         };
         *self.brand.write().unwrap() = b;
         Ok(())
@@ -150,6 +214,47 @@ mod tests {
         assert_eq!(sniff(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
         assert_eq!(sniff(b"<svg onload=alert(1)>"), None);
         assert_eq!(sniff(b"GIF89a"), None);
+    }
+
+    #[test]
+    fn the_home_icon_follows_the_logo() {
+        let dir = std::env::temp_dir().join(format!("pisowifi-brand-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = crate::keys::DbKey(zeroize::Zeroizing::new([7u8; 32]));
+        let db = Db::open(&dir.join("t.db"), &key).unwrap();
+        let store = BrandStore::load(&db).unwrap();
+        let icon = crate::homeicon::png("#5A43E6", 128, false);
+        let logo = crate::homeicon::png("#E63946", 64, true);
+
+        assert_eq!(store.set_asset(&db, "icon", icon.clone()).unwrap(), Err("Upload a logo first"));
+        store.set_asset(&db, "logo", logo.clone()).unwrap().unwrap();
+        for bad in [b"\xFF\xD8\xFF\xE0 a jpeg".to_vec(), logo[..20].to_vec(), crate::homeicon::png("#5A43E6", 64, false)] {
+            assert_eq!(store.set_asset(&db, "icon", bad).unwrap(), Err("The home-screen icon must be a square PNG"));
+        }
+        store.set_asset(&db, "icon", icon.clone()).unwrap().unwrap();
+        assert!(store.get().icon.is_some());
+
+        // A new logo drops the icon made from the old one; so does removing it.
+        store.set_asset(&db, "logo", logo.clone()).unwrap().unwrap();
+        assert!(store.get().icon.is_none() && store.asset("icon").is_none());
+        store.set_asset(&db, "icon", icon).unwrap().unwrap();
+        assert!(store.remove_asset(&db, "logo").unwrap());
+        assert!(store.get().icon.is_none() && store.get().logo.is_none());
+        assert!(BrandStore::load(&db).unwrap().asset("icon").is_none(), "gone from the database too");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn after_url_is_a_plain_web_page() {
+        let c = |s: &str| clean_after_url(s);
+        assert_eq!(c("  ").as_deref(), Some(""));
+        assert_eq!(c("google.com/search?q=cats").as_deref(), Some("https://google.com/search?q=cats"));
+        assert_eq!(c("http://10.0.0.1:8080/promo").as_deref(), Some("http://10.0.0.1:8080/promo"));
+        assert_eq!(c(DEFAULT_AFTER_URL).as_deref(), Some(DEFAULT_AFTER_URL));
+        for bad in ["javascript:alert(1)", "javascript://x%0aalert(1)", "data:text/html,hi", "https://", "https://a b.com", "https://x.com/\"<p>", "ftp://x.com"] {
+            assert_eq!(c(bad), None, "{bad}");
+        }
     }
 
     #[test]

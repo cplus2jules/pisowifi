@@ -165,7 +165,7 @@ pub async fn security_headers(req: Request<axum::body::Body>, next: Next) -> Res
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
-             font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+             font-src 'self'; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
     h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));

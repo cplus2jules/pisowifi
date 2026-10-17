@@ -176,6 +176,7 @@ function render() {
   };
   if (changed && !REDUCE && document.startViewTransition) document.startViewTransition(apply);
   else apply();
+  if (changed && slot.state === "mine") Sound.slot();
 
   if (slot.state === "mine") {
     if (firstRender || lastSlotState !== "mine") {
@@ -201,7 +202,131 @@ function render() {
   firstRender = false;
 }
 
+// ---- sound effects ------------------------------------------------------------
+
+// Made on the spot with Web Audio: no files to load before the phone has
+// internet. Phones only allow sound after a tap, so any tap wakes it; coins
+// that land later still play because an earlier tap did.
+const SOUND_KEY = "pisowifi-sound";
+const Sound = (() => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ctx = null, out = null;
+  let quiet = false;
+  try { quiet = localStorage.getItem(SOUND_KEY) === "off"; } catch (_) { /* private mode */ }
+
+  const allowed = () => !!AC && !!state && state.brand.sounds;
+  const ready = () => allowed() && !quiet && ctx && ctx.state === "running";
+
+  function wake() {
+    if (!allowed() || quiet) return;
+    if (!ctx) {
+      ctx = new AC();
+      // Loud enough for a phone speaker in a busy shop; the limiter keeps
+      // coins landing close together from crackling.
+      out = ctx.createGain();
+      out.gain.value = 1.6;
+      const limit = ctx.createDynamicsCompressor();
+      limit.threshold.value = -6;
+      limit.knee.value = 6;
+      limit.ratio.value = 8;
+      limit.attack.value = 0.002;
+      limit.release.value = 0.2;
+      out.connect(limit);
+      limit.connect(ctx.destination);
+      // Older iPhones only unlock sound once something plays during the tap.
+      const blank = ctx.createBufferSource();
+      blank.buffer = ctx.createBuffer(1, 1, 22050);
+      blank.connect(ctx.destination);
+      blank.start(0);
+    }
+    if (ctx.state !== "running" && ctx.resume) ctx.resume();
+  }
+
+  // One voice: a quick strike, then a ringing fade. `glide` bends the pitch.
+  function tone(at, freq, dur, vol, type, glide) {
+    const t = ctx.currentTime + at;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type || "sine";
+    o.frequency.setValueAtTime(freq, t);
+    if (glide) o.frequency.exponentialRampToValueAtTime(glide, t + dur * 0.7);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g);
+    g.connect(out);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+
+  // The slot opening: a soft clunk, then two bubbly blips up.
+  function slot() {
+    if (!ready()) return;
+    tone(0, 260, 0.13, 0.3, "triangle", 110);
+    tone(0.07, 520, 0.13, 0.2, "sine", 1040);
+    tone(0.17, 780, 0.2, 0.2, "sine", 1560);
+  }
+
+  // A coin landing: a metal clink, a two-note ding, and a sparkle for big coins.
+  function coin(denom) {
+    if (!ready()) return;
+    for (const [f, d] of [[2730, 0.08], [4120, 0.06], [5650, 0.05]]) tone(0, f, d, 0.06);
+    tone(0.03, 988, 0.09, 0.22, "triangle");
+    tone(0.03, 988, 0.08, 0.04, "square");
+    tone(0.11, 1319, 0.55, 0.22, "triangle");
+    tone(0.11, 1319, 0.3, 0.04, "square");
+    if (denom >= 10) tone(0.2, 1976, 0.45, 0.07, "triangle");
+    if (denom >= 20) tone(0.28, 2637, 0.4, 0.05, "triangle");
+  }
+
+  // Online: a quick run up a major chord, landing on a shimmer.
+  function online() {
+    if (!ready()) return;
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(i * 0.085, f, 0.34, 0.2, "triangle"));
+    [1046.5, 1318.5, 1568].forEach((f) => tone(0.34, f, 1.3, 0.08));
+    tone(0.34, 2093, 0.9, 0.035, "triangle");
+  }
+
+  function setQuiet(q) {
+    quiet = q;
+    try { localStorage.setItem(SOUND_KEY, q ? "off" : "on"); } catch (_) { /* private mode */ }
+    if (q) return;
+    // A ding, so you hear it's on.
+    wake();
+    if (ctx && ctx.resume) Promise.resolve(ctx.resume()).then(() => coin(5));
+  }
+
+  return { wake, slot, coin, online, allowed, quiet: () => quiet, setQuiet };
+})();
+
+for (const t of ["pointerdown", "pointerup", "touchend", "keydown"]) {
+  addEventListener(t, () => Sound.wake(), { capture: true, passive: true });
+}
+
+function renderSoundBtn() {
+  const b = $("sound");
+  b.hidden = !Sound.allowed();
+  const on = !Sound.quiet();
+  b.setAttribute("aria-pressed", String(on));
+  b.firstElementChild.firstElementChild.setAttribute("href", on ? "#i-sound" : "#i-mute");
+}
+$("sound").addEventListener("click", () => {
+  Sound.setQuiet(!Sound.quiet());
+  renderSoundBtn();
+});
+
 // ---- coins ------------------------------------------------------------------
+
+// A coin with both faces, for where it turns over: the value on the front,
+// the plant on the back.
+function twoSided(denom, px, cls) {
+  const front = PisoCoins.draw(denom, px), back = PisoCoins.draw(denom, px, "back");
+  back.classList.add("back");
+  back.setAttribute("aria-hidden", "true");
+  const coin = el("span", null, cls);
+  coin.style.width = coin.style.height = front.getAttribute("width") + "px";
+  coin.append(front, back);
+  return coin;
+}
 
 function trayCoin(denom, pop) {
   const wrap = el("span", null, "mini");
@@ -230,17 +355,15 @@ function countTo(target) {
 function dropCoin(denom) {
   const zone = $("drop-zone");
   const chute = $("chute");
-  const art = PisoCoins.draw(denom, 92);
-  const size = Number(art.getAttribute("width"));
-  const fly = el("div", null, "flying");
-  fly.style.width = fly.style.height = size + "px";
-  fly.style.marginLeft = -size / 2 + "px";
-  fly.append(art);
+  // Spinning in, it shows its plant side too.
+  const fly = twoSided(denom, 92, "coin2 flying");
+  fly.style.marginLeft = -parseFloat(fly.style.width) / 2 + "px";
   chute.append(fly);
   if (navigator.vibrate) navigator.vibrate(denom >= 10 ? [20, 40, 20] : 25);
 
   const done = () => {
     fly.remove();
+    Sound.coin(denom);
     countTo(shownPesos + denom);
     $("tray").append(trayCoin(denom, true));
     animate(zone, [{ transform: "scale(1)" }, { transform: "scale(1.07)" }, { transform: "scale(1)" }], { duration: 520 });
@@ -267,15 +390,16 @@ function renderRates() {
   if (key === ratesKey) return;
   ratesKey = key;
   const best = state.rates.reduce((b, r) => (r.minutes / r.pesos > b.minutes / b.pesos ? r : b), state.rates[0]);
-  $("rates").replaceChildren(...state.rates.map((r) => {
+  $("rates").replaceChildren(...state.rates.map((r, i) => {
     const isBest = r === best && state.rates.length > 1;
     const li = el("li", null, "rate" + (isBest ? " best" : ""));
     const art = el("span", null, "art");
-    for (const d of PisoCoins.split(r.pesos).slice(0, 3)) {
-      const c = PisoCoins.draw(d, 58);
-      c.classList.add("stack");
+    // The coins turn over now and then to show the plant on the back.
+    PisoCoins.split(r.pesos).slice(0, 3).forEach((d, j) => {
+      const c = twoSided(d, 58, "coin2 stack");
+      c.style.animationDelay = i * 0.8 + j * 0.15 + "s";
       art.append(c);
-    }
+    });
     const price = el("span", null, "price");
     price.append(el("b", "₱" + r.pesos), " · " + perPeso(r));
     li.append(art, el("span", human(r.minutes * 60), "dur"), price);
@@ -367,6 +491,10 @@ function applyBrand(b) {
   $("logo").replaceChildren(logoNode(b));
   $("ob-logo").replaceChildren(logoNode(b));
   $("ob-name").textContent = b.name;
+  $("home-logo").replaceChildren(logoNode(b));
+  $("hs-logo").replaceChildren(logoNode(b));
+  $("hs-name").textContent = b.name;
+  renderSoundBtn();
 
   const fig = $("poster"), img = $("poster-img");
   if (b.poster) {
@@ -398,7 +526,7 @@ function maybeOnboard() {
   obChecked = true;
   const fromQr = new URLSearchParams(location.search).has("welcome");
   if (fromQr) history.replaceState(null, "", location.pathname);
-  if (!seenOnboarding()) openOnboarding();
+  if (!seenOnboarding() && !standalone()) openOnboarding();
 }
 
 function openOnboarding() {
@@ -464,6 +592,7 @@ async function refresh() {
     fetchedAt = performance.now();
     render();
     renderPass();
+    renderHome();
     maybeOnboard();
     maybeClaimPass();
   } catch (e) {
@@ -490,10 +619,24 @@ async function action(btn, fn) {
   }
 }
 
+const isOnline = () => !!state && state.running && state.remaining_secs - elapsed() > 0;
+
 // Phones decide whether this WiFi "has internet" when the sign-in page loads.
-// Load it again after paying so the sign-in sheet closes and apps use WiFi.
-function recheckSoon() {
-  setTimeout(() => location.replace(location.pathname), 1800);
+// Load a page after paying so the sign-in sheet closes and apps use WiFi: on
+// first getting online, the owner's pick (a cat search, unless they changed
+// it); otherwise this page again.
+function recheckSoon(landing) {
+  setTimeout(() => {
+    const url = landing && isOnline() && state.brand.after_url;
+    if (url && /^https?:\/\//i.test(url)) location.assign(url);
+    else location.replace(location.pathname);
+  }, 1800);
+}
+
+// Time added and running: a chime, then a fresh page load.
+function wentOnline(wasOnline) {
+  Sound.online();
+  recheckSoon(!wasOnline);
 }
 
 // ---- events -----------------------------------------------------------------
@@ -511,6 +654,7 @@ $("slot").addEventListener("click", () =>
 $("done").addEventListener("click", () =>
   action($("done"), async () => {
     const before = state.slot.pesos;
+    const wasOnline = isOnline();
     // The saved pass goes along, so the coins join it instead of a new pass.
     const saved = storedPass();
     const r = await api("/coin/done", saved ? { pass: saved } : {});
@@ -518,10 +662,11 @@ $("done").addEventListener("click", () =>
     if (r.pass_secs !== undefined) autoClaim.done = true;
     if (before > 0) {
       confetti($("done"));
-      if (r.pass_code) showPassSheet(r.pass_code);
+      Sound.online();
+      if (r.pass_code) showPassSheet(r.pass_code, !wasOnline);
       else {
         toast(r.pass_secs > 0 ? "You're online, with " + human(r.pass_secs) + " from your Piso Pass too." : "You're online. Enjoy!");
-        recheckSoon();
+        recheckSoon(!wasOnline);
       }
     }
   }));
@@ -536,13 +681,14 @@ $("resume").addEventListener("click", () =>
   action($("resume"), async () => {
     await api("/resume", {});
     toast("Welcome back. You're online.");
-    recheckSoon();
+    wentOnline(false);
   }));
 
 $("voucher-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const btn = ev.submitter || $("voucher-form").querySelector("button");
   const code = $("code").value;
+  const wasOnline = isOnline();
   action(btn, async () => {
     if (isPassCode(code)) {
       const r = await api("/pass/claim", { code, start: true });
@@ -550,14 +696,14 @@ $("voucher-form").addEventListener("submit", (ev) => {
       $("code").value = "";
       confetti(btn);
       toast(r.secs > 0 ? "Piso Pass added: " + human(r.secs) + "." : "Piso Pass linked to this phone.");
-      if (r.secs > 0) recheckSoon();
+      if (r.secs > 0) wentOnline(wasOnline);
       return;
     }
     const r = await api("/voucher", { code });
     $("code").value = "";
     confetti(btn);
     toast("Voucher added: " + human(r.secs) + ".");
-    recheckSoon();
+    wentOnline(wasOnline);
   });
 });
 
@@ -603,10 +749,12 @@ function savePass(code) {
 }
 
 let sheetCode = null;   // pass shown in the sheet (works even if storage is off)
+let sheetLanding = false; // shown on first getting online: "Got it" goes on from there
 
-function showPassSheet(code) {
+function showPassSheet(code, landing) {
   const nice = savePass(code);
   sheetCode = nice;
+  sheetLanding = !!landing;
   $("ps-code").textContent = nice;
   $("ps-brand").textContent = state.brand.name;
   $("pass-sheet").hidden = false;
@@ -616,7 +764,7 @@ function showPassSheet(code) {
 $("ps-done").addEventListener("click", () => {
   $("pass-sheet").hidden = true;
   toast("You're online. Enjoy!");
-  if (state && state.running) recheckSoon();
+  if (state && state.running) recheckSoon(sheetLanding);
 });
 $("pass-sheet").addEventListener("click", (ev) => { if (ev.target === $("pass-sheet")) $("pass-sheet").hidden = true; });
 $("pass-show").addEventListener("click", () => {
@@ -692,6 +840,184 @@ function addToWallet(kind, btn) {
 $("ps-apple").addEventListener("click", () => addToWallet("apple", $("ps-apple")));
 $("ps-google").addEventListener("click", () => addToWallet("google", $("ps-google")));
 
+// ---- add to home screen ------------------------------------------------------------
+
+// Browsers only offer their own install prompt on HTTPS, so on plain
+// http://10.0.0.1 the card shows the steps for this browser instead. Where a
+// prompt is offered (a future HTTPS portal, or localhost), it's used.
+const HOME_KEY = "pisowifi-home";
+let installPrompt = null;
+
+function standalone() {
+  return navigator.standalone === true || ["standalone", "fullscreen", "minimal-ui"].some((m) => matchMedia("(display-mode: " + m + ")").matches);
+}
+function homeAdded() {
+  try { return localStorage.getItem(HOME_KEY) === "1"; } catch (_) { return false; }
+}
+function markHomeAdded() {
+  try { localStorage.setItem(HOME_KEY, "1"); } catch (_) { /* private mode */ }
+}
+
+// Opened from the icon (the manifest's start_url is /?home): tidy the address.
+(() => {
+  const q = new URLSearchParams(location.search);
+  if (!q.has("home")) return;
+  markHomeAdded();
+  q.delete("home");
+  const rest = q.toString();
+  history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
+})();
+
+function icon(id) {
+  const s = svgEl("svg", { class: "ic", "aria-hidden": "true" });
+  s.append(svgEl("use", { href: "#i-" + id }));
+  return s;
+}
+// A button as it looks in the browser: its icon, its label, or both.
+function key(label, ic, name) {
+  const k = el("b", null, "key");
+  if (ic) k.append(icon(ic));
+  if (label) k.append(label);
+  else k.setAttribute("aria-label", name);
+  return k;
+}
+const bold = (text) => el("b", text);
+
+// Steps for this browser, or null where it can't make a home-screen icon.
+function homeGuide() {
+  const addr = () => el("b", location.host, "addr");
+  const elsewhere = (browser) => ({
+    webview: true,
+    title: "Do this in " + browser,
+    text: "This window can't add icons, but your browser can.",
+    steps: [
+      ["Close this window"],
+      ["Open ", bold(browser), " and go to ", addr()],
+      ["Tap ", bold("Add to home screen"), " there"],
+    ],
+  });
+  const dotsV = () => key(null, "dots-v", "the three dots");
+  const dotsH = () => key(null, "dots-h", "the three dots");
+  const menu = () => key(null, "menu", "the menu");
+  const inApp = /FBAN|FBAV|FB_IAB|Instagram|Line\/|MicroMessenger|GSA\//.test(UA);
+
+  if (IS_IOS) {
+    // Apple's sign-in window and apps' built-in browsers don't say "Safari".
+    if (!/Safari\//.test(UA) || inApp) return elsewhere("Safari");
+    const share = key("Share", "share");
+    const confirm = ["Tap ", bold("Add"), " in the top corner"];
+    if (/CriOS\//.test(UA)) {
+      return { steps: [["Tap ", share, " at the top right"], ["Scroll down and tap ", key("Add to Home Screen", "plus-sq")], confirm] };
+    }
+    if (/FxiOS\/|EdgiOS\/|OPiOS\/|OPT\//.test(UA)) {
+      return { steps: [["Open the menu ", menu(), " or ", dotsH(), " and tap ", share], ["Tap ", key("Add to Home Screen", "plus-sq")], confirm] };
+    }
+    const version = Number((UA.match(/Version\/(\d+)/) || [])[1]) || 0;
+    const ipad = /iPad|Macintosh/.test(UA);
+    if (version >= 26) {
+      return { steps: [
+        ipad ? ["Tap ", share, " at the top"] : ["Tap ", dotsH(), " at the bottom, then ", share],
+        ["Tap ", bold("View More"), " if you need to, then ", key("Add to Home Screen", "plus-sq")],
+        confirm,
+      ] };
+    }
+    return { steps: [["Tap ", share, ipad ? " at the top" : " at the bottom"], ["Scroll down and tap ", key("Add to Home Screen", "plus-sq")], confirm] };
+  }
+
+  if (IS_ANDROID) {
+    // The WiFi sign-in window and apps' built-in browsers are WebViews ("wv").
+    if (/; wv\)/.test(UA) || inApp) return elsewhere("Chrome");
+    if (/SamsungBrowser\//.test(UA)) {
+      return { steps: [["Tap ", menu(), " at the bottom right"], ["Tap ", bold("Add page to"), ", then ", bold("Home screen")], ["Tap ", bold("Add")]] };
+    }
+    if (/EdgA\//.test(UA)) {
+      return { steps: [["Tap ", dotsH(), " at the bottom"], ["Tap ", bold("Add to phone")], ["Tap ", bold("Add"), " or ", bold("Install")]] };
+    }
+    if (/Firefox\//.test(UA)) {
+      return { steps: [["Tap ", dotsV()], ["Tap ", bold("Add to Home screen")], ["Tap ", bold("Add")]] };
+    }
+    if (/Chrome\//.test(UA) && !/OPR\/|MiuiBrowser|HuaweiBrowser|HeyTapBrowser|VivoBrowser|UCBrowser|YaBrowser/.test(UA)) {
+      return { steps: [["Tap ", dotsV(), " at the top right"], ["Tap ", bold("Add to home screen")], ["Tap ", bold("Add"), " or ", bold("Install")]] };
+    }
+    return { steps: [["Open your browser's menu ", dotsV(), " or ", menu()], ["Look for ", bold("Add to home screen")], ["Not there? Open ", addr(), " in ", bold("Chrome")]] };
+  }
+
+  // Computers: a shortcut in the Dock or on the desktop.
+  const desk = (steps) => ({ title: "Add it to your computer", text: "Then your time is one click away.", steps });
+  if (/Edg\//.test(UA)) return desk([["Click ", dotsH(), " at the top right"], ["Click ", bold("Apps"), ", then ", bold("Install this site as an app")], ["Click ", bold("Install")]]);
+  if (/Chrome\//.test(UA) && !/OPR\//.test(UA)) return desk([["Click ", dotsV(), " at the top right"], ["Click ", bold("Cast, save, and share"), ", then ", bold("Create shortcut")], ["Click ", bold("Create")]]);
+  if (/Macintosh/.test(UA) && /Safari\//.test(UA) && Number((UA.match(/Version\/(\d+)/) || [])[1]) >= 17) {
+    return desk([["Click ", bold("File"), " in the menu bar"], ["Click ", bold("Add to Dock")], ["Click ", bold("Add")]]);
+  }
+  if (/Macintosh/.test(UA) && !/Safari\/|Firefox\//.test(UA)) return elsewhere("Safari"); // the Mac's sign-in window
+  return null; // e.g. Firefox on a computer
+}
+const HOME_GUIDE = homeGuide();
+
+function renderHome() {
+  if (!state) return;
+  if (standalone()) markHomeAdded();
+  const relevant = state.remaining_secs > 0 || !!storedPass();
+  $("home-card").hidden = !relevant || homeAdded() || !(installPrompt || HOME_GUIDE);
+}
+
+function openHomeSheet() {
+  const g = HOME_GUIDE;
+  $("hs-title").textContent = g.title || "Add to your home screen";
+  $("hs-text").textContent = g.text || "Then your time is one tap away, like an app.";
+  $("hs-steps").replaceChildren(...g.steps.map((parts, i) => {
+    const li = el("li");
+    const t = el("span");
+    t.append(...parts);
+    li.append(el("span", String(i + 1), "n"), t);
+    return li;
+  }));
+  $("hs-done").textContent = g.webview ? "Got it" : "I added it";
+  $("hs-later").hidden = !!g.webview;
+  $("home-sheet").hidden = false;
+  $("hs-box").scrollTop = 0;
+  $("hs-box").focus({ preventScroll: true });
+}
+
+function closeHomeSheet() {
+  $("home-sheet").hidden = true;
+  const add = $("home-add");
+  (add.offsetParent ? add : $("help")).focus({ preventScroll: true });
+}
+
+$("home-add").addEventListener("click", async () => {
+  if (!installPrompt) return openHomeSheet();
+  const p = installPrompt;
+  installPrompt = null;
+  p.prompt();
+  const choice = await p.userChoice;
+  if (choice.outcome === "accepted") {
+    markHomeAdded();
+    toast("Added. Tap the icon any time to check your time.");
+  }
+  renderHome();
+});
+$("hs-done").addEventListener("click", () => {
+  if (!HOME_GUIDE.webview) {
+    markHomeAdded();
+    toast("Nice! Tap the icon any time to check your time.");
+  }
+  renderHome();
+  closeHomeSheet();
+});
+$("hs-later").addEventListener("click", closeHomeSheet);
+$("home-sheet").addEventListener("click", (ev) => { if (ev.target === $("home-sheet")) closeHomeSheet(); });
+$("home-sheet").addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeHomeSheet(); });
+addEventListener("beforeinstallprompt", (ev) => {
+  ev.preventDefault(); // the card asks instead, when it's useful
+  installPrompt = ev;
+  renderHome();
+});
+addEventListener("appinstalled", () => {
+  markHomeAdded();
+  renderHome();
+});
+
 // Opened from a wallet pass ("Use my time" → http://10.0.0.1/?pass=CODE):
 // tidy the address bar, then offer to claim it. Never adopted silently, so a
 // planted link can't collect other customers' time.
@@ -718,6 +1044,7 @@ $("claim-sheet").addEventListener("click", (ev) => { if (ev.target === $("claim-
 $("cs-yes").addEventListener("click", () =>
   action($("cs-yes"), async () => {
     const code = deepPass;
+    const wasOnline = isOnline();
     closeClaimSheet();
     const r = await api("/pass/claim", { code, start: true });
     savePass(code);
@@ -725,7 +1052,7 @@ $("cs-yes").addEventListener("click", () =>
     toast(r.secs > 0 ? "Welcome back! " + human(r.secs) + " from your Piso Pass." : "Piso Pass linked to this phone.");
     if (r.secs > 0) {
       confetti($("meter"));
-      recheckSoon();
+      wentOnline(wasOnline);
     }
   }));
 
@@ -746,6 +1073,7 @@ async function maybeClaimPass() {
   const code = storedPass();
   if (!code || code === unknownPass || performance.now() < autoClaim.next) return;
   autoClaim.busy = true;
+  const wasOnline = isOnline();
   try {
     const r = await api("/pass/claim", { code });
     autoClaim.done = true;
@@ -753,7 +1081,7 @@ async function maybeClaimPass() {
       confetti($("meter"));
       if (r.running) {
         toast("Welcome back! " + human(r.secs) + " from your Piso Pass.");
-        recheckSoon();
+        wentOnline(wasOnline);
       } else {
         toast("Welcome back! " + human(r.secs) + " from your Piso Pass is saved here. Tap Resume to go online.");
       }

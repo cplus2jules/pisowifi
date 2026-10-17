@@ -364,6 +364,9 @@ struct BrandingReq {
     poster_alt: String,
     #[serde(default)]
     wifi_name: String,
+    /// Left out: unchanged.
+    sounds: Option<bool>,
+    after_url: Option<String>,
 }
 
 async fn set_branding(
@@ -380,6 +383,12 @@ async fn set_branding(
         return Err(ApiError::bad("Pick a colour like #5A43E6"));
     }
     let (alt, wifi) = (clean_text(&req.poster_alt, 120), clean_text(&req.wifi_name, 32));
+    let now = st.brand.get();
+    let after_url = match &req.after_url {
+        Some(u) => crate::brand::clean_after_url(u).ok_or_else(|| ApiError::bad("Use a web address like google.com"))?,
+        None => now.after_url,
+    };
+    st.brand.set_online(&st.db, req.sounds.unwrap_or(now.sounds), &after_url)?;
     st.brand.set_text(&st.db, &name, &req.accent.to_uppercase(), &alt, &wifi)?;
     st.db.audit(&actor(addr), "branding", &format!("{name} · {}", req.accent));
     Ok(Json(json!({ "ok": true, "brand": st.brand.get() })))
