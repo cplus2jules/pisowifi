@@ -33,6 +33,50 @@ pub struct ClientRow {
     pub paused: bool,
 }
 
+/// Coins in the slot that haven't been credited yet. Saved on every coin,
+/// so a power cut mid-insert doesn't lose them: they're credited on boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct OpenSlot {
+    pub mac: Mac,
+    pub ip: std::net::Ipv4Addr,
+    pub coins: Vec<u32>,
+    /// The rates when the customer tapped Insert coin (what they were shown).
+    pub rates: Vec<Rate>,
+}
+
+/// Money and log entries that go in with the time they paid for.
+#[derive(Debug, Clone)]
+pub enum Ledger {
+    Sale { mac: Option<Mac>, pesos: u32, secs: u64, source: &'static str },
+    PassCredit { pass_id: String, pesos: u32, secs: u64 },
+    Audit { actor: &'static str, action: &'static str, detail: String },
+}
+
+/// Everything that changed since the last save, written in one transaction.
+#[derive(Debug, Default)]
+pub struct Batch {
+    pub clients: Vec<ClientRow>,
+    pub clients_gone: Vec<Mac>,
+    pub links: Vec<(Mac, String)>,
+    pub links_gone: Vec<Mac>,
+    /// Some(Some): coins are in the slot; Some(None): they've been credited.
+    pub slot: Option<Option<OpenSlot>>,
+    pub ledger: Vec<Ledger>,
+}
+
+impl Batch {
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+            && self.clients_gone.is_empty()
+            && self.links.is_empty()
+            && self.links_gone.is_empty()
+            && self.slot.is_none()
+            && self.ledger.is_empty()
+    }
+}
+
+pub const OPEN_SLOT_KEY: &str = "open_slot";
+
 #[derive(Debug, Serialize)]
 pub struct Sale {
     pub ts: i64,
@@ -154,6 +198,12 @@ CREATE TABLE hub_outbox (
 );
 ";
 
+/// v4: secrets that must stay inside the encrypted database (the vendo's
+/// hub signing key).
+const SCHEMA_V4: &str = "
+CREATE TABLE secrets (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -191,7 +241,30 @@ impl Db {
             tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
+        if v < 4 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    // ---- secrets --------------------------------------------------------
+
+    pub fn get_secret(&self, name: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let c = self.conn.lock().unwrap();
+        let v: Option<Vec<u8>> = c.query_row("SELECT value FROM secrets WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+        Ok(v.map(Zeroizing::new))
+    }
+
+    /// Stores a secret unless one by that name exists; returns the stored one.
+    pub fn put_secret_once(&self, name: &str, value: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        {
+            let c = self.conn.lock().unwrap();
+            c.execute("INSERT OR IGNORE INTO secrets (name, value) VALUES (?1, ?2)", params![name, value])?;
+        }
+        self.get_secret(name)?.context("secret not stored")
     }
 
     // ---- settings -------------------------------------------------------
@@ -262,26 +335,6 @@ impl Db {
         Ok(out)
     }
 
-    pub fn save_links(&self, links: &[(Mac, String)]) -> Result<()> {
-        let mut c = self.conn.lock().unwrap();
-        let tx = c.transaction()?;
-        tx.execute("DELETE FROM pass_links", [])?;
-        for (mac, pass) in links {
-            tx.execute("INSERT INTO pass_links (mac, pass_id) VALUES (?1, ?2)", params![mac.to_string(), pass])?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn outbox_add(&self, pass_id: &str, pesos: u32, secs: u64) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO hub_outbox (pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4)",
-            params![pass_id, pesos, secs as i64, now()],
-        )?;
-        Ok(())
-    }
-
     pub fn outbox_list(&self, limit: u32) -> Result<Vec<crate::hub::proto::CreditReport>> {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare("SELECT id, pass_id, pesos, secs, ts FROM hub_outbox ORDER BY id LIMIT ?1")?;
@@ -295,6 +348,35 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forgets which phone holds which pass and the sales not yet reported:
+    /// both belong to one hub enrolment. Phones keep their time here.
+    pub fn clear_pass_state(&self) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute_batch("DELETE FROM pass_links; DELETE FROM hub_outbox;")?;
+        Ok(())
+    }
+
+    /// At startup: pass links and unsent credits belong to the hub enrolment
+    /// they were made under. After `join-hub` (a new vendo id) or `leave-hub`
+    /// they are dropped, since a running service writes them back on its way
+    /// down. Returns true if anything was cleared.
+    pub fn reset_pass_state_if_hub_changed(&self, vendo_id: Option<&str>) -> Result<bool> {
+        let owner = self.get_setting("pass_links_hub")?;
+        if owner.as_deref() == vendo_id {
+            return Ok(false);
+        }
+        // Links from before this was recorded belong to the current enrolment.
+        let adopt = owner.is_none() && vendo_id.is_some();
+        if !adopt {
+            self.clear_pass_state()?;
+        }
+        match vendo_id {
+            Some(id) => self.set_setting("pass_links_hub", id)?,
+            None => self.delete_setting("pass_links_hub")?,
+        }
+        Ok(!adopt)
     }
 
     pub fn outbox_delete(&self, ids: &[i64]) -> Result<()> {
@@ -345,17 +427,69 @@ impl Db {
         Ok(out)
     }
 
-    /// Replaces the stored client table with a snapshot of live sessions.
-    pub fn save_clients(&self, rows: &[ClientRow]) -> Result<()> {
+    pub fn open_slot(&self) -> Result<Option<OpenSlot>> {
+        let Some(raw) = self.get_setting(OPEN_SLOT_KEY)? else { return Ok(None) };
+        serde_json::from_str(&raw).map(Some).context("reading the saved coin slot")
+    }
+
+    /// Writes one batch of changes atomically: a coin's sale, the time it
+    /// bought and the cleared slot either all land or none do.
+    pub fn save(&self, b: &Batch) -> Result<()> {
+        if b.is_empty() {
+            return Ok(());
+        }
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        tx.execute("DELETE FROM clients", [])?;
         let ts = now();
-        for r in rows.iter().filter(|r| r.remaining_secs > 0) {
+        for r in &b.clients {
             tx.execute(
-                "INSERT INTO clients (mac, ip, remaining_secs, paused, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs as i64, r.paused, ts],
+                "INSERT INTO clients (mac, ip, remaining_secs, paused, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(mac) DO UPDATE SET ip = excluded.ip, remaining_secs = excluded.remaining_secs,
+                 paused = excluded.paused, updated_at = excluded.updated_at",
+                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs.min(i64::MAX as u64) as i64, r.paused, ts],
             )?;
+        }
+        for m in &b.clients_gone {
+            tx.execute("DELETE FROM clients WHERE mac = ?1", [m.to_string()])?;
+        }
+        for (m, pass) in &b.links {
+            tx.execute(
+                "INSERT INTO pass_links (mac, pass_id) VALUES (?1, ?2)
+                 ON CONFLICT(mac) DO UPDATE SET pass_id = excluded.pass_id",
+                params![m.to_string(), pass],
+            )?;
+        }
+        for m in &b.links_gone {
+            tx.execute("DELETE FROM pass_links WHERE mac = ?1", [m.to_string()])?;
+        }
+        match &b.slot {
+            None => {}
+            Some(Some(slot)) => {
+                tx.execute(
+                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![OPEN_SLOT_KEY, serde_json::to_string(slot)?],
+                )?;
+            }
+            Some(None) => {
+                tx.execute("DELETE FROM settings WHERE key = ?1", [OPEN_SLOT_KEY])?;
+            }
+        }
+        for e in &b.ledger {
+            match e {
+                Ledger::Sale { mac, pesos, secs, source } => tx.execute(
+                    "INSERT INTO sales (ts, mac, pesos, secs, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![ts, mac.map(|m| m.to_string()), pesos, *secs as i64, source],
+                )?,
+                Ledger::PassCredit { pass_id, pesos, secs } => tx.execute(
+                    "INSERT INTO hub_outbox (pass_id, pesos, secs, ts) VALUES (?1, ?2, ?3, ?4)",
+                    params![pass_id, pesos, *secs as i64, ts],
+                )?,
+                Ledger::Audit { actor, action, detail } => tx.execute(
+                    "INSERT INTO audit (ts, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
+                    params![ts, actor, action, detail],
+                )?,
+            };
         }
         tx.commit()?;
         Ok(())
@@ -562,6 +696,11 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    #[cfg(test)]
+    pub fn exec_for_test(&self, sql: &str) {
+        self.conn.lock().unwrap().execute_batch(sql).unwrap();
+    }
+
     // ---- backup ---------------------------------------------------------
 
     /// Writes a copy encrypted with an owner passphrase (SQLCipher's
@@ -724,9 +863,81 @@ mod tests {
     }
 
     #[test]
+    fn pass_links_are_dropped_when_the_hub_enrolment_changes() {
+        let (_dir, db) = test_db();
+        let mac = Mac::parse("02:11:22:33:44:55").unwrap();
+        let fill = |db: &Db| {
+            db.save(&Batch {
+                links: vec![(mac, "p_1".into())],
+                ledger: vec![Ledger::PassCredit { pass_id: "p_1".into(), pesos: 5, secs: 600 }],
+                ..Default::default()
+            })
+            .unwrap();
+        };
+        let held = |db: &Db| (db.load_links().unwrap().len(), db.outbox_list(10).unwrap().len());
+        // Links made before the owner was recorded belong to the current hub.
+        fill(&db);
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap());
+        assert_eq!(held(&db), (1, 1));
+        assert!(!db.reset_pass_state_if_hub_changed(Some("v_a")).unwrap(), "same hub: kept");
+        assert_eq!(held(&db), (1, 1));
+        // join-hub as a new vendo: the old service saved its links on the way down.
+        assert!(db.reset_pass_state_if_hub_changed(Some("v_b")).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        // leave-hub.
+        fill(&db);
+        assert!(db.reset_pass_state_if_hub_changed(None).unwrap());
+        assert_eq!(held(&db), (0, 0));
+        assert!(!db.reset_pass_state_if_hub_changed(None).unwrap(), "no hub, nothing to do");
+    }
+
+    #[test]
+    fn secrets_are_written_once() {
+        let (_dir, db) = test_db();
+        assert!(db.get_secret("k").unwrap().is_none());
+        assert_eq!(*db.put_secret_once("k", b"first").unwrap(), b"first");
+        assert_eq!(*db.put_secret_once("k", b"second").unwrap(), b"first", "never overwritten");
+    }
+
+    #[test]
+    fn batches_upsert_and_delete_single_rows() {
+        let (_d, db) = test_db();
+        let (a, b) = (Mac::parse("02:00:00:00:00:0a").unwrap(), Mac::parse("02:00:00:00:00:0b").unwrap());
+        let row = |mac, secs, paused| ClientRow { mac, ip: "10.0.0.9".parse().unwrap(), remaining_secs: secs, paused };
+        db.save(&Batch { clients: vec![row(a, 100, false), row(b, 200, true)], ..Default::default() }).unwrap();
+        db.save(&Batch { clients: vec![row(a, 70, false)], ..Default::default() }).unwrap();
+        let mut rows = db.load_clients().unwrap();
+        rows.sort_by_key(|r| r.mac);
+        assert_eq!(rows.iter().map(|r| r.remaining_secs).collect::<Vec<_>>(), vec![70, 200]);
+        db.save(&Batch { clients_gone: vec![a], links: vec![(b, "P1".into())], ..Default::default() }).unwrap();
+        assert_eq!(db.load_clients().unwrap().len(), 1);
+        assert_eq!(db.load_links().unwrap(), vec![(b, "P1".to_string())]);
+        db.save(&Batch { links_gone: vec![b], ..Default::default() }).unwrap();
+        assert!(db.load_links().unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_slot_is_saved_and_cleared_with_its_sale() {
+        let (_d, db) = test_db();
+        let slot = OpenSlot {
+            mac: Mac::parse("02:00:00:00:00:0a").unwrap(),
+            ip: "10.0.0.9".parse().unwrap(),
+            coins: vec![5, 1],
+            rates: vec![Rate { pesos: 1, minutes: 20 }],
+        };
+        db.save(&Batch { slot: Some(Some(slot.clone())), ..Default::default() }).unwrap();
+        assert_eq!(db.open_slot().unwrap(), Some(slot.clone()));
+        let sale = Ledger::Sale { mac: Some(slot.mac), pesos: 6, secs: 7200, source: "coin" };
+        db.save(&Batch { slot: Some(None), ledger: vec![sale], ..Default::default() }).unwrap();
+        assert_eq!(db.open_slot().unwrap(), None);
+        assert_eq!(db.sales_summary(1).unwrap().today_pesos, 6);
+    }
+
+    #[test]
     fn backup_roundtrip() {
         let (dir, db) = test_db();
         db.set_rates(&[Rate { pesos: 5, minutes: 99 }]).unwrap();
+        db.put_secret_once("hub_signing_key", &[3u8; 32]).unwrap();
         let bk = dir.0.join("backup.db");
         db.export_backup(&bk, "correct horse").unwrap();
         let key2 = DbKey(Zeroizing::new([9u8; 32]));
@@ -734,5 +945,7 @@ mod tests {
         import_backup(&bk, "correct horse", &dir.0.join("new.db"), &key2).unwrap();
         let db2 = Db::open(&dir.0.join("new.db"), &key2).unwrap();
         assert_eq!(db2.rates().unwrap(), vec![Rate { pesos: 5, minutes: 99 }]);
+        // A replacement board keeps its hub identity.
+        assert_eq!(*db2.get_secret("hub_signing_key").unwrap().unwrap(), [3u8; 32]);
     }
 }

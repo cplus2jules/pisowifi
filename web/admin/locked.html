@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Dashboard locked</title>
+<style>
+  :root { --ink: #1E1F2E; --muted: #6E7183; --line: #E8E8EF; --purple: #5A43E6; --lavender: #EEEBFD; --lime: #D4F04C; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; background: #F8F8FB; color: var(--ink);
+         font: 15px/1.5 Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+  main { width: 100%; max-width: 460px; background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 28px 24px; }
+  .badge { display: inline-grid; place-items: center; width: 44px; height: 44px; border-radius: 12px; background: var(--lavender); color: var(--purple); margin-bottom: 14px; }
+  h1 { font-size: 22px; line-height: 1.25; margin: 0 0 6px; }
+  p { margin: 0 0 12px; }
+  .muted { color: var(--muted); }
+  .device { background: var(--lavender); border-radius: 10px; padding: 10px 12px; margin: 16px 0 20px; }
+  .device b { display: block; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  code { font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; word-break: break-all; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  ol { margin: 0 0 20px; padding-left: 20px; }
+  li { margin-bottom: 10px; }
+  pre { margin: 6px 0 0; padding: 10px 12px; background: var(--ink); color: #fff; border-radius: 10px; overflow-x: auto; }
+  pre code { color: inherit; word-break: normal; }
+  footer { border-top: 1px solid var(--line); padding-top: 14px; font-size: 14px; }
+  a { color: var(--purple); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <div class="badge" aria-hidden="true">
+    <svg width="22" height="22" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="12" height="8.5" rx="2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>
+  </div>
+  <h1>This dashboard is locked</h1>
+  <p class="muted">Only the owner's own phones and laptops can open it, and this device isn't on the list.</p>
+  <div class="device"><b>This device</b><code>{device}</code></div>
+  <h2>Is this your phone?</h2>
+  <ol>
+    <li>Turn off the private (random) WiFi address for this network. iPhone: Settings › Wi-Fi › ⓘ › Private Wi-Fi Address › Off. Android: Wi-Fi › this network › Privacy › Use device MAC. Reconnect, then reload this page.</li>
+    <li>Still locked? Sign in to the vendo over SSH from the modem's side (not this WiFi) and run:
+      <pre><code>sudo pisowifi allow-mac {mac}
+sudo systemctl restart pisowifi</code></pre>
+    </li>
+  </ol>
+  <footer>Here for the internet? Go to <a href="{portal}">{portal}</a></footer>
+</main>
+</body>
+</html>

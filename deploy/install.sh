@@ -2,9 +2,13 @@
 # Installs pisowifi on an Orange Pi running Armbian, replacing LPB.
 # First run ./preflight.sh (changes nothing). Then, from the unpacked bundle:
 #   sudo ./install.sh
+# Test layout, for trying it out before the vendo has a modem and access point:
+#   sudo ./install.sh --test-layout
+# The built-in port becomes the customer side (a laptop plugged in is the
+# customer), there is no internet, and the vendo restarts into it at the end.
 # Run it again from a newer bundle to upgrade: when the settings and database
 # already exist it only swaps in the new version (with automatic rollback)
-# and asks nothing else. `./install.sh --full` runs the whole setup again.
+# and asks nothing else. `--full` (or `--test-layout`) runs the whole setup again.
 # Nothing from LPB is deleted: its services are disabled and its settings are
 # copied to /root/lpb-backup-<date>/ so you can roll back with uninstall.sh.
 # Everything is checked before LPB is touched, and LPB is stopped as late as
@@ -12,6 +16,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+TEST_LAYOUT=0
+[[ "${1:-}" == --test-layout ]] && TEST_LAYOUT=1
 say()  { printf '\n\033[1;35m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m %s\n' "$*"; }
 ask()  { local a; read -r -p "$1 [y/N] " a; [[ "$a" =~ ^[Yy] ]]; }
@@ -30,7 +36,7 @@ UNITS=(pisowifi.service pisowifi-update.service pisowifi-update.path)
 # the dashboard's updates use. Nothing else is asked or changed.
 DATA_DIR="$(setting data_dir "$CONF" 2>/dev/null || true)"
 DATA_DIR="${DATA_DIR:-/var/lib/pisowifi}"
-if [[ "${1:-}" != --full && -f "$CONF" && -f "$DATA_DIR/pisowifi.db" ]]; then
+if [[ -z "${1:-}" && -f "$CONF" && -f "$DATA_DIR/pisowifi.db" ]]; then
   OLD="$(/usr/local/bin/pisowifi --version 2>/dev/null | awk '{print $2}' || true)"
   cat <<EOF
 
@@ -44,6 +50,11 @@ if [[ "${1:-}" != --full && -f "$CONF" && -f "$DATA_DIR/pisowifi.db" ]]; then
   (To run the whole first-time setup again instead: ./install.sh --full)
 
 EOF
+  if [[ "$(setting wan_iface "$CONF")" == nowan0 ]]; then
+    echo "  This vendo uses the test layout, and keeps it. For the shop layout run"
+    echo "  ./install.sh --full instead."
+    echo
+  fi
   ALLOW=()
   if [[ -n "$OLD" && "$OLD" == "$NEW" ]]; then
     ask "Version $NEW is already installed. Reinstall it?" || exit 1
@@ -114,6 +125,18 @@ cat <<'EOF'
   minute or two while the new system starts.
 
 EOF
+if ((TEST_LAYOUT)); then
+  cat <<'EOF'
+  TEST LAYOUT
+  The port this SSH session uses becomes the customer side, with a fixed
+  address of 10.0.0.1. There is no internet port, so customers get time but
+  no internet, and they aren't told to send traffic through the vendo. At
+  the end the vendo restarts into this layout. After that, SSH works only
+  from the device you lock the dashboard to, plugged into the customer side.
+  Run ./install.sh --full later for the real layout.
+
+EOF
+fi
 ask "I have a backup of the SD card. Continue?" || exit 1
 
 # ---- 1. Interfaces -----------------------------------------------------------
@@ -132,24 +155,104 @@ pick_iface() { # $1 = role description, $2 = current guess
   done
   echo "$name"
 }
-say "Network interfaces"
-LAN_IF="$(pick_iface "goes to the access point (customers)" "$LAN_IF")"
-WAN_IF="$(pick_iface "goes to the ISP modem" "$WAN_IF")"
-[[ "$LAN_IF" != "$WAN_IF" ]] || { echo "The LAN and WAN interfaces must be different."; exit 1; }
-echo "Customers: $LAN_IF   Modem: $WAN_IF"
-if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
-  echo "OK: $LAN_IF has $LAN_IP"
+LAN_PREFIX="$(setting lan_cidr "$SRC_CONF" | cut -s -d/ -f2)"
+LAN_PREFIX="${LAN_PREFIX:-19}"
+lan_ip_saved() {
+  grep -rqsE "${LAN_IP//./\\.}(/| |$)" /etc/network /etc/NetworkManager/system-connections /etc/netplan /etc/systemd/network /etc/dhcpcd.conf
+}
+# A fresh Armbian Minimal card: netplan with systemd-networkd, and every
+# ethernet port asking for an address by DHCP.
+netplan_networkd() {
+  command -v netplan >/dev/null && [[ -d /etc/netplan ]] \
+    && systemctl is-enabled -q systemd-networkd 2>/dev/null \
+    && ! grep -rqsiE 'renderer: *NetworkManager' /etc/netplan
+}
+if ((TEST_LAYOUT)); then
+  say "Network interfaces (test layout)"
+  netplan_networkd || { warn "The test layout needs a fresh Armbian Minimal card (netplan + networkd)."; exit 1; }
+  conn="${SSH_CONNECTION:-}"
+  here="$(ip -o route get "${conn%% *}" 2>/dev/null | sed -nE 's/.* dev ([^ ]+).*/\1/p' || true)"
+  LAN_IF="$(pick_iface "becomes the customer side" "${here:-$LAN_IF}")"
+  WAN_IF="nowan0"   # no internet port; the firewall rules just never match it
+  echo "Customers: $LAN_IF (after the restart)   Internet: none"
 else
-  warn "$LAN_IF doesn't have $LAN_IP. Set it up as $LAN_IP/19 (armbian-config > Network) and run this again."
-  ask "Continue anyway?" || exit 1
-fi
-if ! grep -rqsE "${LAN_IP//./\\.}(/| |$)" /etc/network /etc/NetworkManager/system-connections /etc/netplan /etc/systemd/network /etc/dhcpcd.conf; then
-  warn "$LAN_IP isn't saved in any network config this installer knows. If LPB sets it at"
-  warn "boot itself, it will be gone after a reboot once LPB is off. Make it permanent with"
-  warn "armbian-config > Network, or tell whoever is helping you, before rebooting."
+  say "Network interfaces"
+  LAN_IF="$(pick_iface "goes to the access point (customers)" "$LAN_IF")"
+  WAN_IF="$(pick_iface "goes to the ISP modem" "$WAN_IF")"
+  [[ "$LAN_IF" != "$WAN_IF" ]] || { echo "The LAN and WAN interfaces must be different."; exit 1; }
+  echo "Customers: $LAN_IF   Modem: $WAN_IF"
+  if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
+    echo "OK: $LAN_IF has $LAN_IP"
+    if ! lan_ip_saved; then
+      warn "$LAN_IP isn't saved in any network config this installer knows. If LPB sets it at"
+      warn "boot itself, it will be gone after a reboot once LPB is off. Make it permanent with"
+      warn "armbian-config > Network, or tell whoever is helping you, before rebooting."
+    fi
+  elif netplan_networkd; then
+    say "Setting up $LAN_IF for customers ($LAN_IP/$LAN_PREFIX)"
+    echo "  $WAN_IF keeps getting its address from the modem. $LAN_IF gets a fixed one;"
+    echo "  the vendo hands out addresses there itself. Armbian's own netplan files"
+    echo "  are moved to $BACKUP/netplan (uninstall.sh puts them back)."
+    ask "Set up the network like this?" || exit 1
+    mkdir -p "$BACKUP/netplan"
+    MOVED=()
+    for f in /etc/netplan/*.yaml; do
+      [[ -e "$f" && "$f" != /etc/netplan/20-pisowifi.yaml ]] || continue
+      mv "$f" "$BACKUP/netplan/" && MOVED+=("$(basename "$f")")
+    done
+    umask 077
+    cat > /etc/netplan/20-pisowifi.yaml <<NETPLAN
+# Written by the pisowifi installer.
+# $WAN_IF: internet side, address from the modem by DHCP.
+# $LAN_IF: customer side, a fixed address with no DHCP client or IPv6
+# (dnsmasq serves DHCP there), kept even while no cable is plugged in.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $WAN_IF:
+      dhcp4: true
+    $LAN_IF:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      ignore-carrier: true
+      addresses: [$LAN_IP/$LAN_PREFIX]
+NETPLAN
+    umask 022
+    if ! netplan generate; then
+      rm -f /etc/netplan/20-pisowifi.yaml
+      for f in "${MOVED[@]}"; do mv "$BACKUP/netplan/$f" /etc/netplan/; done
+      warn "netplan refused that setup. Nothing was changed. Send the output above to whoever is helping you."
+      exit 1
+    fi
+    echo "  Applying. If your SSH connection drops, log in again and run ./install.sh again."
+    netplan apply
+    for _ in $(seq 1 15); do ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/" && break; sleep 1; done
+    if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
+      echo "OK: $LAN_IF has $LAN_IP"
+    else
+      warn "$LAN_IF still doesn't have $LAN_IP. Check 'networkctl status $LAN_IF'."
+      ask "Continue anyway?" || exit 1
+    fi
+  else
+    warn "$LAN_IF doesn't have $LAN_IP. Set it up as $LAN_IP/$LAN_PREFIX (armbian-config > Network) and run this again."
+    ask "Continue anyway?" || exit 1
+  fi
+
 fi
 
 # ---- 2. Packages -------------------------------------------------------------
+# Our dnsmasq settings for this LAN port. In the test layout no gateway is
+# handed out: there's no internet, and the laptop keeps using its own.
+dnsmasq_conf() {
+  if ((TEST_LAYOUT)); then
+    sed -e "s/^interface=.*/interface=$LAN_IF/" -e "s/^dhcp-option=option:router.*/dhcp-option=3/" ./dnsmasq-pisowifi.conf
+  else
+    sed "s/^interface=.*/interface=$LAN_IF/" ./dnsmasq-pisowifi.conf
+  fi
+}
 PKGS=()
 command -v nft >/dev/null || PKGS+=(nftables)
 if ! command -v dnsmasq >/dev/null; then
@@ -157,7 +260,7 @@ if ! command -v dnsmasq >/dev/null; then
   # Our settings go in first, so the package's first start only serves the
   # customer side and doesn't fight anything for port 53.
   mkdir -p /etc/dnsmasq.d
-  sed "s/^interface=.*/interface=$LAN_IF/" ./dnsmasq-pisowifi.conf > /etc/dnsmasq.d/pisowifi.conf
+  dnsmasq_conf > /etc/dnsmasq.d/pisowifi.conf
 fi
 if ((${#PKGS[@]})); then
   say "Installing ${PKGS[*]}"
@@ -175,6 +278,19 @@ else
   install -m 0644 ./config.example.toml "$CONF"
 fi
 sed -i -E "s/^lan_iface *= *\"[^\"]*\"/lan_iface = \"$LAN_IF\"/; s/^wan_iface *= *\"[^\"]*\"/wan_iface = \"$WAN_IF\"/" "$CONF"
+# SSH stays open from the modem's side on every port sshd listens on, plus
+# the one this session came in on, or the new firewall would lock you out.
+SSH_PORTS="$( { sshd -T 2>/dev/null | awk '$1 == "port" {print $2}'
+               [[ -n "${SSH_CONNECTION:-}" ]] && echo "${SSH_CONNECTION##* }"
+             } | grep -E '^[0-9]+$' | sort -un | paste -sd, - | sed 's/,/, /g' || true)"
+SSH_PORTS="${SSH_PORTS:-22}"
+if grep -qE '^ssh_ports *=' "$CONF"; then
+  sed -i -E "s/^ssh_ports *=.*/ssh_ports = [$SSH_PORTS]/" "$CONF"
+else
+  sed -i -E "/^wan_iface *=/a ssh_ports = [$SSH_PORTS]" "$CONF"
+fi
+echo "SSH stays open from the modem's side on port $SSH_PORTS."
+((TEST_LAYOUT)) || sed -i -E "s/^owner_ssh_from_lan *=.*/owner_ssh_from_lan = false/" "$CONF"
 ./pisowifi --config "$CONF" print-firewall > /tmp/pisowifi.nft
 if ! nft -c -f /tmp/pisowifi.nft; then
   warn "This kernel refuses the firewall rules above. Nothing has been changed and LPB is still running."
@@ -194,12 +310,23 @@ done
 ./pisowifi --config "$CONF" admin-info
 
 say "Locking the dashboard to your phone"
-echo "  Customers share this network, so it's safest if only your phone can open"
-echo "  the dashboard. In your phone's WiFi settings for this network, turn OFF"
-echo "  the private/random address (iPhone: Private Wi-Fi Address; Android:"
-echo "  MAC address type = Phone MAC), then copy the WiFi address shown there."
+if ((TEST_LAYOUT)); then
+  echo "  Test layout: enter the MAC of the laptop's network adapter that will be"
+  echo "  plugged into the customer side. Only it can open the dashboard and SSH in."
+  MAC_PROMPT="The laptop adapter's MAC (e.g. 00:e0:4c:11:22:33): "
+else
+  echo "  Customers share this network, so it's safest if only your phone can open"
+  echo "  the dashboard. In your phone's WiFi settings for this network, turn OFF"
+  echo "  the private/random address (iPhone: Private Wi-Fi Address; Android:"
+  echo "  MAC address type = Phone MAC), then copy the WiFi address shown there."
+  MAC_PROMPT="Your phone's WiFi MAC (e.g. a4:5e:60:11:22:33), or blank to skip: "
+fi
 while true; do
-  read -r -p "Your phone's WiFi MAC (e.g. a4:5e:60:11:22:33), or blank to skip: " OWNER_MAC
+  read -r -p "$MAC_PROMPT" OWNER_MAC
+  if [[ -z "$OWNER_MAC" ]] && ((TEST_LAYOUT)); then
+    warn "The test layout needs it: without it, nothing could log in after the restart."
+    continue
+  fi
   if [[ -z "$OWNER_MAC" ]]; then
     warn "Skipped: any device on the customer WiFi can reach the sign-in page."
     warn "Add your MAC later under [admin] allow_macs in $CONF."
@@ -209,6 +336,11 @@ while true; do
     OWNER_MAC="$(echo "$OWNER_MAC" | tr 'A-F-' 'a-f:')"
     sed -i -E "s/^allow_macs = .*/allow_macs = [\"$OWNER_MAC\"]/" "$CONF"
     echo "Dashboard locked to $OWNER_MAC."
+    if ((TEST_LAYOUT)); then
+      sed -i -E "s/^owner_ssh_from_lan *=.*/owner_ssh_from_lan = true/" "$CONF"
+      grep -qE '^owner_ssh_from_lan *=' "$CONF" || sed -i -E "/^allow_macs *=/a owner_ssh_from_lan = true" "$CONF"
+      echo "It can also SSH in from the customer side (test layout only)."
+    fi
     break
   fi
   warn "That doesn't look like a MAC address."
@@ -291,7 +423,7 @@ echo "Press Ctrl-C when done (it also stops by itself after 3 minutes)."
 if ask "Run the coin probe now?"; then
   # Ctrl-C stops the probe only, not this installer.
   trap ':' INT
-  timeout --foreground 180 ./pisowifi --config "$CONF" coin-probe || true
+  ./pisowifi --config "$CONF" coin-probe --seconds 180 || true
   trap - INT
   echo
   read -r -p "The line number it showed (blank to set it later): " LINE
@@ -318,7 +450,7 @@ install -d -m 0700 "$DATA_DIR" "$DATA_DIR/update"
 
 # dnsmasq: only our settings. bind-dynamic in pisowifi.conf copes with the LAN
 # adapter coming up late; the drop-in restarts dnsmasq if it ever dies.
-sed "s/^interface=.*/interface=$LAN_IF/" ./dnsmasq-pisowifi.conf > /etc/dnsmasq.d/pisowifi.conf
+dnsmasq_conf > /etc/dnsmasq.d/pisowifi.conf
 printf '# pisowifi: settings are in /etc/dnsmasq.d/pisowifi.conf\n# (LPB'"'"'s original is in %s)\n' "$BACKUP" > /etc/dnsmasq.conf
 printf 'ENABLED=1\nCONFIG_DIR=/etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new\n' > /etc/default/dnsmasq
 mkdir -p /etc/systemd/system/dnsmasq.service.d
@@ -341,12 +473,55 @@ EOF
 sysctl -q --system || warn "Some kernel settings didn't apply (see above); continuing."
 
 # Boot-time firewall: closed from the first second, before pisowifi starts.
+./pisowifi --config "$CONF" print-firewall > /tmp/pisowifi.nft
 { echo '#!/usr/sbin/nft -f'; echo 'flush ruleset'; cat /tmp/pisowifi.nft; } > /etc/nftables.conf
 rm -f /tmp/pisowifi.nft
 nft -c -f /etc/nftables.conf
 
 systemctl daemon-reload
 systemctl enable -q nftables dnsmasq pisowifi pisowifi-update.service pisowifi-update.path
+if ((TEST_LAYOUT)); then
+  # Written now, used from the restart: changing it live would cut this
+  # SSH session off half way.
+  mkdir -p "$BACKUP/netplan"
+  for f in /etc/netplan/*.yaml; do
+    [[ -e "$f" && "$f" != /etc/netplan/20-pisowifi.yaml ]] && mv "$f" "$BACKUP/netplan/"
+  done
+  umask 077
+  cat > /etc/netplan/20-pisowifi.yaml <<NETPLAN
+# Written by the pisowifi installer (test layout).
+# $LAN_IF: customer side, a fixed address with no DHCP client or IPv6
+# (dnsmasq serves DHCP there). There is no internet port.
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $LAN_IF:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      ignore-carrier: true
+      addresses: [$LAN_IP/$LAN_PREFIX]
+NETPLAN
+  umask 022
+  netplan generate
+  cat <<EOF
+
+  Test layout is ready. The vendo restarts in 10 seconds and this SSH
+  session closes. Then, on the laptop:
+  1. Turn Internet Sharing off (it would fight the vendo's DHCP).
+  2. Wait a minute; the adapter gets a 10.0.0.x address from the vendo.
+  3. Customer page:  http://$LAN_IP/
+     Dashboard:      https://$LAN_IP:8443/   (only from $OWNER_MAC)
+     SSH:            ssh root@$LAN_IP        (only from $OWNER_MAC)
+  Customers get time but no internet: this layout has no internet port.
+
+EOF
+  # A timer of systemd's own, so the session closing can't cancel it.
+  systemd-run --quiet --on-active=10s /bin/systemctl reboot
+  exit 0
+fi
 systemctl restart nftables dnsmasq
 systemctl restart pisowifi
 systemctl start pisowifi-update.path
@@ -359,14 +534,15 @@ cat <<EOF
   Customers:  connect to the WiFi; the portal opens at http://$LAN_IP/
   Owner:      https://$LAN_IP:8443/   (compare the certificate fingerprint above)
   Logs:       journalctl -u pisowifi -f
-  Updates:    dashboard > Settings > Software updates, or run ./install.sh
-              from a newer bundle (it keeps everything and rolls back by itself)
+  Updates:    dashboard > Settings > Update (upload the file from the GitHub
+              release), or run ./install.sh from a newer bundle
   LPB backup: $BACKUP
   Roll back:  sudo ./uninstall.sh $BACKUP
 
   Before rebooting:
   * SSH now only works from the modem's side (e.g. a laptop on the modem's own
-    WiFi), not from the customer WiFi. Check that you can log in that way.
+    WiFi), on port $SSH_PORTS, not from the customer WiFi. Check that you can
+    log in that way.
   * Then reboot once (sudo reboot) and check everything comes back by itself:
     the portal opens on a phone, and a coin gives time.
 

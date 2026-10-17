@@ -3,6 +3,7 @@
 use crate::app::{self, asset, ApiError, ApiResult, Shared};
 use crate::auth::{self, Auth, LoginCheck, SessionInfo};
 use crate::db::Rate;
+use crate::engine::AdminAdd;
 use crate::net::Mac;
 use crate::rates;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
@@ -59,6 +60,37 @@ pub fn router(st: Shared) -> Router {
         .layer(from_fn(hsts))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .with_state(st)
+}
+
+/// What a device not on `admin.allow_macs` sees: why it's locked and how
+/// the owner gets back in. Served before any login, from its own small pool.
+pub fn locked_router(st: Shared) -> Router {
+    Router::new().fallback(locked_page).layer(from_fn(hsts)).with_state(st)
+}
+
+async fn locked_page(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Response {
+    // Every value below is formatted by us (a MAC or our own URL), never raw input.
+    let mac = st.identify(addr).ok().map(|(m, _)| m.to_string());
+    let device = mac.clone().unwrap_or_else(|| "Couldn't tell which device this is. Reconnect to the WiFi and reload.".into());
+    let html = include_str!("../web/admin/locked.html")
+        .replace("{device}", &device)
+        .replace("{mac}", mac.as_deref().unwrap_or("YOUR-PHONE-MAC"))
+        .replace("{portal}", &st.portal_url());
+    (
+        StatusCode::FORBIDDEN,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 async fn hsts(req: Request, next: Next) -> Response {
@@ -197,11 +229,16 @@ async fn overview(State(st): State<Shared>) -> ApiResult<Json<Value>> {
     let sales = st.db.sales_summary(14)?;
     let clients = st.engine.clients();
     let active = clients.iter().filter(|c| c.running).count();
+    // Devices on the WiFi without time, so the owner can give them some.
+    let mut lan_devices = crate::net::lan_devices(&st.cfg.network.lan_iface, &st.cfg.network.dhcp_leases, st.dev);
+    lan_devices.retain(|d| !clients.iter().any(|c| c.mac == d.mac.to_string()));
+    lan_devices.truncate(200);
     Ok(Json(json!({
         "name": st.brand.get().name,
         "brand": st.brand.get(),
         "sales": sales,
         "clients": clients,
+        "lan_devices": lan_devices,
         "active": active,
         "slot": st.engine.slot_admin(),
         "uptime_secs": st.engine.uptime_secs(),
@@ -233,12 +270,22 @@ async fn add_time(
     if req.minutes == 0 || req.minutes > 60 * 24 * 30 {
         return Err(ApiError::bad("Minutes must be between 1 and 43200"));
     }
-    if !st.engine.admin_add_time(mac, req.minutes as u64 * 60) {
-        return Err(ApiError::bad("Device is not connected"));
+    let secs = req.minutes as u64 * 60;
+    // Where the device is on the LAN (only needed if it has no time yet).
+    let seen_at = crate::net::ip_for_mac(mac, &st.cfg.network.lan_iface, st.dev)
+        .or_else(|| {
+            let leases = crate::net::read_leases(&st.cfg.network.dhcp_leases).ok()?;
+            leases.into_iter().find(|l| l.mac == mac).map(|l| l.ip)
+        })
+        .filter(|ip| st.dev || crate::config::in_subnet(*ip, st.lan.0, st.lan.1));
+    let how = st.engine.admin_add_time(mac, secs, seen_at);
+    if how == AdminAdd::Unknown {
+        return Err(ApiError::bad("That device isn't on the WiFi right now"));
     }
-    st.db.add_sale(Some(mac), 0, req.minutes as u64 * 60, "manual")?;
-    st.db.audit(&actor(addr), "add_time", &format!("{mac} +{}m", req.minutes));
-    Ok(Json(json!({ "ok": true })))
+    let paused = how == AdminAdd::Paused;
+    st.db.add_sale(Some(mac), 0, secs, "manual")?;
+    st.db.audit(&actor(addr), "add_time", &format!("{mac} +{}m{}", req.minutes, if paused { " (paused)" } else { "" }));
+    Ok(Json(json!({ "ok": true, "paused": paused })))
 }
 
 async fn kick(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Path(mac): Path<String>) -> ApiResult<Json<Value>> {
@@ -246,7 +293,6 @@ async fn kick(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAdd
     if !st.engine.kick(mac) {
         return Err(ApiError::bad("Device is not connected"));
     }
-    st.engine.persist();
     st.db.audit(&actor(addr), "kick", &mac.to_string());
     Ok(Json(json!({ "ok": true })))
 }

@@ -27,12 +27,12 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 
 | Threat | What stops it |
 |---|---|
-| Customer gets online without paying | nftables forward policy is **drop**. Only devices whose MAC **and** IP are both in the paid set are routed. If the service dies, the table stays: it **fails closed**. |
+| Customer gets online without paying | nftables forward policy is **drop**. Only devices whose MAC **and** IP are both in the paid set are routed. If the service dies, the table stays: it **fails closed**. Every minute the service checks the kernel still matches: if something flushed the table (an nftables reload, a leftover LPB script), it's reinstalled with every customer in one step, and the audit log says so. |
 | Bypass over IPv6, DNS tunnels ("SlowDNS" apps) | IPv6 from customers is dropped. Every DNS query is forced to the box's own resolver; unpaid devices get only 10 lookups a second, enough to find the portal but too little for a usable tunnel. |
 | Customer pokes the ISP modem, SSH, or the box | Customers can reach only DHCP, DNS, the portal and the dashboard. Private ranges (192.168.x, 10.x, …) are unreachable. SSH works only from the modem side. |
 | Stolen or cloned SD card | The DB key is derived from the **H3 chip's factory ID** plus a random salt, stretched with Argon2id (64 MiB, 3 passes) so guessing the ID is slow. The key is never stored, so the card can't be opened on another board. **Stealing the whole box (chip and card) still opens the database**; at that point the Argon2id-hashed admin password is what protects your account. |
 | Admin password sniffed on the open WiFi | The dashboard is HTTPS only (TLS 1.2/1.3, rustls). The password is Argon2id-hashed (64 MiB, 3 passes). Sessions are bound to your IP with HttpOnly, Secure, SameSite=Strict cookies plus a CSRF token. |
-| Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC, and the dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
+| Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC. Other devices are turned away before any TLS work, from a separate small pool, so customers can't tie up the dashboard; they see a page explaining the lock. The dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
 | Customer "claims" a fresh box | The password can only be set from the device's shell (`set-password`), never from the web. |
 | Web attacks (XSS, CSRF, clickjacking, DNS rebinding) | Strict CSP (no inline scripts), no `innerHTML`, custom-header CSRF checks, Host-header checks, `frame-ancestors 'none'`. |
 | Slowloris / connection floods | Connection caps, 10 s header timeout, 4–16 KB body limits, one Argon2 hash at a time. |
@@ -40,9 +40,9 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Compromised service | The systemd unit drops all capabilities except networking, the filesystem is read-only except `/var/lib/pisowifi`, and only GPIO devices are allowed. |
 
 **Known limits** (true of every open-WiFi vendo, LPB included):
-- **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break. Fully preventing this needs WPA2 per-user keys.
+- **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break, and a customer's time only moves to a new IP that dnsmasq actually leased to that MAC (anything else is refused and logged as a possible MAC clone). A clone that also copies the IP still gets through; fully preventing this needs WPA2 per-user keys.
 - **Client isolation.** Turn it on in the access point so customers can't see each other's devices.
-- **Piso Pass codes travel unencrypted** over the open WiFi, like everything on the portal. Someone sniffing nearby could copy a code and use its time. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
+- **Piso Pass codes are bearer secrets sent over the open WiFi.** Whoever has a code has its time, and the portal (like every vendo's) is plain HTTP, so someone sniffing nearby could copy a code as the phone claims it or buys more time, and use the time first. Tell customers to treat the code like cash. See [Piso Pass](#piso-pass-one-payment-all-your-locations) before turning it on.
 - **SSH works only from the modem's side** (e.g. a laptop on the modem's own WiFi), never from the customer WiFi.
 
 ## Install on the Orange Pi
@@ -88,6 +88,12 @@ minute or two. It:
 - saves LPB's firewall and dnsmasq settings to `/root/lpb-backup-<date>/`
 - runs the coin probe
 - installs a fail-closed boot firewall and DHCP/DNS for the customer side, and starts the service
+
+**No modem or access point yet?** `sudo ./install.sh --test-layout` (fresh
+Armbian card only) makes the built-in port the customer side: plug a laptop
+in and it's the customer. There's no internet in this layout, and only the
+laptop whose adapter MAC you give the installer can open the dashboard or
+SSH in. Run `./install.sh` again for the real layout.
 
 **5. Before you leave it:** check SSH works from the modem side, then
 `sudo reboot` once and check that the portal opens on a phone and a coin
@@ -138,6 +144,12 @@ Put that number in `/etc/pisowifi/config.toml` under `[coin] line = …`, then:
 sudo systemctl start pisowifi
 ```
 
+**Optional: check pulse widths.** `coin-probe` prints how long each pulse
+lasts (ALLAN: usually 20–100 ms). Once you've seen yours, set
+`pulse_width_ms = [15, 150]` (shortest, longest) under `[coin]`: pulses
+outside that range, like electrical noise or a wire held low, are then
+ignored and logged instead of counted. Leave it out until you've measured.
+
 **Optional: gate the acceptor.** Wire a relay or transistor to the acceptor's
 power (or INHIBIT input) and set `enable_line`. The slot then only accepts
 coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
@@ -147,11 +159,12 @@ coins after a customer taps *Insert coin*, so no more "unclaimed" coins.
 | Task | How |
 |---|---|
 | Dashboard | `https://10.0.0.1:8443/` from a phone on the WiFi. Accept the certificate once **after checking the fingerprint** from `sudo pisowifi admin-info`. |
-| Lock the dashboard to your phone | Add your phone's MAC to `admin.allow_macs` in the config. Turn off "private address" for this network on the phone. |
+| Lock the dashboard to your phone | Turn off "private address" for this network on the phone, then `sudo pisowifi allow-mac a4:5e:60:11:22:33` and `sudo systemctl restart pisowifi`. Locked out? Open the dashboard anyway: the page shows the address to allow. |
 | Logs | `journalctl -u pisowifi -f` |
-| Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. |
+| Backup | `sudo pisowifi backup --out /root/pisowifi-backup.db` makes a passphrase-encrypted copy. Keep it off the box. It includes the vendo's Piso Pass key, so a replacement board restored from it stays in your chain without re-joining. |
 | Restore onto a replacement board | Stop the service, move `/var/lib/pisowifi/pisowifi.db` aside, then run `sudo pisowifi restore --from …`. |
 | Changed `config.toml`? | Restart (`sudo systemctl restart pisowifi`). If you changed interfaces or ports, also refresh the boot firewall: `sudo sh -c '{ echo "flush ruleset"; pisowifi print-firewall; } > /etc/nftables.conf'`. |
+| Give someone time | Dashboard › Devices. Works for any device on the WiFi, even with no time yet. A paused customer stays paused: the time waits with theirs. |
 | Coin slot offline | The dashboard says so, and the portal refuses coins instead of losing them. Check `[coin]` in the config and `journalctl -u pisowifi`. |
 | Dashboard certificate | Valid for 800 days and renewed automatically a month before it expires; your browser then warns once more, so check the new fingerprint with `sudo pisowifi admin-info`. |
 | Reset the password | `sudo pisowifi set-password`. Use 4+ random words or 14+ random characters, used nowhere else. Never reuse the old LPB password: LPB stored it in plain text in MariaDB on the SD card. |
@@ -178,9 +191,11 @@ Dev mode fakes the firewall and the coin slot. The dashboard shows *Test ₱1/�
 
 Run the tests with `cargo test`. They cover the encryption-at-rest check,
 wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session
-binding, lockout, rate math, ARP parsing, the firewall rules, Piso Pass
-transfers and wallet passes (JWT claims, .pkpass manifest and signature,
-single-use links).
+binding, lockout, rate math, ARP and lease parsing, the firewall rules and
+their self-repair, coins surviving a power cut, the MAC-clone check, the
+dashboard lock, Piso Pass (transfers between two vendos against a real hub
+over HTTP, syncs crossing claims, lease caps, pruning, offline vendos) and
+wallet passes (JWT claims, .pkpass manifest and signature, single-use links).
 
 To try wallet passes locally, write a hub config whose `[wallet]` section
 points at the throwaway keys in `testdata/wallet/` and run
@@ -193,11 +208,8 @@ Run several vendos? Customers' time can follow them. Pay ₱20 at your store
 in Barangay A, use an hour, and the remaining time is waiting at your
 branch in Barangay B.
 
-> **Not ready for real money yet.** A review before the first deployment
-> found Piso Pass bugs that can lose or duplicate a customer's time when a
-> sync crosses a claim, plus pass links that pile up over weeks. Run single
-> vendos without a hub until those are fixed. A vendo that never joins a hub
-> is unaffected: all Piso Pass code stays switched off.
+A vendo that never joins a hub is unaffected: all Piso Pass code stays
+switched off.
 
 ```
  Vendo A ──┐  outbound HTTPS only, every request signed (Ed25519)
@@ -208,20 +220,39 @@ branch in Barangay B.
 - **The pass.** The first time a phone pays, it gets a Piso Pass
   (`PASS-XXXX-XXXX-XXXX-XXXX`). The pass is saved in the phone's browser and
   shown on screen to screenshot. All vendos use the same portal address
-  (10.0.0.1), so a phone's saved pass is picked up automatically at any
-  location. It can also be typed into *Have a voucher or Piso Pass?*.
+  (10.0.0.1), so a phone's saved pass is picked up automatically at any of
+  your locations. It can also be typed into *Have a voucher or Piso Pass?*.
+  Phones keep passes per hub, so another owner's vendo never sees yours, and
+  a saved pass is never deleted because something went wrong.
 - **Moving between locations.** A vendo holds a pass's time while the customer is
   there and reports it to the hub every 30 s. Claiming the pass somewhere
   else moves the time there, and the old vendo cuts that phone off on its next
-  report. Paused time moves intact; running time keeps counting.
+  report. Running time keeps counting. Paused time moves intact and stays
+  paused until the customer taps *Resume*, so a phone that joins the WiFi in
+  a pocket doesn't use it up. Buying coins with a pass saved on the phone adds
+  to that pass; it never makes a second one.
 - **If the hub is down**, every vendo keeps working on its own. Coins and
   vouchers work as usual, and passes resume syncing when the hub is back.
+  One exception: a vendo that hasn't reached the hub for 2 minutes won't
+  restart *paused* pass time, because the pass may have been claimed at
+  another location meanwhile. The customer sees a message to try again; their
+  time is safe on the pass.
 - **Wallet passes.** Optionally, customers can add the pass to Google Wallet
   or Apple Wallet (see [Wallet passes](#wallet-passes)).
 - **Security.** Vendos enrol with a single-use code and an Ed25519 key that
   never leaves the box. Requests are signed over the method, path, time,
-  nonce and body hash; stale (±5 min) or replayed requests are refused.
-  Vendos never store pass codes, and the hub only stores HMACs of them.
+  nonce and body hash; stale (±5 min) or replayed requests are refused, and
+  the hub checks who is asking before it reads a request. Vendos never store
+  pass codes, and the hub only stores HMACs of them.
+- **A stolen vendo.** Its signing key is kept inside the encrypted database,
+  which is locked to the board's chip, so a copied SD card alone doesn't give
+  it away (unless the chip ID can't be read and the service warned at start
+  that it fell back to a key file on the card). (Older versions kept it in a plain `hub-signing.key` file; it is
+  moved into the database and the file removed on the first start.) Someone
+  with the whole box does have it, but the hub only lets a vendo's reports
+  *lower* a pass's time, or raise it by sales the vendo reported for that
+  pass, so the key can't mint free time, and every refused report is logged.
+  If a box goes missing, run `pisowifi hub remove-vendo` for it straight away.
 
 ### Set up the hub (once)
 
@@ -252,6 +283,12 @@ branch in Barangay B.
 
 To see every vendo, its last sync and the passes it holds, run `pisowifi hub vendos` on the hub. `hub remove-vendo --id …` retires a box and returns its customers' time to their passes.
 
+`leave-hub` (or joining another hub) turns Piso Pass off on that vendo after
+the restart: phones there keep the time they have, but it no longer follows
+them. Retire a vendo with both `leave-hub` and `hub remove-vendo`, when no
+customer there has pass time running: time held there at that moment stays
+on the phones *and* goes back to the passes.
+
 ## Wallet passes
 
 Customers can keep their Piso Pass in **Google Wallet** (Android, Samsung
@@ -276,9 +313,10 @@ How it works:
   The phone downloads the pass from the hub over the internet, so the
   customer's time must be running. Links never contain the code.
 - The pass shows the code as a QR code and as text. Its **Use my time** link
-  opens `http://10.0.0.1/?pass=CODE`: on any of your vendos' WiFi, that saves
-  the pass on the phone and claims its time. The pass doesn't show the
-  balance, which changes every second.
+  opens `http://10.0.0.1/?pass=CODE`: on any of your vendos' WiFi, the portal
+  asks before claiming it (a planted link can't collect someone's time), then
+  saves the pass on the phone. The pass doesn't show the balance, which
+  changes every second.
 - The Google key and Apple certificate live **only on the hub**. Vendos never
   see them. On the hub, systemd hands them over with `LoadCredential`, so the
   files can stay readable by root only.

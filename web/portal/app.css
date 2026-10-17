@@ -142,9 +142,11 @@ h1, h2, p { margin: 0; }
   background: var(--purple); box-shadow: inset 0 -4px 0 rgba(0, 0, 0, .18);
 }
 .slot-slit { position: relative; z-index: 2; width: 34px; height: 8px; border-radius: 6px; background: #1E1F2E; box-shadow: inset 0 2px 3px #000, 0 1px 0 rgba(255, 255, 255, .25); }
-.peek { position: absolute; z-index: 1; left: 50%; top: 4px; width: 26px; height: 26px; margin-left: -13px; animation: bob 2.4s ease-in-out infinite; }
-.peek svg { width: 100%; height: 100%; display: block; }
-.slot:active .peek { animation: none; transform: translateY(14px) scale(.9); transition: transform .2s ease; }
+/* The coin's lower part is cut off at the middle of the slit, just behind it,
+   so it reads as a coin halfway in; it sinks a little, and all the way on tap. */
+.peek { position: absolute; z-index: 1; left: 50%; top: 0; width: 32px; height: 33px; margin-left: -16px; overflow: hidden; pointer-events: none; }
+.peek svg { position: absolute; left: 2px; bottom: -11px; width: 28px; height: 28px; display: block; animation: sink 2.4s ease-in-out infinite; }
+.slot:active .peek svg { animation: none; transform: translateY(26px); transition: transform .25s ease-in; }
 .slot-text { flex: 1; display: grid; gap: 1px; min-width: 0; }
 .slot-title { font-size: clamp(20px, 6vw, 23px); font-weight: 800; letter-spacing: -.03em; }
 .slot-sub { font-size: 13px; color: var(--lime-ink); opacity: .8; }
@@ -273,6 +275,16 @@ h1, h2, p { margin: 0; }
 .confetti i { position: absolute; display: block; will-change: transform, opacity; }
 .noscript { padding: 24px; text-align: center; }
 .foot { text-align: center; font: 600 11.5px/1 var(--mono); color: #A3A5B5; padding-top: 4px; }
+.made-by {
+  justify-self: center; align-self: center; display: inline-flex; align-items: center; gap: 7px;
+  margin-top: -4px; padding: 6px 10px; border-radius: 999px;
+  font: 600 12px/1 var(--font); color: #A3A5B5; text-decoration: none;
+  transition: color .2s ease, background-color .2s ease;
+}
+.made-by-mark { width: 16px; height: 16px; flex: none; }
+.made-by-mark rect { fill: currentColor; transition: fill .2s ease; }
+.made-by-mark text { fill: #fff; font: 800 7.4px/1 var(--font); letter-spacing: -.2px; }
+.made-by:hover { color: var(--purple); background: var(--lavender); }
 
 /* ---- onboarding ------------------------------------------------------------ */
 .onboard { position: fixed; inset: 0; z-index: 50; display: grid; align-items: end; justify-items: center; background: rgba(30, 31, 46, .38); backdrop-filter: blur(4px); animation: fade .3s ease; }
@@ -316,7 +328,7 @@ h1, h2, p { margin: 0; }
 /* ---- keyframes ------------------------------------------------------------- */
 @keyframes sig { 0%, 100% { opacity: .35; } 40% { opacity: 1; } }
 @keyframes hop { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-3px); } }
-@keyframes bob { 0%, 100% { transform: translateY(-2px); } 50% { transform: translateY(5px); } }
+@keyframes sink { 0%, 100% { transform: translateY(-3px); } 50% { transform: translateY(3px); } }
 @keyframes nudge { 0%, 70%, 100% { transform: translateX(0); } 80% { transform: translateX(4px); } 90% { transform: translateX(-1px); } }
 @keyframes blink { 50% { opacity: .2; } }
 @keyframes spin-y { to { transform: rotateY(360deg); } }

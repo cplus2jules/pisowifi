@@ -1265,7 +1265,7 @@ pub fn spawn_daily(u: Arc<Updater>, engine: Arc<Engine>) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::db::ClientRow;
+    use crate::db::{Batch, ClientRow};
     use crate::keys::DbKey;
     use crate::net::Mac;
     use crate::release::tests::{bundle_with, manifest_for, test_key, TARGET_ARM};
@@ -1376,7 +1376,8 @@ mod tests {
         fs::write(layout.units_dir.join("pisowifi.service"), "old unit").unwrap();
         let db = Db::open(&data.join("pisowifi.db"), &DbKey(Zeroizing::new(KEY))).unwrap();
         db.add_sale(Some(Mac::parse(PHONE).unwrap()), 20, 7200, "coin").unwrap();
-        db.save_clients(&[ClientRow { mac: Mac::parse(PHONE).unwrap(), ip: "10.0.0.9".parse().unwrap(), remaining_secs: 5000, paused: false }]).unwrap();
+        let client = ClientRow { mac: Mac::parse(PHONE).unwrap(), ip: "10.0.0.9".parse().unwrap(), remaining_secs: 5000, paused: false };
+        db.save(&Batch { clients: vec![client], ..Default::default() }).unwrap();
         drop(db);
         fs::write(data.join("db.salt"), [1u8; 32]).unwrap();
         let profile = Profile {

@@ -32,14 +32,20 @@ pub struct AppState {
 
 pub type Shared = Arc<AppState>;
 
-pub struct ApiError(pub StatusCode, pub String);
+/// An error for the browser or a vendo: a message for people and, where a
+/// program needs to tell cases apart, a fixed `code`.
+pub struct ApiError(pub StatusCode, pub String, pub Option<&'static str>);
 
 impl ApiError {
     pub fn new(code: StatusCode, msg: impl Into<String>) -> Self {
-        ApiError(code, msg.into())
+        ApiError(code, msg.into(), None)
     }
     pub fn bad(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg)
+    }
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.2 = Some(code);
+        self
     }
 }
 
@@ -52,7 +58,11 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let body = match self.2 {
+            Some(code) => json!({ "error": self.1, "code": code }),
+            None => json!({ "error": self.1 }),
+        };
+        (self.0, Json(body)).into_response()
     }
 }
 

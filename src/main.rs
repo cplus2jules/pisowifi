@@ -59,9 +59,17 @@ enum Cmd {
     CoinProbe {
         #[arg(long, default_value = "/dev/gpiochip0")]
         chip: String,
+        /// Stop by itself after this many seconds (default: until Ctrl-C)
+        #[arg(long)]
+        seconds: Option<u64>,
     },
     /// Show the dashboard URL and TLS certificate fingerprint
     AdminInfo,
+    /// Let a device open the dashboard (adds it to [admin] allow_macs; restart to apply)
+    AllowMac {
+        /// The device's WiFi MAC address, e.g. a4:5e:60:11:22:33
+        mac: String,
+    },
     /// Print the nftables ruleset this config would install
     PrintFirewall,
     /// Write a passphrase-encrypted backup of the database
@@ -217,6 +225,18 @@ fn main() -> Result<()> {
             };
             return run_hub(cfg, cmd, cli.dev);
         }
+        Cmd::AllowMac { mac } => {
+            if cli.dev {
+                bail!("allow-mac edits the vendo's config file; dev mode doesn't use one");
+            }
+            let mac = net::Mac::parse(&mac).context("that isn't a WiFi (MAC) address like a4:5e:60:11:22:33")?;
+            if config::add_admin_mac(&cli.config, mac)? {
+                println!("{mac} can open the dashboard once the service restarts:\n  sudo systemctl restart pisowifi");
+            } else {
+                println!("{mac} is already allowed. Still locked out? Check the address on the locked page matches.");
+            }
+            return Ok(());
+        }
         Cmd::ReleaseKey { key } => {
             let k = release::load_or_create_key(&key)?;
             println!("{}", hex::encode(k.verifying_key().as_bytes()));
@@ -283,7 +303,7 @@ fn main() -> Result<()> {
             println!("Password saved. Restart the service to sign out existing sessions.");
             Ok(())
         }
-        Cmd::CoinProbe { chip } => gpio::probe(&chip),
+        Cmd::CoinProbe { chip, seconds } => gpio::probe(&chip, seconds.map(Duration::from_secs)),
         Cmd::AdminInfo => {
             let t = tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?;
             println!("Dashboard:   https://{}:{}/", cfg.network.portal_ip, cfg.admin.listen.port());
@@ -292,7 +312,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::PrintFirewall => {
-            print!("{}", firewall::base_ruleset(&cfg)?);
+            print!("{}", firewall::base_ruleset(&cfg, &[])?);
             Ok(())
         }
         Cmd::Backup { out } => {
@@ -313,7 +333,7 @@ fn main() -> Result<()> {
         }
         Cmd::LeaveHub => {
             hubclient::leave(&open_db(&cfg, cli.dev)?)?;
-            println!("Left the hub. Restart the service.");
+            println!("Left the hub. Restart the service. Phones keep the time they have here; it just stops being a Piso Pass.");
             Ok(())
         }
         Cmd::Update(a) => {
@@ -324,7 +344,7 @@ fn main() -> Result<()> {
             };
             update::cli(&p, a.into(), cli.dev, &configured)
         }
-        Cmd::Hub { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } => unreachable!(),
+        Cmd::Hub { .. } | Cmd::AllowMac { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } => unreachable!(),
         Cmd::Restore { from } => {
             let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
             let k = keys::derive(&cfg.storage.data_dir, source, false)?;
@@ -462,10 +482,12 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let admin_l = listen(cfg.admin.listen)?;
     let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let enable = gpio::Enable::open(&cfg.coin)?.map(|e| (e, cfg.coin.enable_line.unwrap()));
-    // Customers who were online stay online through a restart or an update:
-    // their grants go in together with the new firewall table.
-    let grants: Vec<_> = db.load_clients()?.into_iter().filter(|c| !c.paused).map(|c| (c.mac, c.ip, c.remaining_secs)).collect();
-    let fw = firewall::Firewall::start(&cfg, dev, &grants).await?;
+    let (fw, fw_start) = firewall::Firewall::new(&cfg, dev);
+    // Pass links from another hub enrolment (join-hub, leave-hub) are dropped
+    // before the engine loads them.
+    if db.reset_pass_state_if_hub_changed(db.get_setting("hub_vendo_id")?.as_deref())? {
+        tracing::info!("Piso Pass: hub changed; old pass links dropped (customers keep their time here)");
+    }
     // In dev mode coins come from the dashboard's test buttons.
     let reader_ok = Arc::new(std::sync::atomic::AtomicBool::new(dev));
     let engine = engine::Engine::new(
@@ -475,7 +497,13 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         cfg.coin.pesos_per_pulse,
         cfg.coin.insert_window_secs,
         reader_ok.clone(),
+        (!dev).then(|| cfg.network.dhcp_leases.clone()),
     )?;
+    // Base ruleset and every restored customer in one transaction.
+    let db2 = db.clone();
+    fw_start
+        .start(&engine.grants(), move |what| db2.audit("system", "firewall_restored", what))
+        .await?;
 
     // Coin pulses -> engine.
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -498,7 +526,18 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         }
     });
 
-    // Clock: expire sessions every second, save to disk every 30 s.
+    // Firewall: every minute, check nothing else flushed or changed it.
+    let e = engine.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.tick().await; // (fires at once; it was just installed)
+        loop {
+            tick.tick().await;
+            e.reconcile_firewall();
+        }
+    });
+
+    // Clock: expire sessions every second, checkpoint running clocks every 30 s.
     let e = engine.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -517,18 +556,14 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let hub_client = hubclient::HubClient::load(&db, &cfg.storage.data_dir)?;
     if let Some(hub) = hub_client.clone() {
         tracing::info!("Piso Pass: connected to hub {} as {}", hub.status().url, hub.status().name);
-        let (e, db2) = (engine.clone(), db.clone());
+        let e = engine.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(if dev { 5 } else { 30 }));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let credits = db2.outbox_list(200).unwrap_or_default();
-                match hub.sync(hub::proto::SyncReq { leases: e.lease_reports(), credits }).await {
-                    Ok(r) => {
-                        e.revoke_passes(&r.revoked);
-                        let _ = db2.outbox_delete(&r.acked);
-                    }
-                    Err(err) => tracing::warn!("hub sync: {err}"),
+                if let Err(err) = hub.sync_once(&e).await {
+                    tracing::warn!("hub sync: {err}");
                 }
             }
         });
@@ -573,14 +608,25 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         portal::router(state.clone()),
         None,
         server::Limits { max_conns: cfg.portal.max_connections, per_ip: 24, request_timeout: Duration::from_secs(20) },
+        None,
         stop_rx.clone(),
     ));
+    // Devices not on admin.allow_macs are turned away before TLS, from a
+    // pool of their own, so customers can't use up the owner's connections.
+    let gate = (!state.admin_macs.is_empty()).then(|| {
+        let st = state.clone();
+        server::Gate {
+            allow: Box::new(move |addr| st.identify(addr).is_ok_and(|(mac, _)| st.admin_macs.contains(&mac))),
+            locked: admin::locked_router(state.clone()),
+        }
+    });
     let a = tokio::spawn(server::serve(
         admin_l,
         admin::router(state.clone()),
         admin_tls.map(|t| t.acceptor),
         // Uploads (logo, poster) get longer.
         server::Limits { max_conns: 32, per_ip: 8, request_timeout: Duration::from_secs(60) },
+        gate,
         stop_rx,
     ));
 
