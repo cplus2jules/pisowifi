@@ -13,7 +13,7 @@ use crate::hub::proto::{CreditReport, LeaseReport};
 use crate::net::Mac;
 use crate::rates;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +36,8 @@ pub const MAX_GRANT_SECS: u64 = 400 * 86400;
 /// recently: while out of touch, this vendo wouldn't know the pass had been
 /// claimed at another location. Shorter than any trip between two vendos.
 pub const PASS_TRUST: Duration = Duration::from_secs(120);
+/// What a blocked phone is told when it tries to buy or use time.
+pub const BLOCKED: &str = "This device can't buy time here. Please talk to the owner.";
 
 pub struct Engine {
     state: Mutex<State>,
@@ -77,6 +79,8 @@ struct State {
     clone_alerts: HashMap<(Mac, Ipv4Addr), Instant>,
     /// Last successful hub sync (Piso Pass).
     last_sync: Option<Instant>,
+    /// Devices the owner blocked: they get no time here, from anywhere.
+    blocked: HashSet<Mac>,
 }
 
 #[derive(Default)]
@@ -142,6 +146,8 @@ pub struct MeView {
     pub running: bool,
     pub slot: SlotView,
     pub rates: Vec<Rate>,
+    /// The owner blocked this phone.
+    pub blocked: bool,
 }
 
 #[derive(Serialize)]
@@ -168,6 +174,8 @@ pub struct SlotAdminView {
 pub enum Resume {
     Resumed,
     Nothing,
+    /// The owner blocked this phone.
+    Blocked,
     /// Paused Piso Pass time, and the hub hasn't been heard from lately.
     NeedsHub,
 }
@@ -179,6 +187,8 @@ pub enum CoinStart {
     Offline,
     /// This phone's last reservation expired empty; try again in N s.
     Wait(u64),
+    /// The owner blocked this phone.
+    Blocked,
 }
 
 /// Owner adding time from the dashboard.
@@ -189,6 +199,16 @@ pub enum AdminAdd {
     Paused,
     /// Not on the network as far as we can tell.
     Unknown,
+    /// The owner blocked this device: unblock it first.
+    Blocked,
+}
+
+/// Owner blocking a device.
+#[derive(Debug, PartialEq)]
+pub enum Block {
+    Done,
+    /// It's inserting coins right now; blocking would swallow them.
+    Inserting,
 }
 
 impl Engine {
@@ -203,8 +223,12 @@ impl Engine {
         leases: Option<PathBuf>,
     ) -> anyhow::Result<Arc<Engine>> {
         let now = Instant::now();
+        let blocked: HashSet<Mac> = db.load_blocked()?.into_iter().collect();
         let mut clients = HashMap::new();
         for row in db.load_clients()? {
+            if blocked.contains(&row.mac) {
+                continue;
+            }
             let left = Duration::from_secs(row.remaining_secs.min(MAX_GRANT_SECS));
             // Downtime isn't charged: the clock resumes where it stopped.
             let c = if row.paused {
@@ -241,6 +265,7 @@ impl Engine {
                 ledger: vec![],
                 clone_alerts: HashMap::new(),
                 last_sync: None,
+                blocked,
             }),
             writer: Mutex::new(()),
             db,
@@ -325,6 +350,7 @@ impl Engine {
             running,
             slot,
             rates: st.rates.clone(),
+            blocked: st.blocked.contains(&mac),
         }
     }
 
@@ -382,6 +408,9 @@ impl Engine {
     pub fn coin_start(&self, mac: Mac, ip: Ipv4Addr) -> CoinStart {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
+        if st.blocked.contains(&mac) {
+            return CoinStart::Blocked;
+        }
         if let Some(s) = &st.slot {
             if s.mac != mac {
                 return CoinStart::Busy(s.deadline.saturating_duration_since(now).as_secs());
@@ -500,6 +529,9 @@ impl Engine {
     pub fn resume(&self, mac: Mac, ip: Ipv4Addr) -> Resume {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
+        if st.blocked.contains(&mac) {
+            return Resume::Blocked;
+        }
         if !self.rebind(&mut st, mac, ip, now) {
             return Resume::Nothing;
         }
@@ -540,6 +572,9 @@ impl Engine {
     }
 
     pub fn redeem_voucher(&self, mac: Mac, ip: Ipv4Addr, code: &str) -> Result<u64, &'static str> {
+        if self.is_blocked(mac) {
+            return Err(BLOCKED);
+        }
         self.code_attempt_allowed(mac)?;
         match self.db.redeem_voucher(code, mac) {
             Ok(Some(secs)) => {
@@ -569,6 +604,9 @@ impl Engine {
     /// the address it was seen at on the LAN.
     pub fn admin_add_time(&self, mac: Mac, secs: u64, seen_at: Option<Ipv4Addr>) -> AdminAdd {
         let mut st = self.state.lock().unwrap();
+        if st.blocked.contains(&mac) {
+            return AdminAdd::Blocked;
+        }
         let known = st.clients.get(&mac).map(|c| (c.until.is_none(), c.ip));
         let res = match known {
             Some((true, _)) => {
@@ -598,18 +636,41 @@ impl Engine {
 
     pub fn kick(&self, mac: Mac) -> bool {
         let mut st = self.state.lock().unwrap();
-        let kicked = match st.clients.remove(&mac) {
-            Some(c) => {
-                if c.until.is_some() {
-                    self.fw.revoke(mac, c.ip);
-                }
-                true
-            }
-            None => false,
-        };
+        let kicked = self.remove_client_locked(&mut st, mac);
         drop(st);
         self.flush(false);
         kicked
+    }
+
+    /// Blocks a device: its time here ends (like `kick`) and it can't buy,
+    /// redeem, claim or resume time until it's unblocked. Saved at once.
+    pub fn block(&self, mac: Mac) -> anyhow::Result<Block> {
+        let mut st = self.state.lock().unwrap();
+        if st.slot.as_ref().is_some_and(|s| s.mac == mac) {
+            return Ok(Block::Inserting);
+        }
+        self.db.set_blocked(mac, true)?;
+        st.blocked.insert(mac);
+        st.cooldown.remove(&mac);
+        self.remove_client_locked(&mut st, mac);
+        drop(st);
+        self.flush(false);
+        Ok(Block::Done)
+    }
+
+    /// Returns whether it was blocked.
+    pub fn unblock(&self, mac: Mac) -> anyhow::Result<bool> {
+        let mut st = self.state.lock().unwrap();
+        self.db.set_blocked(mac, false)?;
+        Ok(st.blocked.remove(&mac))
+    }
+
+    pub fn is_blocked(&self, mac: Mac) -> bool {
+        self.state.lock().unwrap().blocked.contains(&mac)
+    }
+
+    pub fn blocked(&self) -> Vec<Mac> {
+        self.state.lock().unwrap().blocked.iter().copied().collect()
     }
 
     pub fn test_coin(&self, pesos: u32) {
@@ -732,6 +793,10 @@ impl Engine {
     pub fn claim_into(&self, mac: Mac, ip: Ipv4Addr, pass_id: String, secs: u64, run: bool, pesos: u32) -> (u64, bool) {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
+        // The portal refuses blocked phones before asking the hub; this is the backstop.
+        if st.blocked.contains(&mac) {
+            return (0, false);
+        }
         // A copy of this MAC elsewhere gets the time put on the real phone.
         let ip = self.ip_for(&mut st, mac, ip, now);
         let (extra, local_running) = match st.links.get(&mac) {
@@ -843,6 +908,19 @@ impl Engine {
 
     // ---- internals ------------------------------------------------------
 
+    /// Ends a phone's time here. Returns whether it had any.
+    fn remove_client_locked(&self, st: &mut State, mac: Mac) -> bool {
+        match st.clients.remove(&mac) {
+            Some(c) => {
+                if c.until.is_some() {
+                    self.fw.revoke(mac, c.ip);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     fn finish_slot(&self, st: &mut State, slot: Slot) -> Option<(u32, u64)> {
         self.set_acceptor(false);
         if slot.pesos == 0 {
@@ -893,6 +971,9 @@ impl Engine {
 
     /// Sets a phone's time outright, running or paused.
     fn set_time_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, secs: u64, run: bool) {
+        if st.blocked.contains(&mac) {
+            return;
+        }
         let now = Instant::now();
         let left = Duration::from_secs(secs.min(MAX_GRANT_SECS));
         let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO });
@@ -912,6 +993,10 @@ impl Engine {
 
     /// Paying (coins, vouchers, passes) always starts the clock.
     fn add_time_locked(&self, st: &mut State, mac: Mac, ip: Ipv4Addr, secs: u64) {
+        // Blocked: no time from anywhere (even a coin that was still dropping).
+        if st.blocked.contains(&mac) {
+            return;
+        }
         let now = Instant::now();
         let ip = self.ip_for(st, mac, ip, now);
         let add = Duration::from_secs(secs.min(MAX_GRANT_SECS));
@@ -1008,6 +1093,7 @@ impl Engine {
 fn grants_of(st: &State, now: Instant) -> Vec<Grant> {
     st.clients
         .iter()
+        .filter(|(m, _)| !st.blocked.contains(m))
         .filter_map(|(m, c)| c.until.map(|u| Grant { mac: *m, ip: c.ip, secs: u.saturating_duration_since(now).as_secs() }))
         .filter(|g| g.secs > 0)
         .collect()
@@ -1069,6 +1155,54 @@ mod tests {
         assert!(!e.counting());
         // (The clock is running, so allow a second.)
         assert!(rates::secs_for(25, &rates) - remaining(&e, mac) <= 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_blocked_device_gets_no_time_from_anywhere_even_after_a_restart() {
+        let (dir, e) = engine(true);
+        let (mac, other) = (Mac::parse(PHONE).unwrap(), Mac::parse("02:00:00:00:00:02").unwrap());
+        buy(&e, mac, IP, 5);
+        e.pause(mac, IP);
+        buy(&e, other, Ipv4Addr::new(10, 0, 0, 10), 1);
+        assert_eq!(e.block(mac).unwrap(), Block::Done);
+        assert_eq!(remaining(&e, mac), 0, "its time ends, like a kick");
+        assert!(e.me(mac, IP).blocked && !e.me(other, IP).blocked);
+        assert!(matches!(e.coin_start(mac, IP), CoinStart::Blocked));
+        assert!(matches!(e.resume(mac, IP), Resume::Blocked));
+        assert_eq!(e.admin_add_time(mac, 600, Some(IP)), AdminAdd::Blocked);
+        let codes = e.db.create_vouchers(1, 600, "").unwrap();
+        assert_eq!(e.redeem_voucher(mac, IP, &codes[0]), Err(BLOCKED));
+        assert_eq!(e.redeem_voucher(other, IP, &codes[0]).unwrap(), 600, "the code wasn't used up");
+        assert_eq!(e.claim_into(mac, IP, "pass-1".into(), 900, true, 0), (0, false));
+        assert!(e.grants().iter().all(|g| g.mac != mac));
+        assert!(e.grants().iter().any(|g| g.mac == other), "other phones are untouched");
+
+        // Still blocked after a restart, until the owner unblocks it.
+        drop(e);
+        let e = engine_at(&dir, true, None);
+        assert!(e.is_blocked(mac));
+        assert!(matches!(e.coin_start(mac, IP), CoinStart::Blocked));
+        assert!(e.unblock(mac).unwrap());
+        assert!(!e.unblock(mac).unwrap(), "already unblocked");
+        buy(&e, mac, IP, 1);
+        assert!(remaining(&e, mac) > 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn blocking_waits_while_the_device_is_inserting_coins() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        assert!(matches!(e.coin_start(mac, IP), CoinStart::Ok));
+        e.on_coin(5, 5);
+        assert_eq!(e.block(mac).unwrap(), Block::Inserting, "blocking now would swallow its coins");
+        assert!(!e.is_blocked(mac));
+        e.coin_done(mac).unwrap();
+        assert_eq!(e.block(mac).unwrap(), Block::Done);
+        // A coin still dropping as it was blocked is recorded but gives no time.
+        e.on_coin(1, 1);
+        assert_eq!(remaining(&e, mac), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

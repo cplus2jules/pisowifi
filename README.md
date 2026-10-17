@@ -25,6 +25,8 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
     address, from the phone's browser and the name it gives the WiFi. Give
     regulars your own names. Each device opens a panel with its time (add,
     pause, resume, disconnect), what it has spent, and its purchases.
+    **Block** a troublemaker there: its time ends and it can't buy time, use
+    vouchers or bring a Piso Pass until you unblock it.
   - **Sales**: 7 days to 12 months, busiest hours of the week, how customers
     paid, record days, and a spreadsheet (CSV) download.
   - **Coin box**: how much cash should be inside since you last emptied it.
@@ -56,7 +58,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC. Other devices are turned away before any TLS work, from a separate small pool, so customers can't tie up the dashboard; they see a page explaining the lock. The dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
 | Customer "claims" a fresh box | The password can only be set from the device's shell (`set-password`), never from the web. |
 | Web attacks (XSS, CSRF, clickjacking, DNS rebinding) | Strict CSP (no inline scripts), no `innerHTML`, custom-header CSRF checks, Host-header checks, `frame-ancestors 'none'`. |
-| A phone pretending to be another | Device names and models come from the phone itself (its browser and DHCP), so they can be faked. They're labels for you only, never used to decide who gets time; only MAC + IP are. Customers never see your nicknames. The sales spreadsheet escapes cells that a spreadsheet app would run as formulas. |
+| A phone pretending to be another | Device names and models come from the phone itself (its browser and DHCP), so they can be faked. They're labels for you only, never used to decide who gets time; only MAC + IP are. Blocking works on the MAC too, so a phone that changes its private address (by forgetting the network) comes back unblocked. Customers never see your nicknames. The sales spreadsheet escapes cells that a spreadsheet app would run as formulas. |
 | Slowloris / connection floods | Connection caps, 10 s header timeout, 4–16 KB body limits, one Argon2 hash at a time. |
 | Ledger tampering | All SQL uses bound parameters. Voucher codes are stored hashed (shown once). Test coins exist only in dev mode. Every owner action goes to the audit log. |
 | Compromised service | The systemd unit drops all capabilities except networking, the filesystem is read-only except `/var/lib/pisowifi`, and only GPIO devices are allowed. |

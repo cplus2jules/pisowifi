@@ -753,12 +753,14 @@ function renderDevices(clients, others) {
   }, true);
 
   $("lan-card").hidden = others.length === 0;
-  keyed($("lan-devices"), JSON.stringify(others.map((d) => [d.mac, d.ip, deviceOf(d.mac).name])), () => others.map((o) => {
+  keyed($("lan-devices"), JSON.stringify(others.map((d) => [d.mac, d.ip, deviceOf(d.mac).name, !!deviceOf(d.mac).blocked])), () => others.map((o) => {
     const d = deviceOf(o.mac);
-    return el("li", { class: "dev-row" },
+    return el("li", { class: "dev-row" + (d.blocked ? " is-blocked" : "") },
       el("button", { class: "open", type: "button", onclick: () => openDevice(o.mac) },
         avatar(o.mac, d), el("span", { class: "who" }, el("b", { text: d.name }), el("small", { text: [d.detail, o.ip].filter(Boolean).join(" · ") }))),
-      el("span", { class: "actions" }, addTimeButton(o.mac, 30, "+30 min"), addTimeButton(o.mac, 60, "+1 hr")));
+      d.blocked
+        ? el("span", { class: "status bad", text: "Blocked" })
+        : el("span", { class: "actions" }, addTimeButton(o.mac, 30, "+30 min"), addTimeButton(o.mac, 60, "+1 hr")));
   }));
 }
 
@@ -774,31 +776,44 @@ async function loadPeople() {
   } catch (e) { toast(e.message, true); }
 }
 
+let blockedOnly = false;
 function renderPeople() {
   const q = $("people-q").value.trim().toLowerCase();
-  const list = people.filter((p) => !q || [p.name, p.detail, p.mac, p.nickname, p.hostname].some((v) => v && v.toLowerCase().includes(q)));
+  const blockedCount = people.filter((p) => p.blocked).length;
+  if (!blockedCount) blockedOnly = false;
+  $("people-blocked").hidden = !blockedCount;
+  $("people-blocked").setAttribute("aria-pressed", String(blockedOnly));
+  $("blocked-count").textContent = blockedCount;
+  const list = people.filter((p) => (!blockedOnly || p.blocked) &&
+    (!q || [p.name, p.detail, p.mac, p.nickname, p.hostname].some((v) => v && v.toLowerCase().includes(q))));
   $("people-sub").textContent = people.length
     ? people.length + (people.length === 1 ? " device" : " devices") + " · " + people.filter((p) => p.spend.count).length + " have bought time"
     : "Everyone who has opened your page or bought time";
   $("people-empty").hidden = list.length > 0;
-  $("people-empty").textContent = people.length ? "No one matches “" + q + "”." : "Nobody yet. Devices show up here the first time they open your page.";
-  keyed($("people"), JSON.stringify([q, list.map((p) => [p.mac, p.name, p.detail, p.spend.pesos, p.running, p.has_time, p.last_seen])]), () =>
+  $("people-empty").textContent = !people.length ? "Nobody yet. Devices show up here the first time they open your page."
+    : q ? "No one matches “" + q + "”." : "No blocked devices.";
+  keyed($("people"), JSON.stringify([q, blockedOnly, list.map((p) => [p.mac, p.name, p.detail, p.spend.pesos, p.running, p.has_time, p.last_seen, p.blocked])]), () =>
     list.slice(0, 200).map((p, i) => {
       const seen = Math.max(p.last_seen || 0, p.spend.last || 0);
-      const li = el("li", { class: "dev-row" },
+      const li = el("li", { class: "dev-row" + (p.blocked ? " is-blocked" : "") },
         el("button", { class: "open", type: "button", onclick: () => openDevice(p.mac) },
           avatar(p.mac, p, "", p.running),
           el("span", { class: "who" }, el("b", { text: p.name }), el("small", { text: p.detail || shortMac(p.mac) }))),
         el("span", { class: "nums" },
           el("span", {}, el("b", { text: peso(p.spend.pesos) }), "spent"),
           el("span", {}, el("b", { text: String(p.spend.count) }), p.spend.count === 1 ? "purchase" : "purchases"),
-          el("span", {}, el("b", { text: p.has_time ? (p.running ? "Online" : "Paused") : seen ? when(seen) : "—" }), p.has_time ? "now" : "last seen")));
+          el("span", {}, el("b", { text: p.has_time ? (p.running ? "Online" : "Paused") : seen ? when(seen) : "—" }), p.has_time ? "now" : "last seen")),
+        p.blocked ? el("span", { class: "status bad", text: "Blocked" }) : null);
       li.style.setProperty("--i", Math.min(i, 20));
       return li;
     }));
 }
 
 $("people-q").addEventListener("input", renderPeople);
+$("people-blocked").addEventListener("click", () => {
+  blockedOnly = !blockedOnly;
+  renderPeople();
+});
 
 // ---- device drawer --------------------------------------------------------
 
@@ -850,8 +865,10 @@ async function loadDrawer() {
   nick.placeholder = d.nickname ? "" : "e.g. " + (d.name.startsWith("Device …") ? "Aling Nena" : d.name);
 
   const c = r.client;
-  $("dv-time").hidden = !c;
-  $("dv-give").hidden = !!c;
+  $("dv-blocked").hidden = !d.blocked;
+  $("dv-block").hidden = !!d.blocked;
+  $("dv-time").hidden = !c || d.blocked;
+  $("dv-give").hidden = !!c || d.blocked;
   if (c) {
     $("dv-time").classList.toggle("paused", !c.running);
     $("dv-state").textContent = c.running ? "Online now" : "Paused";
@@ -924,22 +941,46 @@ $("dv-kick").addEventListener("click", (ev) => {
   });
 });
 
+// A device changed (renamed, blocked): every list showing it follows.
+function deviceChanged(mac, device) {
+  knownDevices[mac] = Object.assign(knownDevices[mac] || {}, device);
+  if (overview && overview.devices) overview.devices[mac] = device;
+  const p = people.find((x) => x.mac === mac);
+  if (p) Object.assign(p, device);
+  fillDrawerHead(mac, device);
+  if (overview) renderOverview();
+  if (currentTab === "devices") renderPeople();
+}
+
 $("dv-rename").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const mac = drawerMac;
   if (!mac) return;
   busy(ev.submitter, async () => {
     const r = await api("PUT", "/devices/" + encodeURIComponent(mac) + "/name", { name: $("dv-nick").value });
-    knownDevices[mac] = Object.assign(knownDevices[mac] || {}, r.device);
-    if (overview && overview.devices) overview.devices[mac] = r.device;
-    const p = people.find((x) => x.mac === mac);
-    if (p) Object.assign(p, r.device);
-    fillDrawerHead(mac, r.device);
+    deviceChanged(mac, r.device);
     toast(r.device.nickname ? "Saved as " + r.device.nickname : "Name removed");
-    renderOverview();
-    if (currentTab === "devices") renderPeople();
   });
 });
+
+function setBlocked(blocked, btn) {
+  const mac = drawerMac;
+  if (!mac) return;
+  const d = deviceOf(mac);
+  const hasTime = overview && overview.clients.some((c) => c.mac === mac);
+  if (blocked && !confirm("Block " + d.name + "? It won't be able to buy time, use vouchers or bring a Piso Pass here until you unblock it." +
+    (hasTime ? " Its remaining time is removed." : ""))) return;
+  busy(btn, async () => {
+    const r = await api("PUT", "/devices/" + encodeURIComponent(mac) + "/blocked", { blocked });
+    deviceChanged(mac, r.device);
+    toast((blocked ? "Blocked " : "Unblocked ") + r.device.name);
+    await poll();
+    loadDrawer();
+  });
+}
+
+$("dv-block-btn").addEventListener("click", (ev) => setBlocked(true, ev.currentTarget));
+$("dv-unblock").addEventListener("click", (ev) => setBlocked(false, ev.currentTarget));
 
 async function copyText(text, done) {
   try {
@@ -1375,6 +1416,7 @@ const ACTIONS = {
   pause: "Paused a device", resume: "Resumed a device", rename_device: "Named a device",
   collect_coins: "Emptied the coin box", set_goal: "Set the daily goal", branding: "Changed the customer page",
   upload_image: "Uploaded an image", remove_image: "Removed an image", mac_clone: "Possible copied address",
+  block_device: "Blocked a device", unblock_device: "Unblocked a device",
 };
 
 // "da:a1:19:…" in a log line becomes the device's name when we know it.

@@ -376,6 +376,13 @@ h1, h2, p { margin: 0; }
 ::view-transition-group(slot) { animation-duration: .55s; animation-timing-function: var(--spring); }
 ::view-transition-old(slot), ::view-transition-new(slot) { height: 100%; object-fit: cover; }
 
+/* ---- blocked by the owner ------------------------------------------------------ */
+.wrap.blocked #slot-card, .wrap.blocked .voucher, .wrap.blocked .pass-card, .wrap.blocked .home-card { display: none; }
+.blocked-card { display: flex; align-items: center; gap: 12px; padding: 14px; border-radius: 22px; background: var(--soft); border: 1px solid var(--line); animation: rise .6s var(--ease) backwards; animation-timing-function: var(--spring); }
+.blocked-card .sq { width: 40px; height: 40px; border-radius: 14px; background: #fff; color: var(--purple); display: grid; place-items: center; flex: none; }
+.blocked-card .pass-text { display: grid; gap: 2px; }
+.blocked-card .pass-text span { color: var(--muted); font-size: 13.5px; }
+
 /* ---- the owner's message ----------------------------------------------------- */
 .notice {
   display: flex; align-items: center; gap: 10px; margin: 0; padding: 7px 14px 7px 7px; border-radius: 20px;

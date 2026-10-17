@@ -183,6 +183,7 @@ async fn coin_start(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Soc
             "The coin slot isn't working right now. Please don't insert coins; tell the owner.",
         )),
         CoinStart::Wait(secs) => Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, format!("Please wait {secs} s, then tap Insert coin again."))),
+        CoinStart::Blocked => Err(blocked()),
     }
 }
 
@@ -219,6 +220,18 @@ async fn coin_done(
     Ok(Json(json!({ "ok": true })))
 }
 
+fn blocked() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, crate::engine::BLOCKED).with_code("blocked")
+}
+
+/// Asked before anything goes to the hub, so a pass's time never moves to a blocked phone.
+fn refuse_blocked(st: &Shared, mac: crate::net::Mac) -> ApiResult<()> {
+    if st.engine.is_blocked(mac) {
+        return Err(blocked());
+    }
+    Ok(())
+}
+
 fn invalid_pass() -> ApiError {
     ApiError::bad("That Piso Pass code isn't valid.").with_code(UNKNOWN_PASS)
 }
@@ -247,6 +260,7 @@ async fn pass_claim(
     let Some(hub) = st.hub.clone() else {
         return Err(ApiError::bad("Piso Pass isn't set up at this location."));
     };
+    refuse_blocked(&st, mac)?;
     st.engine.code_attempt_allowed(mac).map_err(ApiError::bad)?;
     if crate::hub::normalize_code(&req.code).len() != 16 {
         st.engine.record_code_fail(mac);
@@ -308,6 +322,7 @@ async fn pass_save(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Sock
     let Some(hub) = st.hub.clone() else {
         return Err(ApiError::bad("Piso Pass isn't set up at this location."));
     };
+    refuse_blocked(&st, mac)?;
     match hub.save_pass(&st.engine, mac).await {
         Ok(code) => Ok(Json(json!({ "ok": true, "pass_code": code }))),
         Err(PassError::HasPass) => Err(ApiError::bad("This phone already has a Piso Pass.")),
@@ -327,6 +342,7 @@ async fn pause(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAd
 
 async fn resume(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<serde_json::Value>> {
     let (mac, ip) = st.identify(addr)?;
+    refuse_blocked(&st, mac)?;
     let r = match &st.hub {
         Some(hub) => hub.resume(&st.engine, mac, ip).await,
         None => st.engine.resume(mac, ip),
@@ -334,6 +350,7 @@ async fn resume(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketA
     match r {
         Resume::Resumed => Ok(Json(json!({ "ok": true }))),
         Resume::Nothing => Err(ApiError::bad("No saved time to resume")),
+        Resume::Blocked => Err(blocked()),
         Resume::NeedsHub => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "This location can't reach Piso Pass right now, so saved pass time can't restart here yet. Try again in a few minutes.",

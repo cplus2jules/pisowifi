@@ -291,6 +291,11 @@ CREATE TABLE collections (
 );
 ";
 
+/// v6: devices the owner blocked from buying or using time here.
+const SCHEMA_V6: &str = "
+CREATE TABLE blocked (mac TEXT PRIMARY KEY, ts INTEGER NOT NULL);
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -343,6 +348,12 @@ impl Db {
             let tx = c.transaction()?;
             tx.execute_batch(SCHEMA_V5)?;
             tx.pragma_update(None, "user_version", 5)?;
+            tx.commit()?;
+        }
+        if v < 6 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V6)?;
+            tx.pragma_update(None, "user_version", 6)?;
             tx.commit()?;
         }
         Ok(())
@@ -857,6 +868,31 @@ impl Db {
             Ok(Sale { ts: r.get(0)?, mac: r.get(1)?, pesos: r.get(2)?, secs: r.get::<_, i64>(3)? as u64, source: r.get(4)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---- blocked devices ------------------------------------------------
+
+    pub fn load_blocked(&self) -> Result<Vec<Mac>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT mac FROM blocked")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = vec![];
+        for m in rows {
+            if let Ok(mac) = Mac::parse(&m?) {
+                out.push(mac);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_blocked(&self, mac: Mac, blocked: bool) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        if blocked {
+            c.execute("INSERT OR IGNORE INTO blocked (mac, ts) VALUES (?1, ?2)", params![mac.to_string(), now()])?;
+        } else {
+            c.execute("DELETE FROM blocked WHERE mac = ?1", [mac.to_string()])?;
+        }
+        Ok(())
     }
 
     // ---- coin box -------------------------------------------------------

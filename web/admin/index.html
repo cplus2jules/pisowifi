@@ -270,7 +270,10 @@
       <div class="card">
         <div class="card-head">
           <div><h2>All customers</h2><p class="sub" id="people-sub">Everyone who has opened your page or bought time</p></div>
-          <label class="search"><svg class="ic"><use href="#i-search"/></svg><input type="search" id="people-q" placeholder="Search name or model" aria-label="Search customers"></label>
+          <div class="row nowrap people-tools">
+            <button class="chip-btn" type="button" id="people-blocked" aria-pressed="false" hidden>Blocked <b id="blocked-count">0</b></button>
+            <label class="search"><svg class="ic"><use href="#i-search"/></svg><input type="search" id="people-q" placeholder="Search name or model" aria-label="Search customers"></label>
+          </div>
         </div>
         <ul class="dev-rows people" id="people"></ul>
         <p class="empty pad" id="people-empty">Nobody yet. Devices show up here the first time they open your page.</p>
@@ -591,6 +594,12 @@
       </div>
     </form>
 
+    <div class="dv-blocked" id="dv-blocked" hidden>
+      <svg class="ic"><use href="#i-shield"/></svg>
+      <div><b>Blocked</b><p>It can't buy time, use vouchers or bring a Piso Pass here.</p></div>
+      <button class="btn small outline" type="button" id="dv-unblock">Unblock</button>
+    </div>
+
     <div class="dv-time" id="dv-time" hidden>
       <div class="dv-clock"><small id="dv-state">Online</small><b id="dv-left">0:00</b><span class="sub">left</span></div>
       <div class="dv-actions">
@@ -622,6 +631,11 @@
 
     <h3 class="dv-h">Purchases</h3>
     <ul class="feed flush" id="dv-sales"></ul>
+
+    <div class="dv-block" id="dv-block">
+      <div><b>Block this device</b><p class="sub">Its time here ends, and it can't buy time, use vouchers or bring a Piso Pass here until you unblock it.</p></div>
+      <button class="btn small danger" type="button" id="dv-block-btn">Block</button>
+    </div>
   </div>
 </aside>
 

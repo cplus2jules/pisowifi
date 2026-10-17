@@ -145,7 +145,7 @@ function renderClock() {
   $("meter-label").textContent = online ? "You're online" : paused ? "Time saved" : "No time yet";
   $("meter-sub").textContent = online
     ? "Until about " + new Date(Date.now() + left * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
-    : paused ? "Paused. Your time isn't running." : "Drop a coin to get online";
+    : paused ? "Paused. Your time isn't running." : state.blocked ? "Talk to the owner to get online" : "Drop a coin to get online";
   $("pause").hidden = !online;
   $("resume").hidden = !paused;
   renderDrain(left, online);
@@ -225,6 +225,9 @@ function render() {
     // short code the owner sees.
     $("device").textContent = state.device_name ? state.device_name + " · " + state.device.replace(/^Device /, "") : state.device;
     $("app").setAttribute("aria-busy", "false");
+    // Blocked by the owner: no slot, voucher or pass buttons, just a plain note.
+    $("app").classList.toggle("blocked", !!state.blocked);
+    $("blocked-card").hidden = !state.blocked;
     $("slot").hidden = slot.state !== "idle";
     $("inserting").hidden = slot.state !== "mine";
     $("busy").hidden = slot.state !== "busy";

@@ -28,6 +28,7 @@ pub fn router(st: Shared) -> Router {
         .route("/devices", get(list_devices))
         .route("/devices/{mac}", get(device_detail))
         .route("/devices/{mac}/name", put(rename_device))
+        .route("/devices/{mac}/blocked", put(set_blocked))
         .route("/report", get(report))
         .route("/sales.csv", get(sales_csv))
         .route("/coinbox", get(coinbox))
@@ -314,6 +315,9 @@ async fn add_time(
     if how == AdminAdd::Unknown {
         return Err(ApiError::bad("That device isn't on the WiFi right now"));
     }
+    if how == AdminAdd::Blocked {
+        return Err(ApiError::bad("This device is blocked. Unblock it first."));
+    }
     let paused = how == AdminAdd::Paused;
     st.db.add_sale(Some(mac), 0, secs, "manual")?;
     st.db.audit(&actor(addr), "add_time", &format!("{mac} +{}m{}", req.minutes, if paused { " (paused)" } else { "" }));
@@ -354,6 +358,7 @@ async fn resume_client(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<
     match st.engine.resume(mac, client_ip(&st, mac)?) {
         Resume::Resumed => {}
         Resume::Nothing => return Err(ApiError::bad("Its time is already running")),
+        Resume::Blocked => return Err(ApiError::bad("This device is blocked. Unblock it first.")),
         Resume::NeedsHub => {
             return Err(ApiError::bad("This is Piso Pass time and the hub hasn't answered lately. Try again in a minute."))
         }
@@ -364,6 +369,13 @@ async fn resume_client(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<
 
 // ---- devices ---------------------------------------------------------------
 
+/// A device as the dashboard shows it: its name and model, and whether it's blocked.
+fn device_json(st: &Shared, mac: Mac) -> Value {
+    let mut v = json!(st.devices.info(mac));
+    v["blocked"] = json!(st.engine.is_blocked(mac));
+    v
+}
+
 /// What to call each device the page is about to show.
 fn device_names(st: &Shared, macs: impl IntoIterator<Item = String>) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
@@ -372,7 +384,7 @@ fn device_names(st: &Shared, macs: impl IntoIterator<Item = String>) -> serde_js
             continue;
         }
         if let Ok(mac) = Mac::parse(&m) {
-            out.insert(m, json!(st.devices.info(mac)));
+            out.insert(m, device_json(st, mac));
         }
     }
     out
@@ -386,6 +398,7 @@ struct DeviceItem {
     spend: Spend,
     /// Has time here now (running or paused).
     has_time: bool,
+    blocked: bool,
     running: bool,
     remaining_secs: u64,
 }
@@ -394,11 +407,15 @@ struct DeviceItem {
 async fn list_devices(State(st): State<Shared>) -> ApiResult<Json<Value>> {
     let spend = st.db.device_spend()?;
     let clients = st.engine.clients();
+    let blocked = st.engine.blocked();
     let mut seen: HashMap<Mac, DeviceInfo> = st.devices.all().into_iter().collect();
     for m in spend.keys().map(String::as_str).chain(clients.iter().map(|c| c.mac.as_str())) {
         if let Ok(mac) = Mac::parse(m) {
             seen.entry(mac).or_insert_with(|| st.devices.info(mac));
         }
+    }
+    for mac in &blocked {
+        seen.entry(*mac).or_insert_with(|| st.devices.info(*mac));
     }
     let mut list: Vec<DeviceItem> = seen
         .into_iter()
@@ -408,6 +425,7 @@ async fn list_devices(State(st): State<Shared>) -> ApiResult<Json<Value>> {
             DeviceItem {
                 spend: spend.get(&m).copied().unwrap_or_default(),
                 has_time: client.is_some(),
+                blocked: blocked.contains(&mac),
                 running: client.is_some_and(|c| c.running),
                 remaining_secs: client.map_or(0, |c| c.remaining_secs),
                 mac: m,
@@ -427,7 +445,7 @@ async fn device_detail(State(st): State<Shared>, Path(mac): Path<String>) -> Api
     let client = st.engine.clients().into_iter().find(|c| c.mac == m);
     Ok(Json(json!({
         "mac": m,
-        "device": st.devices.info(mac),
+        "device": device_json(&st, mac),
         "spend": st.db.device_spend()?.get(&m).copied().unwrap_or_default(),
         "sales": st.db.device_sales(mac, 60)?,
         "client": client,
@@ -450,7 +468,34 @@ async fn rename_device(
     let name = crate::brand::clean_text(&req.name, 32);
     st.devices.set_nickname(&st.db, mac, &name)?;
     st.db.audit(&actor(addr), "rename_device", &format!("{mac} → {}", if name.is_empty() { "(no name)" } else { &name }));
-    Ok(Json(json!({ "ok": true, "device": st.devices.info(mac) })))
+    Ok(Json(json!({ "ok": true, "device": device_json(&st, mac) })))
+}
+
+#[derive(Deserialize)]
+struct BlockReq {
+    blocked: bool,
+}
+
+/// Blocks a device (its time here ends; it can't buy or use time) or lets it back.
+async fn set_blocked(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(mac): Path<String>,
+    Json(req): Json<BlockReq>,
+) -> ApiResult<Json<Value>> {
+    let mac = parse_mac(&mac)?;
+    if req.blocked {
+        if st.admin_macs.contains(&mac) {
+            return Err(ApiError::bad("That's one of your own dashboard devices"));
+        }
+        if st.engine.block(mac)? == crate::engine::Block::Inserting {
+            return Err(ApiError::bad("It's inserting coins right now. Try again once they tap Start."));
+        }
+        st.db.audit(&actor(addr), "block_device", &mac.to_string());
+    } else if st.engine.unblock(mac)? {
+        st.db.audit(&actor(addr), "unblock_device", &mac.to_string());
+    }
+    Ok(Json(json!({ "ok": true, "device": device_json(&st, mac) })))
 }
 
 // ---- sales -----------------------------------------------------------------
