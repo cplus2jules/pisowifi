@@ -2,18 +2,20 @@
 
 use crate::app::{self, asset, ApiError, ApiResult, Shared};
 use crate::auth::{self, Auth, LoginCheck, SessionInfo};
-use crate::db::Rate;
-use crate::engine::AdminAdd;
+use crate::db::{Rate, Spend};
+use crate::devices::DeviceInfo;
+use crate::engine::{AdminAdd, Resume};
 use crate::net::Mac;
 use crate::rates;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 pub fn router(st: Shared) -> Router {
@@ -21,6 +23,16 @@ pub fn router(st: Shared) -> Router {
         .route("/overview", get(overview))
         .route("/clients/{mac}/time", post(add_time))
         .route("/clients/{mac}/kick", post(kick))
+        .route("/clients/{mac}/pause", post(pause_client))
+        .route("/clients/{mac}/resume", post(resume_client))
+        .route("/devices", get(list_devices))
+        .route("/devices/{mac}", get(device_detail))
+        .route("/devices/{mac}/name", put(rename_device))
+        .route("/report", get(report))
+        .route("/sales.csv", get(sales_csv))
+        .route("/coinbox", get(coinbox))
+        .route("/coinbox/collect", post(collect_coins))
+        .route("/goal", put(set_goal))
         .route("/rates", get(get_rates).put(set_rates))
         .route("/vouchers", get(list_vouchers).post(create_vouchers))
         .route("/vouchers/{id}", delete(delete_voucher))
@@ -235,16 +247,32 @@ async fn overview(State(st): State<Shared>) -> ApiResult<Json<Value>> {
     let active = clients.iter().filter(|c| c.running).count();
     // Devices on the WiFi without time, so the owner can give them some.
     let mut lan_devices = crate::net::lan_devices(&st.cfg.network.lan_iface, &st.cfg.network.dhcp_leases, st.dev);
+    st.devices.saw_hostnames(&st.db, lan_devices.iter().filter_map(|d| Some((d.mac, d.name.as_deref()?))));
     lan_devices.retain(|d| !clients.iter().any(|c| c.mac == d.mac.to_string()));
     lan_devices.truncate(200);
+    let slot = st.engine.slot_admin();
+    let devices = device_names(
+        &st,
+        clients
+            .iter()
+            .map(|c| c.mac.clone())
+            .chain(lan_devices.iter().map(|d| d.mac.to_string()))
+            .chain(sales.top_customers.iter().map(|c| c.mac.clone()))
+            .chain(sales.recent.iter().filter_map(|s| s.mac.clone()))
+            .chain(slot.mac.clone()),
+    );
     Ok(Json(json!({
         "name": st.brand.get().name,
         "brand": st.brand.get(),
         "sales": sales,
         "clients": clients,
         "lan_devices": lan_devices,
+        "devices": devices,
+        "coinbox": st.db.coinbox()?,
+        "goal": daily_goal(&st)?,
+        "health": crate::health::read(&st.cfg.storage.data_dir, &st.cfg.network.wan_iface, st.dev),
         "active": active,
-        "slot": st.engine.slot_admin(),
+        "slot": slot,
         "uptime_secs": st.engine.uptime_secs(),
         "fingerprint": st.fingerprint,
         "portal_url": st.portal_url(),
@@ -299,6 +327,257 @@ async fn kick(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAdd
     }
     st.db.audit(&actor(addr), "kick", &mac.to_string());
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Where a device with time is, for pausing and resuming it from here.
+fn client_ip(st: &Shared, mac: Mac) -> ApiResult<std::net::Ipv4Addr> {
+    let m = mac.to_string();
+    st.engine
+        .clients()
+        .into_iter()
+        .find(|c| c.mac == m)
+        .and_then(|c| c.ip.parse().ok())
+        .ok_or_else(|| ApiError::bad("That device has no time right now"))
+}
+
+async fn pause_client(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Path(mac): Path<String>) -> ApiResult<Json<Value>> {
+    let mac = parse_mac(&mac)?;
+    if !st.engine.pause(mac, client_ip(&st, mac)?) {
+        return Err(ApiError::bad("Its time is already paused"));
+    }
+    st.db.audit(&actor(addr), "pause", &mac.to_string());
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn resume_client(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Path(mac): Path<String>) -> ApiResult<Json<Value>> {
+    let mac = parse_mac(&mac)?;
+    match st.engine.resume(mac, client_ip(&st, mac)?) {
+        Resume::Resumed => {}
+        Resume::Nothing => return Err(ApiError::bad("Its time is already running")),
+        Resume::NeedsHub => {
+            return Err(ApiError::bad("This is Piso Pass time and the hub hasn't answered lately. Try again in a minute."))
+        }
+    }
+    st.db.audit(&actor(addr), "resume", &mac.to_string());
+    Ok(Json(json!({ "ok": true })))
+}
+
+// ---- devices ---------------------------------------------------------------
+
+/// What to call each device the page is about to show.
+fn device_names(st: &Shared, macs: impl IntoIterator<Item = String>) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for m in macs {
+        if out.contains_key(&m) {
+            continue;
+        }
+        if let Ok(mac) = Mac::parse(&m) {
+            out.insert(m, json!(st.devices.info(mac)));
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct DeviceItem {
+    mac: String,
+    #[serde(flatten)]
+    info: DeviceInfo,
+    spend: Spend,
+    /// Has time here now (running or paused).
+    has_time: bool,
+    running: bool,
+    remaining_secs: u64,
+}
+
+/// Every device that has opened the customer page or bought time here.
+async fn list_devices(State(st): State<Shared>) -> ApiResult<Json<Value>> {
+    let spend = st.db.device_spend()?;
+    let clients = st.engine.clients();
+    let mut seen: HashMap<Mac, DeviceInfo> = st.devices.all().into_iter().collect();
+    for m in spend.keys().map(String::as_str).chain(clients.iter().map(|c| c.mac.as_str())) {
+        if let Ok(mac) = Mac::parse(m) {
+            seen.entry(mac).or_insert_with(|| st.devices.info(mac));
+        }
+    }
+    let mut list: Vec<DeviceItem> = seen
+        .into_iter()
+        .map(|(mac, info)| {
+            let m = mac.to_string();
+            let client = clients.iter().find(|c| c.mac == m);
+            DeviceItem {
+                spend: spend.get(&m).copied().unwrap_or_default(),
+                has_time: client.is_some(),
+                running: client.is_some_and(|c| c.running),
+                remaining_secs: client.map_or(0, |c| c.remaining_secs),
+                mac: m,
+                info,
+            }
+        })
+        .collect();
+    let recent = |d: &DeviceItem| d.info.last_seen.unwrap_or(0).max(d.spend.last);
+    list.sort_by(|a, b| b.has_time.cmp(&a.has_time).then(recent(b).cmp(&recent(a))));
+    list.truncate(500);
+    Ok(Json(json!({ "devices": list, "server_time": crate::db::now() })))
+}
+
+async fn device_detail(State(st): State<Shared>, Path(mac): Path<String>) -> ApiResult<Json<Value>> {
+    let mac = parse_mac(&mac)?;
+    let m = mac.to_string();
+    let client = st.engine.clients().into_iter().find(|c| c.mac == m);
+    Ok(Json(json!({
+        "mac": m,
+        "device": st.devices.info(mac),
+        "spend": st.db.device_spend()?.get(&m).copied().unwrap_or_default(),
+        "sales": st.db.device_sales(mac, 60)?,
+        "client": client,
+        "server_time": crate::db::now(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct NameReq {
+    name: String,
+}
+
+async fn rename_device(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(mac): Path<String>,
+    Json(req): Json<NameReq>,
+) -> ApiResult<Json<Value>> {
+    let mac = parse_mac(&mac)?;
+    let name = crate::brand::clean_text(&req.name, 32);
+    st.devices.set_nickname(&st.db, mac, &name)?;
+    st.db.audit(&actor(addr), "rename_device", &format!("{mac} → {}", if name.is_empty() { "(no name)" } else { &name }));
+    Ok(Json(json!({ "ok": true, "device": st.devices.info(mac) })))
+}
+
+// ---- sales -----------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PeriodQuery {
+    #[serde(default)]
+    days: u32,
+}
+
+fn period(q: &PeriodQuery) -> u32 {
+    if [1, 7, 30, 90, 365].contains(&q.days) { q.days } else { 30 }
+}
+
+async fn report(State(st): State<Shared>, Query(q): Query<PeriodQuery>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(st.db.report(period(&q))?)))
+}
+
+/// Every sale in the period as a spreadsheet (CSV, opens in Excel or Sheets).
+async fn sales_csv(State(st): State<Shared>, Query(q): Query<PeriodQuery>) -> ApiResult<Response> {
+    use chrono::{Local, TimeZone};
+    let days = period(&q);
+    let today = Local::now().date_naive();
+    let first = today - chrono::Days::new(days as u64 - 1);
+    let since = Local
+        .from_local_datetime(&first.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .map_or(0, |t| t.timestamp());
+    let mut names: HashMap<String, String> = HashMap::new();
+    // A byte-order mark so Excel reads the names as UTF-8.
+    let mut out = String::from("\u{FEFF}Date,Time,Device,Device name,How,Pesos,Minutes\n");
+    for s in st.db.sales_since(since)? {
+        let at = Local.timestamp_opt(s.ts, 0).single();
+        let name = match &s.mac {
+            Some(m) => names
+                .entry(m.clone())
+                .or_insert_with(|| Mac::parse(m).map(|mac| st.devices.info(mac).name).unwrap_or_default())
+                .clone(),
+            None => String::new(),
+        };
+        let how = match s.source.as_str() {
+            "coin" => "Coins",
+            "voucher" => "Voucher",
+            "manual" => "Added by owner",
+            "unclaimed" => "Unclaimed coins",
+            other => other,
+        };
+        let row = [
+            at.map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+            at.map(|t| t.format("%H:%M").to_string()).unwrap_or_default(),
+            s.mac.clone().unwrap_or_default(),
+            name,
+            how.to_string(),
+            s.pesos.to_string(),
+            (s.secs / 60).to_string(),
+        ];
+        out.push_str(&row.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
+    let file = format!("attachment; filename=\"sales-{}-{}days.csv\"", today.format("%Y-%m-%d"), days);
+    Ok((
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8")),
+            (header::CONTENT_DISPOSITION, HeaderValue::from_str(&file).map_err(|e| anyhow::anyhow!("{e}"))?),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        out,
+    )
+        .into_response())
+}
+
+/// One spreadsheet cell. Device names come from customers' phones, and
+/// spreadsheet apps run cells that start with = + - @ as formulas.
+fn csv_field(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+// ---- coin box and goal -------------------------------------------------------
+
+async fn coinbox(State(st): State<Shared>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(st.db.coinbox()?)))
+}
+
+#[derive(Deserialize)]
+struct CollectReq {
+    /// What the owner counted; missing means they didn't count.
+    #[serde(default)]
+    counted: Option<u64>,
+    #[serde(default)]
+    note: String,
+}
+
+async fn collect_coins(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<CollectReq>,
+) -> ApiResult<Json<Value>> {
+    if req.counted.is_some_and(|c| c > 10_000_000) {
+        return Err(ApiError::bad("That's more than a coin box holds"));
+    }
+    let note = crate::brand::clean_text(&req.note, 80);
+    let c = st.db.collect(req.counted, &note)?;
+    st.db.audit(&actor(addr), "collect_coins", &format!("counted ₱{}, expected ₱{}", c.counted, c.expected));
+    Ok(Json(json!({ "collection": c, "coinbox": st.db.coinbox()? })))
+}
+
+fn daily_goal(st: &Shared) -> ApiResult<u32> {
+    Ok(st.db.get_setting("daily_goal")?.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+#[derive(Deserialize)]
+struct GoalReq {
+    pesos: u32,
+}
+
+async fn set_goal(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, Json(req): Json<GoalReq>) -> ApiResult<Json<Value>> {
+    if req.pesos > 1_000_000 {
+        return Err(ApiError::bad("Pick a goal under ₱1,000,000 a day"));
+    }
+    st.db.set_setting("daily_goal", &req.pesos.to_string())?;
+    st.db.audit(&actor(addr), "set_goal", &format!("₱{} a day", req.pesos));
+    Ok(Json(json!({ "ok": true, "goal": req.pesos })))
 }
 
 async fn get_rates(State(st): State<Shared>) -> ApiResult<Json<Vec<Rate>>> {
@@ -367,6 +646,7 @@ struct BrandingReq {
     /// Left out: unchanged.
     sounds: Option<bool>,
     after_url: Option<String>,
+    notice: Option<String>,
 }
 
 async fn set_branding(
@@ -389,6 +669,9 @@ async fn set_branding(
         None => now.after_url,
     };
     st.brand.set_online(&st.db, req.sounds.unwrap_or(now.sounds), &after_url)?;
+    if let Some(notice) = &req.notice {
+        st.brand.set_notice(&st.db, &clean_text(notice, 140))?;
+    }
     st.brand.set_text(&st.db, &name, &req.accent.to_uppercase(), &alt, &wifi)?;
     st.db.audit(&actor(addr), "branding", &format!("{name} · {}", req.accent));
     Ok(Json(json!({ "ok": true, "brand": st.brand.get() })))

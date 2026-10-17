@@ -70,14 +70,15 @@ function toast(msg, bad) {
   const t = $("toast");
   t.hidden = true;
   void t.offsetWidth;
-  // Icon: a check for good news, "!" for problems.
+  // Icon: a check for good news, "!" for problems, a clock for running low.
   const ic = el("span", null, "toast-ic");
   const s = svgEl("svg", { viewBox: "0 0 20 20", "aria-hidden": "true" });
-  if (bad) s.append(svgEl("path", { d: "M10 5.5v5.5" }), svgEl("path", { d: "M10 14.5v.01" }));
+  if (bad === "time") s.append(svgEl("circle", { cx: 10, cy: 10, r: 6 }), svgEl("path", { d: "M10 7v3.2l2 1.3" }));
+  else if (bad) s.append(svgEl("path", { d: "M10 5.5v5.5" }), svgEl("path", { d: "M10 14.5v.01" }));
   else s.append(svgEl("path", { d: "M5.5 10.5l3 3 6-7" }));
   ic.append(s);
   t.replaceChildren(ic, el("span", msg));
-  t.classList.toggle("bad", !!bad);
+  t.classList.toggle("bad", bad === true);
   t.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
@@ -147,6 +148,7 @@ function renderClock() {
     : paused ? "Paused. Your time isn't running." : "Drop a coin to get online";
   $("pause").hidden = !online;
   $("resume").hidden = !paused;
+  renderDrain(left, online);
 
   const slot = state.slot;
   if (slot.state !== "idle") {
@@ -157,14 +159,71 @@ function renderClock() {
   }
 }
 
+// ---- time bar and running-low nudge -------------------------------------------
+
+// The bar drains against the most time this phone has had since it last ran out.
+const PEAK_KEY = "pisowifi-peak";
+let peak = 0;
+try { peak = Number(localStorage.getItem(PEAK_KEY)) || 0; } catch (_) { /* storage off */ }
+let lowWarned = 0;   // minutes left we've already warned about
+
+function savePeak(v) {
+  peak = v;
+  try {
+    if (v) localStorage.setItem(PEAK_KEY, String(v));
+    else localStorage.removeItem(PEAK_KEY);
+  } catch (_) { /* storage off */ }
+}
+
+function renderDrain(left, online) {
+  const bar = $("drain");
+  bar.hidden = left === 0;
+  const low = online && left <= 300;
+  $("meter").classList.toggle("low", low);
+  $("slot").classList.toggle("nudge", low);
+  if (left === 0) {
+    if (peak) savePeak(0);
+    lowWarned = 0;
+    return;
+  }
+  if (left > peak) savePeak(left);
+  bar.classList.toggle("still", !online);
+  $("drain-fill").style.transform = "scaleX(" + Math.max(0.015, left / peak).toFixed(4) + ")";
+  if (!low) {
+    if (left > 330) lowWarned = 0;
+    return;
+  }
+  const mins = Math.ceil(left / 60);
+  $("meter-sub").textContent = left <= 60 ? "Less than a minute left. Add time?" : "Only " + mins + " min left. Add time?";
+  const mark = left <= 60 ? 1 : 5;
+  if (!lowWarned || mark < lowWarned) {
+    lowWarned = mark;
+    toast(left <= 60 ? "Less than a minute of internet left" : "Only " + mins + " min of internet left", "time");
+    if (navigator.vibrate) navigator.vibrate([30, 60, 30]);
+  }
+}
+
+// ---- first load: sections rise in one after another ---------------------------
+
+function intro() {
+  if (REDUCE) return;
+  const wrap = $("app");
+  [...wrap.children].filter((n) => !n.classList.contains("toast")).forEach((n, i) => n.style.setProperty("--i", Math.min(i, 9)));
+  wrap.classList.add("intro");
+  setTimeout(() => wrap.classList.remove("intro"), 1600);
+}
+
 let lastSlotState = "idle";
 
 function render() {
   const slot = state.slot;
+  if (firstRender) intro();
   const changed = slot.state !== lastSlotState && !firstRender;
   const apply = () => {
     applyBrand(state.brand);
-    $("device").textContent = state.device;
+    // "Galaxy A53 5G · …A1B2C3": the model when the phone told us, and the
+    // short code the owner sees.
+    $("device").textContent = state.device_name ? state.device_name + " · " + state.device.replace(/^Device /, "") : state.device;
     $("app").setAttribute("aria-busy", "false");
     $("slot").hidden = slot.state !== "idle";
     $("inserting").hidden = slot.state !== "mine";
@@ -495,6 +554,7 @@ function applyBrand(b) {
   $("hs-logo").replaceChildren(logoNode(b));
   $("hs-name").textContent = b.name;
   renderSoundBtn();
+  renderNotice(b.notice || "");
 
   const fig = $("poster"), img = $("poster-img");
   if (b.poster) {
@@ -509,6 +569,25 @@ function applyBrand(b) {
     fig.hidden = true;
     img.removeAttribute("src");
   }
+}
+
+// The owner's message: still when it fits, gliding by when it doesn't.
+function renderNotice(text) {
+  const box = $("notice"), track = $("notice-track");
+  box.hidden = !text;
+  box.classList.remove("scroll", "wrap");
+  track.replaceChildren(el("span", text));
+  if (!text) return;
+  requestAnimationFrame(() => {
+    const w = track.firstChild.offsetWidth;
+    if (w <= track.parentElement.clientWidth) return;
+    if (REDUCE) { box.classList.add("wrap"); return; }
+    const copy = el("span", text);
+    copy.setAttribute("aria-hidden", "true");
+    track.append(copy);
+    track.style.setProperty("--dur", Math.max(8, (w + 48) / 42).toFixed(1) + "s");
+    box.classList.add("scroll");
+  });
 }
 
 // ---- onboarding ---------------------------------------------------------------
@@ -689,7 +768,7 @@ $("voucher-form").addEventListener("submit", (ev) => {
   const btn = ev.submitter || $("voucher-form").querySelector("button");
   const code = $("code").value;
   const wasOnline = isOnline();
-  action(btn, async () => {
+  action(btn, () => withShake($("code"), async () => {
     if (isPassCode(code)) {
       const r = await api("/pass/claim", { code, start: true });
       savePass(code);
@@ -704,7 +783,32 @@ $("voucher-form").addEventListener("submit", (ev) => {
     confetti(btn);
     toast("Voucher added: " + human(r.secs) + ".");
     wentOnline(wasOnline);
-  });
+  }));
+});
+
+// A code that doesn't work shakes the box, like a head saying no.
+async function withShake(input, fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    animate(input, [
+      { transform: "translateX(0)" }, { transform: "translateX(-9px)" }, { transform: "translateX(7px)" },
+      { transform: "translateX(-5px)" }, { transform: "translateX(3px)" }, { transform: "translateX(0)" },
+    ], { duration: 450, easing: "ease-out", fill: "none" });
+    if (navigator.vibrate) navigator.vibrate([40, 30, 40]);
+    throw e;
+  }
+}
+
+// Tap a price and its coins flip over.
+$("rates").addEventListener("click", (ev) => {
+  const card = ev.target.closest(".rate");
+  if (!card || REDUCE) return;
+  card.classList.remove("flip");
+  void card.offsetWidth;
+  card.classList.add("flip");
+  clearTimeout(card._flip);
+  card._flip = setTimeout(() => card.classList.remove("flip"), 1000);
 });
 
 // Vouchers are XXXX-XXXX-XXXX; passes are PASS-XXXX-XXXX-XXXX-XXXX.

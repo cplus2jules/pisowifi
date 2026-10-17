@@ -6,9 +6,12 @@ mod auth;
 mod brand;
 mod config;
 mod db;
+mod demo;
+mod devices;
 mod engine;
 mod firewall;
 mod gpio;
+mod health;
 mod homeicon;
 mod hub;
 mod hubclient;
@@ -158,6 +161,9 @@ enum Cmd {
         #[arg(required = true)]
         bundles: Vec<PathBuf>,
     },
+    /// Dev mode only: fill a fresh dev vendo with sample sales and devices
+    #[command(hide = true)]
+    DemoData,
 }
 
 #[derive(clap::Args)]
@@ -389,6 +395,12 @@ fn main() -> Result<()> {
             let p = update::Profile::vendo(&cfg, cli.dev);
             let configured = || update::vendo_url(&open_db(&cfg, cli.dev)?);
             update::cli(&p, a.into(), cli.dev, &configured)
+        }
+        Cmd::DemoData => {
+            if !cli.dev {
+                bail!("demo-data only works with --dev: it would mix made-up sales into real ones");
+            }
+            demo::fill(&open_db(&cfg, true)?)
         }
         Cmd::Hub { .. } | Cmd::AllowMac { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } | Cmd::ReleaseChannel { .. } => unreachable!(),
         Cmd::Restore { from } => {
@@ -637,6 +649,7 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         admin_macs: cfg.admin.allow_macs.iter().map(|m| net::Mac::parse(m)).collect::<Result<_>>()?,
         auth: auth::Auth::new(cfg.admin.session_hours),
         brand: brand::BrandStore::load(&db)?,
+        devices: devices::DeviceBook::load(&db)?,
         hub: hub_client.clone(),
         engine: engine.clone(),
         db: db.clone(),

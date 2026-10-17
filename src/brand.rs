@@ -28,6 +28,8 @@ pub struct Brand {
     pub sounds: bool,
     /// Empty: customers stay on the portal.
     pub after_url: String,
+    /// A short message for customers at the top of the page (empty: none).
+    pub notice: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -113,6 +115,7 @@ impl BrandStore {
                 poster: None,
                 sounds: true,
                 after_url: String::new(),
+                notice: String::new(),
             }),
             assets: RwLock::new(assets),
         };
@@ -133,6 +136,12 @@ impl BrandStore {
         db.set_setting("portal_name", name)?;
         db.set_setting("accent", accent)?;
         db.set_setting("poster_alt", poster_alt)?;
+        self.refresh(db)
+    }
+
+    /// `notice` must already be cleaned by [`clean_text`].
+    pub fn set_notice(&self, db: &Db, notice: &str) -> Result<()> {
+        db.set_setting("notice", notice)?;
         self.refresh(db)
     }
 
@@ -197,6 +206,7 @@ impl BrandStore {
             poster: url("poster").map(|u| Poster { url: u, alt: db.get_setting("poster_alt").ok().flatten().unwrap_or_default() }),
             sounds: db.get_setting("portal_sounds")?.is_none_or(|v| v != "0"),
             after_url: db.get_setting("after_url")?.unwrap_or_else(|| DEFAULT_AFTER_URL.into()),
+            notice: db.get_setting("notice")?.unwrap_or_default(),
         };
         *self.brand.write().unwrap() = b;
         Ok(())

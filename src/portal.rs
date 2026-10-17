@@ -5,7 +5,7 @@ use crate::engine::{CoinStart, MeView, Resume};
 use crate::hub::proto::{WalletKind, WalletSupport, UNKNOWN_PASS};
 use crate::hubclient::{AfterPurchase, HubError, PassError};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -149,19 +149,24 @@ struct PassInfo {
 struct MeResponse {
     brand: crate::brand::Brand,
     pass: PassInfo,
+    /// This phone's model or own name, when its browser or DHCP said.
+    device_name: Option<String>,
     #[serde(flatten)]
     me: MeView,
 }
 
-async fn me(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<MeResponse>> {
+async fn me(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
     let (mac, ip) = st.identify(addr)?;
+    // So the owner sees "Galaxy A53 5G" instead of an address. Display only.
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+    st.devices.saw_browser(&st.db, mac, ua);
     let pass = PassInfo {
         enabled: st.hub.is_some(),
         linked: st.engine.pass_of(mac).is_some(),
         chain: st.hub.as_ref().and_then(|h| h.chain()),
         wallet: st.hub.as_ref().map(|h| h.status().wallet).unwrap_or_default(),
     };
-    Ok(Json(MeResponse { brand: st.brand.get(), pass, me: st.engine.me(mac, ip) }))
+    Ok(Json(MeResponse { brand: st.brand.get(), pass, device_name: st.devices.own_name(mac), me: st.engine.me(mac, ip) }))
 }
 
 async fn coin_start(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Response> {

@@ -6,7 +6,7 @@
 use crate::keys::DbKey;
 use crate::net::Mac;
 use anyhow::{bail, Context, Result};
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use rand::Rng;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -116,6 +116,72 @@ pub struct SalesSummary {
     pub recent: Vec<Sale>,
 }
 
+/// What a device has told us about itself, and the owner's name for it.
+#[derive(Debug, Clone)]
+pub struct DeviceRow {
+    pub mac: Mac,
+    pub nickname: String,
+    pub hostname: String,
+    pub user_agent: String,
+    pub first_seen: i64,
+    pub last_seen: i64,
+}
+
+/// All-time purchases by one device.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Spend {
+    pub pesos: u64,
+    pub count: u64,
+    pub secs: u64,
+    pub last: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceTotal {
+    pub source: String,
+    pub pesos: u64,
+    pub count: u64,
+    pub secs: u64,
+}
+
+/// Sales over a period, for the Sales page.
+#[derive(Debug, Serialize)]
+pub struct Report {
+    pub days: u32,
+    /// "day" or "month" (a year is shown month by month).
+    pub group: &'static str,
+    pub buckets: Vec<DaySales>,
+    pub sources: Vec<SourceTotal>,
+    /// Pesos by weekday (0 = Monday) and hour.
+    pub heat: Vec<Vec<u64>>,
+    pub pesos: u64,
+    pub count: u64,
+    pub secs: u64,
+    pub customers: u64,
+    pub prev_pesos: u64,
+    pub best: Option<DaySales>,
+    pub best_ever: Option<DaySales>,
+}
+
+/// Cash in the coin box since it was last emptied.
+#[derive(Debug, Serialize)]
+pub struct CoinBox {
+    pub since: Option<i64>,
+    pub pesos: u64,
+    pub count: u64,
+    pub history: Vec<Collection>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Collection {
+    pub ts: i64,
+    /// What the sales say should have been in the box.
+    pub expected: u64,
+    /// What the owner counted.
+    pub counted: u64,
+    pub note: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VoucherRow {
     pub id: String,
@@ -204,11 +270,37 @@ const SCHEMA_V4: &str = "
 CREATE TABLE secrets (name TEXT PRIMARY KEY, value BLOB NOT NULL);
 ";
 
+/// v5: devices the owner can tell apart (model, own name, nickname), and
+/// each time the coin box was emptied.
+const SCHEMA_V5: &str = "
+CREATE TABLE devices (
+    mac        TEXT PRIMARY KEY,
+    nickname   TEXT NOT NULL,
+    hostname   TEXT NOT NULL,
+    user_agent TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+);
+CREATE INDEX sales_mac ON sales (mac);
+CREATE TABLE collections (
+    id       INTEGER PRIMARY KEY,
+    ts       INTEGER NOT NULL,
+    expected INTEGER NOT NULL,
+    counted  INTEGER NOT NULL,
+    note     TEXT NOT NULL
+);
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Local midnight at the start of `d`.
+fn start_of(d: NaiveDate) -> i64 {
+    Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().map(|t| t.timestamp()).unwrap_or(0)
 }
 
 impl Db {
@@ -245,6 +337,12 @@ impl Db {
             let tx = c.transaction()?;
             tx.execute_batch(SCHEMA_V4)?;
             tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
+        if v < 5 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V5)?;
+            tx.pragma_update(None, "user_version", 5)?;
             tx.commit()?;
         }
         Ok(())
@@ -593,6 +691,235 @@ impl Db {
         })
     }
 
+    /// Sales in the period ending today: per day (per month for a year),
+    /// by source and by hour of the week.
+    pub fn report(&self, days: u32) -> Result<Report> {
+        let c = self.conn.lock().unwrap();
+        let today = Local::now().date_naive();
+        let monthly = days > 92;
+        let first = if monthly {
+            (0..11).fold(today.with_day(1).unwrap(), |d, _| (d - chrono::Days::new(1)).with_day(1).unwrap())
+        } else {
+            today - chrono::Days::new(days.max(1) as u64 - 1)
+        };
+        let since = start_of(first);
+        let length = (today - first).num_days() as u64 + 1;
+        let prev_pesos: i64 = c.query_row(
+            "SELECT COALESCE(SUM(pesos), 0) FROM sales WHERE ts >= ?1 AND ts < ?2 AND source != 'unclaimed'",
+            [start_of(first - chrono::Days::new(length)), since],
+            |r| r.get(0),
+        )?;
+
+        let key = |d: NaiveDate| if monthly { d.format("%Y-%m").to_string() } else { d.format("%Y-%m-%d").to_string() };
+        let mut buckets: Vec<DaySales> = vec![];
+        let mut d = first;
+        while d <= today {
+            let date = if monthly { d.format("%Y-%m-01").to_string() } else { d.format("%Y-%m-%d").to_string() };
+            if buckets.last().is_none_or(|b| b.date != date) {
+                buckets.push(DaySales { date, pesos: 0, count: 0 });
+            }
+            d = d + chrono::Days::new(1);
+        }
+        let index: std::collections::HashMap<String, usize> =
+            buckets.iter().enumerate().map(|(i, b)| (b.date[..if monthly { 7 } else { 10 }].to_string(), i)).collect();
+
+        let mut heat = vec![vec![0u64; 24]; 7];
+        let mut sources: Vec<SourceTotal> = vec![];
+        let mut customers = std::collections::HashSet::new();
+        let (mut pesos, mut count, mut secs) = (0u64, 0u64, 0u64);
+        let mut st = c.prepare("SELECT ts, mac, pesos, secs, source FROM sales WHERE ts >= ?1")?;
+        let mut rows = st.query([since])?;
+        while let Some(r) = rows.next()? {
+            let (ts, mac, p, s, source): (i64, Option<String>, i64, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+            let (p, s) = (p.max(0) as u64, s.max(0) as u64);
+            match sources.iter_mut().find(|t| t.source == source) {
+                Some(t) => {
+                    t.pesos += p;
+                    t.count += 1;
+                    t.secs += s;
+                }
+                None => sources.push(SourceTotal { source: source.clone(), pesos: p, count: 1, secs: s }),
+            }
+            if source == "unclaimed" {
+                continue;
+            }
+            let Some(at) = Local.timestamp_opt(ts, 0).single() else { continue };
+            if let Some(&i) = index.get(&key(at.date_naive())) {
+                buckets[i].pesos += p;
+                buckets[i].count += 1;
+            }
+            heat[at.weekday().num_days_from_monday() as usize][at.hour() as usize] += p;
+            pesos += p;
+            count += 1;
+            secs += s;
+            if let Some(m) = mac {
+                customers.insert(m);
+            }
+        }
+        sources.sort_by(|a, b| b.pesos.cmp(&a.pesos).then(b.count.cmp(&a.count)));
+        let best = buckets.iter().filter(|b| b.pesos > 0).max_by_key(|b| b.pesos).map(|b| DaySales { date: b.date.clone(), ..*b });
+        let best_ever = c
+            .query_row(
+                "SELECT date(ts, 'unixepoch', 'localtime') AS d, SUM(pesos), COUNT(*) FROM sales
+                 WHERE source != 'unclaimed' GROUP BY d ORDER BY 2 DESC LIMIT 1",
+                [],
+                |r| Ok(DaySales { date: r.get(0)?, pesos: r.get::<_, i64>(1)? as u64, count: r.get::<_, i64>(2)? as u64 }),
+            )
+            .optional()?
+            .filter(|d| d.pesos > 0);
+        Ok(Report {
+            days,
+            group: if monthly { "month" } else { "day" },
+            buckets,
+            sources,
+            heat,
+            pesos,
+            count,
+            secs,
+            customers: customers.len() as u64,
+            prev_pesos: prev_pesos as u64,
+            best,
+            best_ever,
+        })
+    }
+
+    /// Every sale since `since`, oldest first (for the spreadsheet download).
+    pub fn sales_since(&self, since: i64) -> Result<Vec<Sale>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT ts, mac, pesos, secs, source FROM sales WHERE ts >= ?1 ORDER BY id LIMIT 200000")?;
+        let rows = st.query_map([since], |r| {
+            Ok(Sale { ts: r.get(0)?, mac: r.get(1)?, pesos: r.get(2)?, secs: r.get::<_, i64>(3)? as u64, source: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---- devices --------------------------------------------------------
+
+    pub fn load_devices(&self) -> Result<Vec<DeviceRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT mac, nickname, hostname, user_agent, first_seen, last_seen FROM devices")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?;
+        let mut out = vec![];
+        for row in rows {
+            let (mac, nickname, hostname, user_agent, first_seen, last_seen) = row?;
+            if let Ok(mac) = Mac::parse(&mac) {
+                out.push(DeviceRow { mac, nickname, hostname, user_agent, first_seen, last_seen });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn save_device(&self, d: &DeviceRow) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO devices (mac, nickname, hostname, user_agent, first_seen, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (mac) DO UPDATE SET nickname = excluded.nickname, hostname = excluded.hostname,
+                 user_agent = excluded.user_agent, last_seen = excluded.last_seen",
+            params![d.mac.to_string(), d.nickname, d.hostname, d.user_agent, d.first_seen, d.last_seen],
+        )?;
+        Ok(())
+    }
+
+    /// Drops devices the owner never named that haven't been back since `before`.
+    pub fn forget_devices(&self, before: i64) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM devices WHERE last_seen < ?1 AND nickname = ''", [before])?;
+        Ok(())
+    }
+
+    /// All-time purchases per device.
+    pub fn device_spend(&self) -> Result<std::collections::HashMap<String, Spend>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT mac, SUM(pesos), COUNT(*), SUM(secs), MAX(ts) FROM sales
+             WHERE mac IS NOT NULL AND source != 'unclaimed' GROUP BY mac",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Spend {
+                    pesos: r.get::<_, i64>(1)? as u64,
+                    count: r.get::<_, i64>(2)? as u64,
+                    secs: r.get::<_, i64>(3)? as u64,
+                    last: r.get(4)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn device_sales(&self, mac: Mac, limit: u32) -> Result<Vec<Sale>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT ts, mac, pesos, secs, source FROM sales WHERE mac = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = st.query_map(params![mac.to_string(), limit], |r| {
+            Ok(Sale { ts: r.get(0)?, mac: r.get(1)?, pesos: r.get(2)?, secs: r.get::<_, i64>(3)? as u64, source: r.get(4)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ---- coin box -------------------------------------------------------
+    // Coins (claimed or not) are cash in the box until the owner empties it.
+
+    pub fn coinbox(&self) -> Result<CoinBox> {
+        let c = self.conn.lock().unwrap();
+        let since: Option<i64> = c.query_row("SELECT MAX(ts) FROM collections", [], |r| r.get(0))?;
+        let (pesos, count) = c.query_row(
+            "SELECT COALESCE(SUM(pesos), 0), COUNT(*) FROM sales WHERE source IN ('coin', 'unclaimed') AND ts > ?1",
+            [since.unwrap_or(i64::MIN)],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?;
+        let mut st = c.prepare("SELECT ts, expected, counted, note FROM collections ORDER BY id DESC LIMIT 12")?;
+        let history = st
+            .query_map([], |r| {
+                Ok(Collection { ts: r.get(0)?, expected: r.get::<_, i64>(1)? as u64, counted: r.get::<_, i64>(2)? as u64, note: r.get(3)? })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(CoinBox { since, pesos, count, history })
+    }
+
+    /// The owner emptied the coin box: what the sales say was in it, and
+    /// what they counted (the same when they didn't count).
+    pub fn collect(&self, counted: Option<u64>, note: &str) -> Result<Collection> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let ts = now();
+        let since: Option<i64> = tx.query_row("SELECT MAX(ts) FROM collections", [], |r| r.get(0))?;
+        let expected: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(pesos), 0) FROM sales WHERE source IN ('coin', 'unclaimed') AND ts > ?1 AND ts <= ?2",
+            [since.unwrap_or(i64::MIN), ts],
+            |r| r.get(0),
+        )?;
+        let expected = expected as u64;
+        let counted = counted.unwrap_or(expected);
+        tx.execute(
+            "INSERT INTO collections (ts, expected, counted, note) VALUES (?1, ?2, ?3, ?4)",
+            params![ts, expected as i64, counted as i64, note],
+        )?;
+        tx.commit()?;
+        Ok(Collection { ts, expected, counted, note: note.to_string() })
+    }
+
+    /// Sample data for a dev vendo (`pisowifi --dev demo-data`).
+    pub fn demo_sale(&self, ts: i64, mac: Option<Mac>, pesos: u32, secs: u64, source: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO sales (ts, mac, pesos, secs, source) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![ts, mac.map(|m| m.to_string()), pesos, secs as i64, source],
+        )?;
+        Ok(())
+    }
+
+    pub fn demo_collection(&self, ts: i64, expected: u64, counted: u64) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO collections (ts, expected, counted, note) VALUES (?1, ?2, ?3, '')",
+            params![ts, expected as i64, counted as i64],
+        )?;
+        Ok(())
+    }
+
     // ---- vouchers -------------------------------------------------------
     // Only a hash of each code is stored, so even a decrypted database
     // doesn't reveal unused codes. Codes are shown once, at creation.
@@ -820,6 +1147,79 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn coin_box_counts_cash_since_it_was_emptied() {
+        let (_dir, db) = test_db();
+        let mac = Mac::parse("da:a1:19:00:11:22").unwrap();
+        let t = now();
+        db.demo_sale(t - 100, Some(mac), 5, 7200, "coin").unwrap();
+        db.demo_sale(t - 90, None, 1, 0, "unclaimed").unwrap();
+        db.demo_sale(t - 80, Some(mac), 0, 7200, "voucher").unwrap();
+        let b = db.coinbox().unwrap();
+        assert_eq!((b.since, b.pesos, b.count), (None, 6, 2), "coins and unclaimed coins are cash; vouchers aren't");
+        let c = db.collect(Some(4), "two pesos short").unwrap();
+        assert_eq!((c.expected, c.counted), (6, 4));
+        let b = db.coinbox().unwrap();
+        assert_eq!((b.pesos, b.history.len(), b.history[0].note.as_str()), (0, 1, "two pesos short"));
+        assert!(b.since.is_some());
+        db.demo_sale(t - 70, Some(mac), 10, 18000, "coin").unwrap();
+        assert_eq!(db.coinbox().unwrap().pesos, 0, "a sale from before it was emptied isn't in the box");
+        let c = db.collect(None, "").unwrap();
+        assert_eq!((c.expected, c.counted), (0, 0), "not counted: the expected amount");
+    }
+
+    #[test]
+    fn report_groups_by_day_source_and_hour() {
+        let (_dir, db) = test_db();
+        let mac = Mac::parse("da:a1:19:00:11:22").unwrap();
+        let other = Mac::parse("da:a1:19:00:11:33").unwrap();
+        let t = now();
+        db.demo_sale(t, Some(mac), 5, 7200, "coin").unwrap();
+        db.demo_sale(t, Some(other), 20, 43200, "coin").unwrap();
+        db.demo_sale(t, Some(mac), 0, 3600, "voucher").unwrap();
+        db.demo_sale(t, None, 3, 0, "unclaimed").unwrap();
+        db.demo_sale(t - 40 * 86400, Some(mac), 10, 18000, "coin").unwrap();
+        let r = db.report(30).unwrap();
+        assert_eq!((r.group, r.buckets.len()), ("day", 30));
+        assert_eq!((r.pesos, r.count, r.customers, r.prev_pesos), (25, 3, 2, 10));
+        assert_eq!(r.buckets.last().unwrap().pesos, 25);
+        assert_eq!(r.heat.iter().flatten().sum::<u64>(), 25);
+        let coins = r.sources.iter().find(|s| s.source == "coin").unwrap();
+        assert_eq!((coins.pesos, coins.count), (25, 2));
+        assert!(r.sources.iter().any(|s| s.source == "unclaimed" && s.pesos == 3));
+        assert_eq!(r.best_ever.unwrap().pesos, 25);
+        let y = db.report(365).unwrap();
+        assert_eq!((y.group, y.buckets.len(), y.pesos), ("month", 12, 35));
+        let spend = db.device_spend().unwrap();
+        assert_eq!(spend[&mac.to_string()].pesos, 15);
+        assert_eq!(spend[&mac.to_string()].count, 3);
+    }
+
+    #[test]
+    fn devices_are_saved_and_unnamed_old_ones_forgotten() {
+        let (_dir, db) = test_db();
+        let row = |mac: &str, nickname: &str, last_seen: i64| DeviceRow {
+            mac: Mac::parse(mac).unwrap(),
+            nickname: nickname.into(),
+            hostname: String::new(),
+            user_agent: "UA".into(),
+            first_seen: 1,
+            last_seen,
+        };
+        db.save_device(&row("da:a1:19:00:00:01", "", 10)).unwrap();
+        db.save_device(&row("da:a1:19:00:00:02", "Kuya Ben", 10)).unwrap();
+        db.save_device(&row("da:a1:19:00:00:03", "", 1000)).unwrap();
+        let mut updated = row("da:a1:19:00:00:03", "Ate", 2000);
+        updated.first_seen = 999;
+        db.save_device(&updated).unwrap();
+        db.forget_devices(100).unwrap();
+        let mut left = db.load_devices().unwrap();
+        left.sort_by_key(|d| d.mac);
+        assert_eq!(left.len(), 2);
+        assert_eq!(left[0].nickname, "Kuya Ben");
+        assert_eq!((left[1].nickname.as_str(), left[1].first_seen, left[1].last_seen), ("Ate", 1, 2000));
     }
 
     #[test]

@@ -11,13 +11,28 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
   (or your logo), with steps for whichever browser they use.
   Sound effects (made in the browser, no files): a chime when the slot opens,
   a ding for each coin, a jingle once online. Customers can mute them.
+  A bar under the clock drains as time runs; with 5 minutes left the page
+  says so and nudges the *Add more time* button. Your message for customers
+  scrolls across the top. Tapping a price flips its coins.
 - **Your branding**: name, tagline, accent colour, logo and an advert poster,
   sound effects on or off, and the page customers land on once online (a
   Google search for cats until you change it), set on the dashboard's
   *Customer page*. That page also prints a QR sign: one code joins the WiFi
   from the phone camera, the other opens the portal.
 - **Owner dashboard** on `https://10.0.0.1:8443/`: earnings, connected
-  devices, coin slot status, rates, printable vouchers, activity log.
+  devices, coin slot status, rates, printable vouchers, activity log, and:
+  - **Devices by name**: "Galaxy A53 5G" or "Juans iPhone" instead of a MAC
+    address, from the phone's browser and the name it gives the WiFi. Give
+    regulars your own names. Each device opens a panel with its time (add,
+    pause, resume, disconnect), what it has spent, and its purchases.
+  - **Sales**: 7 days to 12 months, busiest hours of the week, how customers
+    paid, record days, and a spreadsheet (CSV) download.
+  - **Coin box**: how much cash should be inside since you last emptied it.
+    Tap *I emptied it*, type what you counted, and the history shows any
+    shortfall.
+  - **Daily goal** with a streak counter, and **vendo health**: temperature,
+    processor, memory, storage and the internet cable.
+  - Live: a sale makes the day's total count up and coins drop into the jar.
 - **Encrypted database**: SQLCipher (AES-256 with an HMAC-SHA512 check on every page).
 
 ## What's in the box
@@ -41,6 +56,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Password guessing from the customer WiFi | The installer locks the dashboard to your phone's MAC. Other devices are turned away before any TLS work, from a separate small pool, so customers can't tie up the dashboard; they see a page explaining the lock. The dashboard port has its own flood limit. 5 wrong tries locks a device out for 15 minutes. After 20 failures box-wide (from any addresses), only one attempt per 30 s is allowed, and that is logged. Common passwords (the 10k list, sequences, keyboard runs, the WiFi or store name) are refused. |
 | Customer "claims" a fresh box | The password can only be set from the device's shell (`set-password`), never from the web. |
 | Web attacks (XSS, CSRF, clickjacking, DNS rebinding) | Strict CSP (no inline scripts), no `innerHTML`, custom-header CSRF checks, Host-header checks, `frame-ancestors 'none'`. |
+| A phone pretending to be another | Device names and models come from the phone itself (its browser and DHCP), so they can be faked. They're labels for you only, never used to decide who gets time; only MAC + IP are. Customers never see your nicknames. The sales spreadsheet escapes cells that a spreadsheet app would run as formulas. |
 | Slowloris / connection floods | Connection caps, 10 s header timeout, 4–16 KB body limits, one Argon2 hash at a time. |
 | Ledger tampering | All SQL uses bound parameters. Voucher codes are stored hashed (shown once). Test coins exist only in dev mode. Every owner action goes to the audit log. |
 | Compromised service | The systemd unit drops all capabilities except networking, the filesystem is read-only except `/var/lib/pisowifi`, and only GPIO devices are allowed. |
@@ -330,6 +346,20 @@ cargo run -- --dev run
 | `http://127.0.0.1:8443` | Dashboard (dev password: `dev-data/dev-password.txt`) |
 
 Dev mode fakes the firewall and the coin slot. The dashboard shows *Test ₱1/₱5/₱10* buttons.
+
+For a dashboard with something in it, fill a fresh dev vendo with four months
+of made-up sales and a dozen phones, then run that one:
+
+```bash
+cargo run -- --dev --instance 5 demo-data
+```
+
+```bash
+cargo run -- --dev --instance 5 run
+```
+
+It's then on ports 8085 (portal) and 8448 (dashboard), with its password in
+`dev-data-5/dev-password.txt`.
 
 Run the tests with `cargo test`. They cover the encryption-at-rest check,
 wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session

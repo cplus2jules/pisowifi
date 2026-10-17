@@ -22,6 +22,8 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub auth: Auth,
     pub brand: BrandStore,
+    /// What each customer's device is (model, own name, owner's nickname).
+    pub devices: crate::devices::DeviceBook,
     /// Set when this vendo is part of a chain (Piso Pass enabled).
     pub hub: Option<Arc<crate::hubclient::HubClient>>,
     pub lan: (Ipv4Addr, u8),
