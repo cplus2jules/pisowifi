@@ -2,6 +2,9 @@
 # Installs pisowifi on an Orange Pi running Armbian, replacing LPB.
 # First run ./preflight.sh (changes nothing). Then, from the unpacked bundle:
 #   sudo ./install.sh
+# Run it again from a newer bundle to upgrade: when the settings and database
+# already exist it only swaps in the new version (with automatic rollback)
+# and asks nothing else. `./install.sh --full` runs the whole setup again.
 # Nothing from LPB is deleted: its services are disabled and its settings are
 # copied to /root/lpb-backup-<date>/ so you can roll back with uninstall.sh.
 # Everything is checked before LPB is touched, and LPB is stopped as late as
@@ -17,6 +20,77 @@ setting() { sed -nE "s/^$1 *= *\"?([^\" #]*)\"?.*/\1/p" "$2" | head -1; }
 [[ $EUID -eq 0 ]] || { echo "Run as root: sudo ./install.sh"; exit 1; }
 [[ -x ./pisowifi ]] || { echo "pisowifi binary not found next to install.sh"; exit 1; }
 ./pisowifi --version >/dev/null || { echo "The binary doesn't run on this board."; exit 1; }
+NEW="$(./pisowifi --version | awk '{print $2}')"
+CONF=/etc/pisowifi/config.toml
+LIB=/usr/local/lib/pisowifi
+UNITS=(pisowifi.service pisowifi-update.service pisowifi-update.path)
+
+# ---- Upgrade ---------------------------------------------------------------------
+# Settings and database exist: swap in the new version with the same rollback
+# the dashboard's updates use. Nothing else is asked or changed.
+DATA_DIR="$(setting data_dir "$CONF" 2>/dev/null || true)"
+DATA_DIR="${DATA_DIR:-/var/lib/pisowifi}"
+if [[ "${1:-}" != --full && -f "$CONF" && -f "$DATA_DIR/pisowifi.db" ]]; then
+  OLD="$(/usr/local/bin/pisowifi --version 2>/dev/null | awk '{print $2}' || true)"
+  cat <<EOF
+
+  Piso WiFi upgrade
+  -----------------
+  Installed: ${OLD:-unknown}    This bundle: $NEW
+
+  Settings, the password, sales and customers' time are kept, and customers
+  who are online stay online. If the new version doesn't come up within
+  about 90 seconds, the installed one is put back by itself.
+  (To run the whole first-time setup again instead: ./install.sh --full)
+
+EOF
+  ALLOW=()
+  if [[ -n "$OLD" && "$OLD" == "$NEW" ]]; then
+    ask "Version $NEW is already installed. Reinstall it?" || exit 1
+    ALLOW=(--allow-same)
+  elif [[ -n "$OLD" && "$(printf '%s\n%s\n' "$OLD" "$NEW" | sort -V | tail -1)" == "$OLD" ]]; then
+    echo "This bundle ($NEW) is older than the installed $OLD. Going back to an older version isn't supported."
+    exit 1
+  else
+    ask "Upgrade to $NEW now?" || exit 1
+  fi
+  ./pisowifi --config "$CONF" print-firewall > /tmp/pisowifi.nft
+  nft -c -f /tmp/pisowifi.nft || { warn "This kernel refuses the new version's firewall rules. Nothing was changed."; exit 1; }
+
+  # The updater runs from a root-only copy, detached from this SSH session,
+  # so a dropped connection can't stop it halfway.
+  INC="$LIB/incoming"
+  install -d -m 0755 "$LIB"
+  rm -rf -- "${INC:?}"
+  install -d -m 0700 "$INC" "$DATA_DIR/update"
+  install -m 0755 ./pisowifi "$INC/"
+  for f in "${UNITS[@]}" README.md; do
+    if [[ -f "$f" ]]; then install -m 0644 "$f" "$INC/"; fi
+  done
+  UNIT="pisowifi-upgrade-$(date +%s)"
+  say "Upgrading to $NEW"
+  journalctl -f -n0 -o cat -u "$UNIT" 2>/dev/null &
+  JPID=$!
+  RC=0
+  systemd-run --quiet --wait --collect --unit "$UNIT" -p Type=oneshot -p TimeoutStartSec=15min \
+    "$INC/pisowifi" --config "$CONF" update --install-dir "$INC" ${ALLOW[@]+"${ALLOW[@]}"} || RC=$?
+  sleep 1
+  kill "$JPID" 2>/dev/null || true
+  rm -rf -- "${INC:?}"
+  if ((RC != 0)); then
+    warn "The upgrade didn't go through:"
+    /usr/local/bin/pisowifi --config "$CONF" update --status || true
+    rm -f /tmp/pisowifi.nft
+    exit 1
+  fi
+  # Boot-time firewall from the new version (checked before it replaces the old one).
+  { echo '#!/usr/sbin/nft -f'; echo 'flush ruleset'; cat /tmp/pisowifi.nft; } > /etc/nftables.conf.new
+  if nft -c -f /etc/nftables.conf.new; then mv /etc/nftables.conf.new /etc/nftables.conf; else rm -f /etc/nftables.conf.new; fi
+  rm -f /tmp/pisowifi.nft
+  if [[ -f README.md ]]; then install -D -m 0644 README.md /usr/local/share/doc/pisowifi/README.md; fi
+  say "Upgraded to $NEW. Customers stayed online; sign in to the dashboard again."
+  exit 0
+fi
 
 # The first run's copy of LPB's settings is the one to roll back to; a
 # second run must not overwrite it with pisowifi's own settings.
@@ -43,7 +117,6 @@ EOF
 ask "I have a backup of the SD card. Continue?" || exit 1
 
 # ---- 1. Interfaces -----------------------------------------------------------
-CONF=/etc/pisowifi/config.toml
 SRC_CONF=./config.example.toml
 [[ -f "$CONF" ]] && SRC_CONF="$CONF"
 LAN_IF="${LAN_IF:-$(setting lan_iface "$SRC_CONF")}"
@@ -229,9 +302,19 @@ fi
 
 # ---- 7. Switch over ----------------------------------------------------------------
 say "Installing pisowifi"
-install -m 0755 ./pisowifi /usr/local/bin/pisowifi
+# Each version gets its own folder; `current` points at the one in use and
+# /usr/local/bin/pisowifi at that. Updates swap the link and keep `previous`.
+REL="releases/$NEW-$(date +%s)"
+install -d -m 0755 "$LIB" "$LIB/releases" "$LIB/$REL"
+install -m 0755 ./pisowifi "$LIB/$REL/pisowifi"
+for f in "${UNITS[@]}" README.md; do
+  if [[ -f "$f" ]]; then install -m 0644 "$f" "$LIB/$REL/"; fi
+done
+ln -sfn "$REL" "$LIB/current"
+ln -sfn "$LIB/current/pisowifi" /usr/local/bin/pisowifi
 [[ -f README.md ]] && install -m 0644 README.md /usr/local/share/doc/pisowifi/
-install -m 0644 ./pisowifi.service /etc/systemd/system/pisowifi.service
+install -m 0644 "${UNITS[@]}" /etc/systemd/system/
+install -d -m 0700 "$DATA_DIR" "$DATA_DIR/update"
 
 # dnsmasq: only our settings. bind-dynamic in pisowifi.conf copes with the LAN
 # adapter coming up late; the drop-in restarts dnsmasq if it ever dies.
@@ -263,9 +346,10 @@ rm -f /tmp/pisowifi.nft
 nft -c -f /etc/nftables.conf
 
 systemctl daemon-reload
-systemctl enable -q nftables dnsmasq pisowifi
+systemctl enable -q nftables dnsmasq pisowifi pisowifi-update.service pisowifi-update.path
 systemctl restart nftables dnsmasq
 systemctl restart pisowifi
+systemctl start pisowifi-update.path
 sleep 3
 systemctl --no-pager --lines=10 status pisowifi || true
 
@@ -275,6 +359,8 @@ cat <<EOF
   Customers:  connect to the WiFi; the portal opens at http://$LAN_IP/
   Owner:      https://$LAN_IP:8443/   (compare the certificate fingerprint above)
   Logs:       journalctl -u pisowifi -f
+  Updates:    dashboard > Settings > Software updates, or run ./install.sh
+              from a newer bundle (it keeps everything and rolls back by itself)
   LPB backup: $BACKUP
   Roll back:  sudo ./uninstall.sh $BACKUP
 

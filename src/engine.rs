@@ -674,7 +674,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pisowifi-engine-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("t.db"), &DbKey(Zeroizing::new([7u8; 32]))).unwrap());
-        let fw = Firewall::start(&crate::config::Config::dev(dir.clone()), true).await.unwrap();
+        let fw = Firewall::start(&crate::config::Config::dev(dir.clone()), true, &[]).await.unwrap();
         let e = Engine::new(db, fw, None, 1, 60, Arc::new(AtomicBool::new(reader_ok))).unwrap();
         (dir, e)
     }

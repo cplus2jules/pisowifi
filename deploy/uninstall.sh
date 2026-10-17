@@ -8,8 +8,9 @@ set -euo pipefail
 BACKUP="${1:?pass the backup folder printed by install.sh}"
 [[ -d "$BACKUP" ]] || { echo "No such folder: $BACKUP"; exit 1; }
 
-systemctl disable --now pisowifi 2>/dev/null || true
-rm -f /etc/systemd/system/pisowifi.service /etc/dnsmasq.d/pisowifi.conf /etc/sysctl.d/90-pisowifi.conf \
+systemctl disable --now pisowifi pisowifi-update.path pisowifi-update.service 2>/dev/null || true
+rm -f /etc/systemd/system/pisowifi.service /etc/systemd/system/pisowifi-update.service \
+  /etc/systemd/system/pisowifi-update.path /etc/dnsmasq.d/pisowifi.conf /etc/sysctl.d/90-pisowifi.conf \
   /etc/modules-load.d/pisowifi.conf /etc/systemd/system/dnsmasq.service.d/pisowifi.conf
 nft delete table inet pisowifi 2>/dev/null || true
 

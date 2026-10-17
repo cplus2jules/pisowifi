@@ -12,6 +12,8 @@
 //!
 //! It fails closed: if the daemon dies, the table stays and nobody new gets
 //! online; existing grants expire by themselves via kernel set timeouts.
+//! On start the table is replaced together with the saved grants, in one
+//! transaction, so a restart or an update never cuts off paying customers.
 //!
 //! Every value written into nft scripts is a parsed MAC/IPv4/integer or a
 //! validated interface name, so no injection is possible.
@@ -39,12 +41,13 @@ pub struct Firewall {
 }
 
 impl Firewall {
-    pub async fn start(cfg: &Config, dev: bool) -> Result<Firewall> {
+    /// `grants`: customers with time running (MAC, IP, seconds left).
+    pub async fn start(cfg: &Config, dev: bool, grants: &[(Mac, Ipv4Addr, u64)]) -> Result<Firewall> {
         if dev {
             tracing::info!("dev mode: firewall changes are logged, not applied");
             return Ok(Firewall { tx: None });
         }
-        run_nft(&base_ruleset(cfg)?).await.context("installing nftables ruleset")?;
+        run_nft(&(base_ruleset(cfg)? + &grant_elements(grants))).await.context("installing nftables ruleset")?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         // A single worker keeps grant/revoke operations strictly ordered.
         tokio::spawn(async move {
@@ -86,6 +89,17 @@ async fn allow(mac: Mac, ip: Ipv4Addr, secs: u64) -> Result<()> {
         secs + KERNEL_GRACE_SECS
     ))
     .await
+}
+
+/// Re-adds saved grants. Appended to the ruleset, so the old table (whose
+/// `allowed` set kept customers online while the daemon was down) is
+/// swapped for the new one with no gap in between.
+fn grant_elements(grants: &[(Mac, Ipv4Addr, u64)]) -> String {
+    if grants.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = grants.iter().map(|(mac, ip, secs)| format!("{mac} . {ip} timeout {}s", secs + KERNEL_GRACE_SECS)).collect();
+    format!("add element inet pisowifi allowed {{ {} }}\n", items.join(", "))
 }
 
 fn del_element(mac: Mac, ip: Ipv4Addr) -> String {
@@ -216,5 +230,16 @@ mod tests {
         // Paid phones' DNS is accepted before the unpaid allowance applies.
         let paid = r.find("th dport 53 ether saddr . ip saddr @allowed accept").unwrap();
         assert!(paid < r.find("meter dns_unpaid").unwrap());
+    }
+
+    #[test]
+    fn saved_grants_load_with_the_table() {
+        assert_eq!(grant_elements(&[]), "");
+        let a = (Mac::parse("02:11:22:33:44:55").unwrap(), Ipv4Addr::new(10, 0, 0, 9), 600);
+        let b = (Mac::parse("02:00:00:00:00:02").unwrap(), Ipv4Addr::new(10, 0, 0, 10), 60);
+        assert_eq!(
+            grant_elements(&[a, b]),
+            "add element inet pisowifi allowed { 02:11:22:33:44:55 . 10.0.0.9 timeout 630s, 02:00:00:00:00:02 . 10.0.0.10 timeout 90s }\n"
+        );
     }
 }

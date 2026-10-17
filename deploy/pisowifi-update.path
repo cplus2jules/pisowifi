@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the Piso WiFi updater when the dashboard asks for an update
+
+[Path]
+# Written by the vendo after it has downloaded and checked a signed update.
+PathExists=/var/lib/pisowifi/update/request
+Unit=pisowifi-update.service
+
+[Install]
+WantedBy=paths.target

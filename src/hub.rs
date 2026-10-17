@@ -750,6 +750,10 @@ pub async fn run(cfg: HubConfig) -> Result<()> {
     // Behind Caddy every connection comes from 127.0.0.1, so no per-address cap.
     let limits = crate::server::Limits { max_conns: 1024, per_ip: 1024, request_timeout: std::time::Duration::from_secs(30) };
     let srv = tokio::spawn(crate::server::serve(listener, router(state), tls, limits, stop_rx));
+    // An update is only kept once the new version gets this far.
+    if let Err(e) = crate::update::report_healthy(&cfg.data_dir, false) {
+        tracing::warn!("writing health report: {e:#}");
+    }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = srv => {},

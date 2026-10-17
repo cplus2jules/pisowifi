@@ -32,6 +32,10 @@ pub fn router(st: Shared) -> Router {
         .route("/password", post(change_password))
         .route("/audit", get(audit))
         .route("/test-coin", post(test_coin))
+        .route("/update", get(update_status))
+        .route("/update/check", post(update_check))
+        .route("/update/install", post(update_install))
+        .route("/update/settings", put(update_settings))
         .route("/logout", post(logout))
         .layer(from_fn_with_state(st.clone(), require_session));
     let api = Router::new()
@@ -444,4 +448,38 @@ async fn test_coin(State(st): State<Shared>, Json(req): Json<TestCoinReq>) -> Ap
     }
     st.engine.test_coin(req.pesos);
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---- software updates ----------------------------------------------------
+
+async fn update_status(State(st): State<Shared>) -> Json<Value> {
+    Json(st.updater.view())
+}
+
+async fn update_check(State(st): State<Shared>) -> Json<Value> {
+    st.updater.check().await;
+    Json(st.updater.view())
+}
+
+/// Starts the download in the background; the card follows it via /update.
+async fn update_install(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<Value>> {
+    st.updater.start_install(&actor(addr), false).map_err(ApiError::bad)?;
+    Ok(Json(st.updater.view()))
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsReq {
+    auto: bool,
+    #[serde(default)]
+    url: String,
+}
+
+async fn update_settings(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<UpdateSettingsReq>,
+) -> ApiResult<Json<Value>> {
+    let url = st.updater.set_settings(req.auto, &req.url).map_err(ApiError::bad)?;
+    st.db.audit(&actor(addr), "update_settings", &format!("install at 3 AM {} · {url}", if req.auto { "on" } else { "off" }));
+    Ok(Json(st.updater.view()))
 }

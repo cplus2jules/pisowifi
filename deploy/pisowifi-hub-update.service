@@ -1,0 +1,23 @@
+[Unit]
+Description=Install a staged Piso Pass hub update, rolling back if it doesn't start
+# Also runs at boot, to finish or undo an update that a power cut interrupted.
+After=pisowifi-hub.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pisowifi hub --hub-config /etc/pisowifi/hub.toml update --run-pending
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=-/usr/local/lib/pisowifi -/usr/local/bin -/etc/systemd/system -/var/lib/pisowifi-update -/var/lib/private/pisowifi-hub
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

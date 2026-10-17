@@ -16,8 +16,10 @@ mod net;
 mod portal;
 mod pwpolicy;
 mod rates;
+mod release;
 mod server;
 mod tls;
+mod update;
 mod wallet;
 
 use anyhow::{bail, Context, Result};
@@ -90,6 +92,86 @@ enum Cmd {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Check for, or install, an update signed with your release key
+    Update(UpdateArgs),
+    /// (scripts/release.sh) Create the release key if missing; print its public half
+    #[command(hide = true)]
+    ReleaseKey {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// (scripts/release.sh) Sign a bundle: writes <bundle>.manifest
+    #[command(hide = true)]
+    ReleaseSign {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+        version: String,
+        #[arg(long, default_value = "0.0.0")]
+        min_from: String,
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+    },
+    /// (scripts/release.sh) Check a signed bundle against a public key file
+    #[command(hide = true)]
+    ReleaseVerify {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        target: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct UpdateArgs {
+    /// Only check whether a newer version is out
+    #[arg(long, conflicts_with = "file")]
+    check: bool,
+    /// Install a downloaded bundle; its .manifest file must be next to it
+    #[arg(long, value_name = "BUNDLE")]
+    file: Option<PathBuf>,
+    /// The bundle's signed manifest, if it isn't next to the bundle
+    #[arg(long, value_name = "FILE", requires = "file")]
+    manifest: Option<PathBuf>,
+    /// Install from the update server [default: the address set in the dashboard]
+    #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = "", conflicts_with = "file")]
+    url: Option<String>,
+    /// Show the installed version and how the last update went (the default)
+    #[arg(long)]
+    status: bool,
+    /// (pisowifi-update.service) Install what's staged, or finish an interrupted update
+    #[arg(long, hide = true)]
+    run_pending: bool,
+    /// (install.sh) Install from an unpacked bundle folder
+    #[arg(long, hide = true, value_name = "DIR")]
+    install_dir: Option<PathBuf>,
+    /// (install.sh) Allow reinstalling the installed version
+    #[arg(long, hide = true)]
+    allow_same: bool,
+}
+
+impl From<UpdateArgs> for update::Args {
+    fn from(a: UpdateArgs) -> Self {
+        update::Args {
+            check: a.check,
+            file: a.file,
+            manifest: a.manifest,
+            url: a.url,
+            run_pending: a.run_pending,
+            install_dir: a.install_dir,
+            allow_same: a.allow_same,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -108,6 +190,8 @@ enum HubCmd {
         #[arg(long)]
         id: String,
     },
+    /// Check for, or install, an update signed with your release key
+    Update(UpdateArgs),
 }
 
 fn main() -> Result<()> {
@@ -124,14 +208,40 @@ fn main() -> Result<()> {
         libc::umask(0o077);
     }
 
-    if let Cmd::Hub { hub_config, cmd } = &cli.cmd {
-        let cfg = match (hub_config, cli.dev) {
-            (Some(path), _) => hub::HubConfig::load(path)?,
-            (None, true) => hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")),
-            (None, false) => hub::HubConfig::load(Path::new("/etc/pisowifi/hub.toml"))?,
-        };
-        return run_hub(cfg, cmd);
-    }
+    let cmd = match cli.cmd {
+        Cmd::Hub { hub_config, cmd } => {
+            let cfg = match (hub_config, cli.dev) {
+                (Some(path), _) => hub::HubConfig::load(&path)?,
+                (None, true) => hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")),
+                (None, false) => hub::HubConfig::load(Path::new("/etc/pisowifi/hub.toml"))?,
+            };
+            return run_hub(cfg, cmd, cli.dev);
+        }
+        Cmd::ReleaseKey { key } => {
+            let k = release::load_or_create_key(&key)?;
+            println!("{}", hex::encode(k.verifying_key().as_bytes()));
+            return Ok(());
+        }
+        Cmd::ReleaseSign { key, bundle, kind, target, version, min_from, notes_file } => {
+            let notes = match notes_file {
+                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?,
+                None => String::new(),
+            };
+            let args = release::SignArgs { kind: release::Kind::parse(&kind)?, target: &target, version: &version, min_from: &min_from, notes: &notes };
+            let out = release::sign_bundle(&release::load_or_create_key(&key)?, &bundle, &args)?;
+            println!("Signed {}", out.display());
+            return Ok(());
+        }
+        Cmd::ReleaseVerify { bundle, public_key, kind, target } => {
+            let key = release::parse_public(&std::fs::read_to_string(&public_key)?)?;
+            let manifest = std::fs::read(release::manifest_path(&bundle))?;
+            let expect = release::Expect { kind: release::Kind::parse(&kind)?, target: &target, current: None, allow_same: false };
+            let m = release::verify(&manifest, &std::fs::read(&bundle)?, Some(&key), &expect)?;
+            println!("OK: {} {} for {}, sha256 {}", bundle.display(), m.version, m.target, m.sha256);
+            return Ok(());
+        }
+        cmd => cmd,
+    };
     let cfg = if cli.dev {
         let n = cli.instance;
         let dir = if n == 0 { "dev-data".to_string() } else { format!("dev-data-{n}") };
@@ -142,12 +252,13 @@ fn main() -> Result<()> {
     } else {
         Config::load(&cli.config)?
     };
-    // Read-only commands (used by preflight.sh) don't create anything.
-    if !matches!(cli.cmd, Cmd::PrintFirewall | Cmd::CoinProbe { .. }) {
+    // Read-only commands (used by preflight.sh) don't create anything; the
+    // update command creates only what it needs (`--check` works unprivileged).
+    if !matches!(cmd, Cmd::PrintFirewall | Cmd::CoinProbe { .. } | Cmd::Update(_)) {
         ensure_data_dir(&cfg.storage.data_dir)?;
     }
 
-    match cli.cmd {
+    match cmd {
         Cmd::Run => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -205,7 +316,15 @@ fn main() -> Result<()> {
             println!("Left the hub. Restart the service.");
             Ok(())
         }
-        Cmd::Hub { .. } => unreachable!(),
+        Cmd::Update(a) => {
+            let p = update::Profile::vendo(&cfg, cli.dev);
+            let configured = || -> Result<String> {
+                let db = open_db(&cfg, cli.dev)?;
+                Ok(db.get_setting(update::URL_KEY)?.filter(|u| !u.is_empty()).unwrap_or_else(|| update::DEFAULT_URL.into()))
+            };
+            update::cli(&p, a.into(), cli.dev, &configured)
+        }
+        Cmd::Hub { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } => unreachable!(),
         Cmd::Restore { from } => {
             let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
             let k = keys::derive(&cfg.storage.data_dir, source, false)?;
@@ -218,9 +337,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_hub(cfg: hub::HubConfig, cmd: &HubCmd) -> Result<()> {
+fn run_hub(cfg: hub::HubConfig, cmd: HubCmd, dev: bool) -> Result<()> {
+    if let HubCmd::Update(a) = cmd {
+        let p = update::Profile::hub(&cfg.data_dir, cfg.listen, dev);
+        return update::cli(&p, a.into(), dev, &|| Ok(update::DEFAULT_URL.to_string()));
+    }
     ensure_data_dir(&cfg.data_dir)?;
-    match cmd {
+    match &cmd {
         HubCmd::Run => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(hub::run(cfg)),
         HubCmd::AddVendo { name } => {
             let name = brand::clean_text(name, 40);
@@ -247,6 +370,7 @@ fn run_hub(cfg: hub::HubConfig, cmd: &HubCmd) -> Result<()> {
             }
             Ok(())
         }
+        HubCmd::Update(_) => unreachable!(),
     }
 }
 
@@ -338,7 +462,10 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
     let admin_l = listen(cfg.admin.listen)?;
     let admin_tls = if dev { None } else { Some(tls::load_or_create(&cfg.storage.data_dir, tls_names(&cfg))?) };
     let enable = gpio::Enable::open(&cfg.coin)?.map(|e| (e, cfg.coin.enable_line.unwrap()));
-    let fw = firewall::Firewall::start(&cfg, dev).await?;
+    // Customers who were online stay online through a restart or an update:
+    // their grants go in together with the new firewall table.
+    let grants: Vec<_> = db.load_clients()?.into_iter().filter(|c| !c.paused).map(|c| (c.mac, c.ip, c.remaining_secs)).collect();
+    let fw = firewall::Firewall::start(&cfg, dev, &grants).await?;
     // In dev mode coins come from the dashboard's test buttons.
     let reader_ok = Arc::new(std::sync::atomic::AtomicBool::new(dev));
     let engine = engine::Engine::new(
@@ -420,7 +547,11 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         }
     }
 
+    let updater = update::Updater::new(update::Profile::vendo(&cfg, dev), dev, db.clone());
+    update::spawn_daily(updater.clone(), engine.clone());
+
     let state = Arc::new(app::AppState {
+        updater,
         lan: cfg.lan_net()?,
         admin_macs: cfg.admin.allow_macs.iter().map(|m| net::Mac::parse(m)).collect::<Result<_>>()?,
         auth: auth::Auth::new(cfg.admin.session_hours),
@@ -453,7 +584,13 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         stop_rx,
     ));
 
+    // An update is only kept once the new version gets this far.
+    if let Err(e) = update::report_healthy(&cfg.storage.data_dir, !dev) {
+        tracing::warn!("writing health report: {e:#}");
+    }
+
     shutdown_signal().await;
+    update::clear_health(&cfg.storage.data_dir);
     tracing::info!("shutting down; saving sessions");
     engine.finish_open_slot();
     engine.persist();
