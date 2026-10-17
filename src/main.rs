@@ -16,8 +16,10 @@ mod net;
 mod portal;
 mod pwpolicy;
 mod rates;
+mod release;
 mod server;
 mod tls;
+mod update;
 mod wallet;
 
 use anyhow::{bail, Context, Result};
@@ -98,6 +100,109 @@ enum Cmd {
         #[arg(long)]
         from: PathBuf,
     },
+    /// Check for, or install, an update signed with your release key
+    Update(UpdateArgs),
+    /// (scripts/make-release-key.sh) New release key: the public half goes to
+    /// FILE, the secret (hex) to stdout, which must not be a terminal
+    #[command(hide = true)]
+    ReleaseKey {
+        #[arg(long, value_name = "FILE")]
+        public_out: PathBuf,
+    },
+    /// (CI) Sign a bundle in place with the secret key from an environment variable
+    #[command(hide = true)]
+    ReleaseSign {
+        #[arg(long, default_value = "PISOWIFI_RELEASE_KEY")]
+        key_env: String,
+        /// Refuse unless the key matches this public key file (release-key.pub)
+        #[arg(long)]
+        expect_public: PathBuf,
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+        version: String,
+        #[arg(long, default_value = "0.0.0")]
+        min_from: String,
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+    },
+    /// Check a signed bundle against a public key file
+    #[command(hide = true)]
+    ReleaseVerify {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        target: String,
+    },
+    /// (CI) Write the signed update list (<out-dir>/<channel>.json and .sig) for signed bundles
+    #[command(hide = true)]
+    ReleaseChannel {
+        #[arg(long, default_value = "PISOWIFI_RELEASE_KEY")]
+        key_env: String,
+        /// Refuse unless the key matches this public key file (release-key.pub)
+        #[arg(long)]
+        expect_public: PathBuf,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(required = true)]
+        bundles: Vec<PathBuf>,
+    },
+}
+
+#[derive(clap::Args)]
+struct UpdateArgs {
+    /// Only check whether a newer version is out
+    #[arg(long, conflicts_with_all = ["file", "install"])]
+    check: bool,
+    /// Download the newest version and install it
+    #[arg(long, conflicts_with = "file")]
+    install: bool,
+    /// (the hub's 3 AM timer) Like --install, quiet when up to date
+    #[arg(long, hide = true, conflicts_with = "file")]
+    auto: bool,
+    /// Install a bundle file instead (it carries its signature), for a box without internet
+    #[arg(long, value_name = "BUNDLE")]
+    file: Option<PathBuf>,
+    /// Use another update list (…/stable.json); on its own it installs from there
+    #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = "", conflicts_with = "file")]
+    url: Option<String>,
+    /// Show the installed version and how the last update went (the default)
+    #[arg(long)]
+    status: bool,
+    /// (pisowifi-update.service) Install what's staged, or finish an interrupted update
+    #[arg(long, hide = true)]
+    run_pending: bool,
+    /// (install.sh) Install from an unpacked bundle folder
+    #[arg(long, hide = true, value_name = "DIR")]
+    install_dir: Option<PathBuf>,
+    /// (install.sh) Allow reinstalling the installed version
+    #[arg(long, hide = true)]
+    allow_same: bool,
+}
+
+impl From<UpdateArgs> for update::Args {
+    fn from(a: UpdateArgs) -> Self {
+        update::Args {
+            check: a.check,
+            install: a.install,
+            auto: a.auto,
+            file: a.file,
+            url: a.url,
+            run_pending: a.run_pending,
+            install_dir: a.install_dir,
+            allow_same: a.allow_same,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -116,6 +221,8 @@ enum HubCmd {
         #[arg(long)]
         id: String,
     },
+    /// Check for, or install, an update signed with your release key
+    Update(UpdateArgs),
 }
 
 fn main() -> Result<()> {
@@ -132,26 +239,77 @@ fn main() -> Result<()> {
         libc::umask(0o077);
     }
 
-    if let Cmd::Hub { hub_config, cmd } = &cli.cmd {
-        let cfg = match (hub_config, cli.dev) {
-            (Some(path), _) => hub::HubConfig::load(path)?,
-            (None, true) => hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")),
-            (None, false) => hub::HubConfig::load(Path::new("/etc/pisowifi/hub.toml"))?,
-        };
-        return run_hub(cfg, cmd);
-    }
-    if let Cmd::AllowMac { mac } = &cli.cmd {
-        if cli.dev {
-            bail!("allow-mac edits the vendo's config file; dev mode doesn't use one");
+    let cmd = match cli.cmd {
+        Cmd::Hub { hub_config, cmd } => {
+            let cfg = match (hub_config, cli.dev) {
+                (Some(path), _) => hub::HubConfig::load(&path)?,
+                (None, true) => hub::HubConfig::dev(std::env::current_dir()?.join("dev-hub")),
+                (None, false) => hub::HubConfig::load(Path::new("/etc/pisowifi/hub.toml"))?,
+            };
+            return run_hub(cfg, cmd, cli.dev);
         }
-        let mac = net::Mac::parse(mac).context("that isn't a WiFi (MAC) address like a4:5e:60:11:22:33")?;
-        if config::add_admin_mac(&cli.config, mac)? {
-            println!("{mac} can open the dashboard once the service restarts:\n  sudo systemctl restart pisowifi");
-        } else {
-            println!("{mac} is already allowed. Still locked out? Check the address on the locked page matches.");
+        Cmd::AllowMac { mac } => {
+            if cli.dev {
+                bail!("allow-mac edits the vendo's config file; dev mode doesn't use one");
+            }
+            let mac = net::Mac::parse(&mac).context("that isn't a WiFi (MAC) address like a4:5e:60:11:22:33")?;
+            if config::add_admin_mac(&cli.config, mac)? {
+                println!("{mac} can open the dashboard once the service restarts:\n  sudo systemctl restart pisowifi");
+            } else {
+                println!("{mac} is already allowed. Still locked out? Check the address on the locked page matches.");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
+        Cmd::ReleaseKey { public_out } => {
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                bail!("this writes the secret key to stdout; pipe it somewhere instead (scripts/make-release-key.sh does)");
+            }
+            let (secret, public) = release::new_key();
+            std::fs::write(&public_out, release::public_file(&public))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&public_out, std::fs::Permissions::from_mode(0o644))?;
+            }
+            print!("{}", secret.as_str());
+            return Ok(());
+        }
+        Cmd::ReleaseSign { key_env, expect_public, bundle, kind, target, version, min_from, notes_file } => {
+            let key = release::key_from_env(&key_env)?;
+            let public = std::fs::read_to_string(&expect_public).with_context(|| format!("reading {}", expect_public.display()))?;
+            if key.verifying_key() != release::parse_public(&public)? {
+                bail!("{key_env} doesn't match {}, so vendos would refuse what it signs. Nothing was signed.", expect_public.display());
+            }
+            let notes = match notes_file {
+                Some(f) => std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?,
+                None => String::new(),
+            };
+            let args = release::SignArgs { kind: release::Kind::parse(&kind)?, target: &target, version: &version, min_from: &min_from, notes: &notes };
+            let sha = release::sign_bundle(&key, &bundle, &args)?;
+            println!("Signed {} (sha256 {sha})", bundle.display());
+            return Ok(());
+        }
+        Cmd::ReleaseChannel { key_env, expect_public, channel, out_dir, bundles } => {
+            let key = release::key_from_env(&key_env)?;
+            let public = std::fs::read_to_string(&expect_public).with_context(|| format!("reading {}", expect_public.display()))?;
+            if key.verifying_key() != release::parse_public(&public)? {
+                bail!("{key_env} doesn't match {}, so vendos would refuse what it signs. Nothing was signed.", expect_public.display());
+            }
+            let c = release::write_channel(&key, &channel, &bundles, &out_dir)?;
+            println!("Wrote {}/{channel}.json for version {} ({} bundles)", out_dir.display(), c.version, c.files.len());
+            return Ok(());
+        }
+        Cmd::ReleaseVerify { bundle, public_key, kind, target } => {
+            let key = release::parse_public(&std::fs::read_to_string(&public_key)?)?;
+            let expect = release::Expect { kind: release::Kind::parse(&kind)?, target: &target, current: None, allow_same: false };
+            let v = release::verify(&std::fs::read(&bundle)?, Some(&key), &expect)?;
+            let m = &v.manifest;
+            println!("OK: {} is version {} for {}, {} signed files", bundle.display(), m.version, m.target, m.files.len());
+            return Ok(());
+        }
+        cmd => cmd,
+    };
     let cfg = if cli.dev {
         let n = cli.instance;
         let dir = if n == 0 { "dev-data".to_string() } else { format!("dev-data-{n}") };
@@ -162,12 +320,13 @@ fn main() -> Result<()> {
     } else {
         Config::load(&cli.config)?
     };
-    // Read-only commands (used by preflight.sh) don't create anything.
-    if !matches!(cli.cmd, Cmd::PrintFirewall | Cmd::CoinProbe { .. }) {
+    // Read-only commands (used by preflight.sh) don't create anything; the
+    // update command creates only what it needs (`--check` works unprivileged).
+    if !matches!(cmd, Cmd::PrintFirewall | Cmd::CoinProbe { .. } | Cmd::Update(_)) {
         ensure_data_dir(&cfg.storage.data_dir)?;
     }
 
-    match cli.cmd {
+    match cmd {
         Cmd::Run => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -225,7 +384,12 @@ fn main() -> Result<()> {
             println!("Left the hub. Restart the service. Phones keep the time they have here; it just stops being a Piso Pass.");
             Ok(())
         }
-        Cmd::Hub { .. } | Cmd::AllowMac { .. } => unreachable!(),
+        Cmd::Update(a) => {
+            let p = update::Profile::vendo(&cfg, cli.dev);
+            let configured = || update::vendo_url(&open_db(&cfg, cli.dev)?);
+            update::cli(&p, a.into(), cli.dev, &configured)
+        }
+        Cmd::Hub { .. } | Cmd::AllowMac { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } | Cmd::ReleaseChannel { .. } => unreachable!(),
         Cmd::Restore { from } => {
             let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
             let k = keys::derive(&cfg.storage.data_dir, source, false)?;
@@ -238,10 +402,14 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_hub(cfg: hub::HubConfig, cmd: &HubCmd) -> Result<()> {
+fn run_hub(cfg: hub::HubConfig, cmd: HubCmd, dev: bool) -> Result<()> {
+    if let HubCmd::Update(a) = cmd {
+        let p = update::Profile::hub(&cfg.data_dir, cfg.listen, dev);
+        return update::cli(&p, a.into(), dev, &|| update::hub_url(cfg.update_url.as_deref(), dev));
+    }
     ensure_data_dir(&cfg.data_dir)?;
-    match cmd {
-        HubCmd::Run => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(hub::run(cfg)),
+    match &cmd {
+        HubCmd::Run => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(hub::run(cfg, dev)),
         HubCmd::AddVendo { name } => {
             let name = brand::clean_text(name, 40);
             let code = hub::HubDb::open(&cfg.data_dir)?.add_enroll_code(&name)?;
@@ -267,6 +435,7 @@ fn run_hub(cfg: hub::HubConfig, cmd: &HubCmd) -> Result<()> {
             }
             Ok(())
         }
+        HubCmd::Update(_) => unreachable!(),
     }
 }
 
@@ -458,7 +627,11 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         }
     }
 
+    let updater = update::Updater::new(update::Profile::vendo(&cfg, dev), dev, db.clone());
+    update::spawn_daily(updater.clone(), engine.clone());
+
     let state = Arc::new(app::AppState {
+        updater,
         lan: cfg.lan_net()?,
         admin_macs: cfg.admin.allow_macs.iter().map(|m| net::Mac::parse(m)).collect::<Result<_>>()?,
         auth: auth::Auth::new(cfg.admin.session_hours),
@@ -502,7 +675,13 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
         stop_rx,
     ));
 
+    // An update is only kept once the new version gets this far.
+    if let Err(e) = update::report_healthy(&cfg.storage.data_dir, !dev) {
+        tracing::warn!("writing health report: {e:#}");
+    }
+
     shutdown_signal().await;
+    update::clear_health(&cfg.storage.data_dir);
     tracing::info!("shutting down; saving sessions");
     engine.finish_open_slot();
     engine.persist();

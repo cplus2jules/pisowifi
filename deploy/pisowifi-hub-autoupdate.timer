@@ -1,0 +1,11 @@
+[Unit]
+Description=Install new Piso Pass hub versions by themselves at about 3 AM
+# Off until you turn it on:
+#   sudo systemctl enable --now pisowifi-hub-autoupdate.timer
+
+[Timer]
+OnCalendar=*-*-* 03:00
+RandomizedDelaySec=45min
+
+[Install]
+WantedBy=timers.target

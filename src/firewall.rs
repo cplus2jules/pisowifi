@@ -8,7 +8,11 @@
 //!   anything on this box besides DHCP, DNS, the portal and the dashboard;
 //! * IPv6 from customers is dropped so it can't be used to bypass the portal;
 //! * unpaid phones get a small DNS allowance (enough to find the portal, too
-//!   little for DNS-tunnel "free internet" apps).
+//!   little for DNS-tunnel "free internet" apps);
+//! * the box's own connections (update checks, the hub) aren't filtered: there
+//!   is no output chain, and replies come back through wan_in's
+//!   established/related rule. None of this opens anything for customers,
+//!   whose traffic only ever passes the forward chain.
 //!
 //! It fails closed: if the daemon dies, the table stays and nobody new gets
 //! online; existing grants expire by themselves via kernel set timeouts.
@@ -548,6 +552,25 @@ mod tests {
         cfg.admin.owner_ssh_from_lan = true;
         let r = base_ruleset(&cfg, &[]).unwrap();
         assert!(r.contains("ether saddr { 00:e0:4c:36:52:91 } tcp dport { 22, 320 } accept"));
+    }
+
+    #[test]
+    fn the_box_can_fetch_updates_but_customers_gain_nothing() {
+        let mut cfg = Config::dev(std::env::temp_dir());
+        cfg.network.lan_iface = "eth1".into();
+        cfg.network.wan_iface = "eth0".into();
+        let r = base_ruleset(&cfg, &[]).unwrap();
+        // Nothing filters what the vendo itself sends (its HTTPS to GitHub)...
+        assert!(!r.contains("hook output"));
+        // ...and the answers come back in on the WAN side.
+        let wan_in = &r[r.find("chain wan_in").unwrap()..];
+        assert!(wan_in[..wan_in.find('}').unwrap()].contains("ct state established,related accept"));
+        // Customers still only pass the forward chain, and only once paid.
+        let fwd = &r[r.find("chain forward").unwrap()..];
+        let fwd = &fwd[..fwd.find('}').unwrap()];
+        assert!(fwd.contains("policy drop"));
+        assert_eq!(fwd.matches("accept").count(), 2, "replies to paid phones, and paid phones: {fwd}");
+        assert!(fwd.contains(r#"iifname "eth1" oifname "eth0" ether saddr . ip saddr @allowed accept"#));
     }
 
     fn mac(s: &str) -> Mac {

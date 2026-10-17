@@ -33,6 +33,14 @@ pub fn router(st: Shared) -> Router {
         .route("/password", post(change_password))
         .route("/audit", get(audit))
         .route("/test-coin", post(test_coin))
+        .route("/update", get(update_status))
+        .route("/update/check", post(update_check))
+        .route("/update/install", post(update_install))
+        .route(
+            "/update/upload",
+            post(update_upload).delete(update_cancel).layer(DefaultBodyLimit::max(crate::update::MAX_UPLOAD_BYTES)),
+        )
+        .route("/update/settings", put(update_settings))
         .route("/logout", post(logout))
         .layer(from_fn_with_state(st.clone(), require_session));
     let api = Router::new()
@@ -490,4 +498,70 @@ async fn test_coin(State(st): State<Shared>, Json(req): Json<TestCoinReq>) -> Ap
     }
     st.engine.test_coin(req.pesos);
     Ok(Json(json!({ "ok": true })))
+}
+
+// ---- software updates ----------------------------------------------------
+
+async fn update_status(State(st): State<Shared>) -> Json<Value> {
+    Json(st.updater.view())
+}
+
+async fn update_check(State(st): State<Shared>) -> Json<Value> {
+    st.updater.clear_error();
+    st.updater.check().await;
+    Json(st.updater.view())
+}
+
+/// The owner's file (for a vendo with no internet): checked now, installed
+/// only after they confirm with Install now.
+async fn update_upload(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: bytes::Bytes) -> ApiResult<Json<Value>> {
+    let u = st.updater.clone();
+    let checked = tokio::task::spawn_blocking(move || u.upload(&body)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    match checked {
+        Ok(m) => st.db.audit(&actor(addr), "update_uploaded", &format!("version {}", m.version)),
+        Err(msg) => {
+            st.db.audit(&actor(addr), "update_refused", &msg);
+            return Err(ApiError::bad(msg));
+        }
+    }
+    Ok(Json(st.updater.view()))
+}
+
+async fn update_cancel(State(st): State<Shared>) -> Json<Value> {
+    st.updater.cancel_upload();
+    Json(st.updater.view())
+}
+
+/// The uploaded file, or (with online checks on) the newest version online;
+/// the card follows the progress via /update.
+async fn update_install(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<Value>> {
+    st.updater.start_install(&actor(addr), false).map_err(ApiError::bad)?;
+    Ok(Json(st.updater.view()))
+}
+
+#[derive(Deserialize)]
+struct UpdateSettingsReq {
+    online: bool,
+    auto: bool,
+    /// Another update list address; empty means the default one.
+    #[serde(default)]
+    url: String,
+}
+
+async fn update_settings(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<UpdateSettingsReq>,
+) -> ApiResult<Json<Value>> {
+    st.updater.set_settings(req.online, req.auto, &req.url).map_err(ApiError::bad)?;
+    let detail = match st.updater.url() {
+        Some(u) => format!("online checks at {u}; install at 3 AM {}", if st.updater.auto() { "on" } else { "off" }),
+        None => "online checks off".into(),
+    };
+    st.db.audit(&actor(addr), "update_settings", &detail);
+    if req.online {
+        let u = st.updater.clone();
+        tokio::spawn(async move { u.check().await });
+    }
+    Ok(Json(st.updater.view()))
 }

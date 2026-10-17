@@ -9,6 +9,10 @@ data_dir = "/var/lib/pisowifi-hub"
 # tls_cert = "/etc/letsencrypt/live/hub.example.com/fullchain.pem"
 # tls_key  = "/etc/letsencrypt/live/hub.example.com/privkey.pem"
 
+# Updates: the hub checks the signed update list every day and logs when a new
+# version is out (install it with: sudo pisowifi hub update --install).
+# update_url = ""   # turns the daily check off; leave it out for the usual list
+
 # ---- Wallet passes (optional) --------------------------------------------------
 # "Add to Google Wallet" / "Add to Apple Wallet" buttons for Piso Passes.
 # Off unless configured; each wallet is on only when all of its lines are set.

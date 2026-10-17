@@ -386,6 +386,61 @@
             <dt>Certificate</dt><dd><code id="fp">—</code></dd>
           </dl>
         </div>
+        <div class="card wide" id="upd-card">
+          <div class="card-head">
+            <div><h2>Update</h2><p class="sub">New versions come over the internet. Only updates signed with your release key are accepted, and a version that doesn't start is undone by itself.</p></div>
+            <span class="status used" id="upd-status">—</span>
+          </div>
+          <dl class="facts">
+            <dt>This vendo</dt><dd id="upd-current">—</dd>
+            <dt id="upd-last-label" hidden>Last update</dt><dd id="upd-last" hidden></dd>
+          </dl>
+          <div class="card-body">
+            <div class="upd-notes" id="upd-notes" hidden>
+              <h3 id="upd-notes-title"></h3>
+              <p id="upd-notes-text"></p>
+            </div>
+            <p class="upd-msg" id="upd-msg" hidden></p>
+            <div class="row" id="upd-ready-row" hidden>
+              <button class="btn outline" type="button" id="upd-cancel">Cancel</button>
+              <span class="grow"></span>
+              <button class="btn primary" type="button" id="upd-install">Install now</button>
+            </div>
+            <div class="row" id="upd-check-row">
+              <button class="btn outline" type="button" id="upd-check">Check now</button>
+              <span class="sub" id="upd-latest"></span>
+            </div>
+            <details class="upd-more" id="upd-upload">
+              <summary>No internet here? Upload the update file</summary>
+              <div class="upd-online">
+                <p class="sub">Download <code>pisowifi-armv7.tar.gz</code> from the newest version folder at <code>github.com/cplus2jules/pisowifi-releases</code>, then choose it here. It's checked before anything changes.</p>
+                <div class="row" id="upd-pick-row">
+                  <label class="btn outline file-btn" id="upd-pick">Choose update file<input type="file" id="upd-file" accept=".gz,application/gzip,application/x-gzip"></label>
+                </div>
+              </div>
+            </details>
+            <details class="upd-more">
+              <summary>Update settings</summary>
+              <form class="upd-online" id="upd-url-form">
+                <label class="switch-row">
+                  <input type="checkbox" class="switch" id="upd-online">
+                  <span>Check for new versions online<small>A few minutes after the vendo starts, then about once a day. Customers never get this access.</small></span>
+                </label>
+                <label class="switch-row">
+                  <input type="checkbox" class="switch" id="upd-auto">
+                  <span>Install new versions by itself at 3 AM<small>Waits if someone is putting in coins. Customers stay online.</small></span>
+                </label>
+                <label class="upd-url-label">Update list address
+                  <span class="row">
+                    <input type="url" id="upd-url" maxlength="300" placeholder="The usual one" aria-label="Update list address">
+                    <button class="btn outline" type="submit">Save</button>
+                  </span>
+                  <small class="sub">Leave empty for the usual one: <code id="upd-default"></code></small>
+                </label>
+              </form>
+            </details>
+          </div>
+        </div>
         <form class="card wide" id="pw-form">
           <div class="card-head"><div><h2>Change password</h2><p class="sub">Use 4+ random words or 14+ random characters, used nowhere else (never the old LPB password). Changing it signs out every device.</p></div></div>
           <div class="card-body">

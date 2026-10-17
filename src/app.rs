@@ -27,6 +27,7 @@ pub struct AppState {
     pub lan: (Ipv4Addr, u8),
     pub admin_macs: Vec<Mac>,
     pub fingerprint: String,
+    pub updater: Arc<crate::update::Updater>,
 }
 
 pub type Shared = Arc<AppState>;

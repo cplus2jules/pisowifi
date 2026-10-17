@@ -38,6 +38,7 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 | Slowloris / connection floods | Connection caps, 10 s header timeout, 4–16 KB body limits, one Argon2 hash at a time. |
 | Ledger tampering | All SQL uses bound parameters. Voucher codes are stored hashed (shown once). Test coins exist only in dev mode. Every owner action goes to the audit log. |
 | Compromised service | The systemd unit drops all capabilities except networking, the filesystem is read-only except `/var/lib/pisowifi`, and only GPIO devices are allowed. |
+| Fake or tampered update | A vendo installs only files signed with your release key (Ed25519; the secret lives in GitHub, the public half is compiled in). The signed update list pins each file's size and SHA-256, and each bundle's own signature covers every file inside it, the board and the version. Versions only go up, and an update list older than one already seen is ignored. Downloads are HTTPS only, with size caps and timeouts. A new version that doesn't come up healthy within 90 s is undone, data included. See [Updating](#updating). |
 
 **Known limits** (true of every open-WiFi vendo, LPB included):
 - **MAC cloning.** Someone who sniffs a paying phone's MAC and clones it can share that phone's time. Binding MAC+IP means both devices then fight and break, and a customer's time only moves to a new IP that dnsmasq actually leased to that MAC (anything else is refused and logged as a possible MAC clone). A clone that also copies the IP still gets through; fully preventing this needs WPA2 per-user keys.
@@ -50,11 +51,9 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 **0. Back up the SD card first** (balenaEtcher "clone", or `dd`). That's
 your guaranteed way back to LPB.
 
-**1. Build on the Mac:**
-
-```bash
-./scripts/build-pi.sh
-```
+**1. Get the bundle:** `pisowifi-armv7.tar.gz` from the newest `v…` folder
+at [pisowifi-releases](https://github.com/cplus2jules/pisowifi-releases) (see
+[Updating](#updating)), or build it on the Mac with `./scripts/build-pi.sh`.
 
 **2. Copy to the Pi.** Connect your computer to the **modem's** network (not
 the Piso WiFi), find the Pi's IP on the modem's device list, then:
@@ -176,6 +175,143 @@ the database stays locked to whichever key opened it first, and a kernel
 that can no longer read the chip ID stops the service with a clear message
 rather than starting an empty database.
 
+## Updating
+
+You develop on the Mac and push to GitHub as usual. When a version is ready,
+you tag it: GitHub tests it, builds it, signs it and publishes it, and every
+vendo with internet offers it the same day. An ordinary push ships nothing.
+
+- **`cplus2jules/pisowifi`** (private) holds the code. Each release is also
+  kept here as a GitHub Release, for your records.
+- **`cplus2jules/pisowifi-releases`** (public) holds only the signed update
+  files that vendos and the hub download: the newest three versions and the
+  signed update list, `channels/stable.json`.
+
+A vendo installs only what's signed with your release key, whose secret half
+lives only in GitHub and in your Mac's Keychain. It never goes back to an
+older version. It ignores an update list older than one it has already seen,
+so an old list can't be replayed to hide a newer version. It undoes an update
+that doesn't start. Customers stay online throughout.
+
+### Once: set up the keys
+
+You need the GitHub CLI signed in as the owner (`brew install gh`, `gh auth login`).
+
+```bash
+scripts/make-release-key.sh
+git add release-key.pub
+git commit -m "Add the release signing key"
+git push
+```
+
+The script sets up two keys:
+1. **The release signing key** (Ed25519). The secret becomes the GitHub
+   secret `PISOWIFI_RELEASE_KEY`, with a backup in your login Keychain named
+   `pisowifi-release-key`. The public half goes to `release-key.pub`, which
+   every build compiles in. The secret is never shown or written to disk.
+2. **A deploy key** that lets the release workflow push to
+   `pisowifi-releases`, and nothing else. It's the GitHub secret
+   `RELEASES_DEPLOY_KEY`, and its public half is on `pisowifi-releases` with
+   write access.
+
+Vendos installed before this, including the one running the test layout now,
+don't know the key yet. Give each one the first release over SSH, once
+(below). After that they update by themselves.
+
+### Every release
+
+1. Raise `version` in `Cargo.toml` (say to `0.2.0`), commit and push.
+2. Tag it. The tag's message is the release notes owners see before installing:
+
+   ```bash
+   git tag -a v0.2.0 -m "Coins are counted faster."
+   git push origin v0.2.0
+   ```
+
+That's all. Actions → Release shows the progress. GitHub runs the tests,
+builds the vendo (`pisowifi-armv7.tar.gz`) and hub
+(`pisowifi-hub-x86_64.tar.gz`) bundles, signs them, writes the signed update
+list, and pushes all of it to `pisowifi-releases` as one fresh commit, so that
+repository stays small. You can also start a release from Actions → Release →
+Run workflow (on `main`) and type the notes there. Only you can push tags or
+start workflows, so nothing is released without you.
+
+### On a vendo
+
+**With internet:** the vendo looks at the update list a few minutes after it
+starts and about once a day after that. Dashboard → Settings → **Update**
+then says *Update available*, with the notes. Tap *Install now*. To have new
+versions install by themselves, turn on *Install new versions by itself at
+3 AM* under *Update settings*; it's off unless you turn it on, and it waits if
+someone is putting in coins. *Check now* looks right away.
+
+The vendo itself fetches the files over HTTPS from
+`raw.githubusercontent.com`. Customers gain no access from this: the firewall
+filters only their traffic, and that is unchanged. *Update settings* can also
+turn online checks off or point the vendo at another update list.
+
+**Without internet** (like the test layout now): download
+`pisowifi-armv7.tar.gz` from the newest `v…` folder at
+[github.com/cplus2jules/pisowifi-releases](https://github.com/cplus2jules/pisowifi-releases),
+then Settings → Update → *No internet here? Upload the update file*. It gets
+the same checks, shows the version and notes, and installs when you tap
+*Install now*.
+
+**The first time on an older vendo** (one installed before the updater):
+
+```bash
+scp pisowifi-armv7.tar.gz root@10.0.0.1:/root/
+ssh -t root@10.0.0.1 'cd /root && tar xzf pisowifi-armv7.tar.gz && cd pisowifi && ./install.sh'
+```
+
+When the settings and database are already there, `install.sh` only
+upgrades: no password, MAC or coin-probe questions, just a confirmation.
+
+**What happens during an install:**
+- The old version stops. Customers who are online stay online (the firewall
+  keeps their access while the service restarts); coins can't go in for the
+  ten seconds or so it takes.
+- The data folder (the encrypted database, salt and keys) and the unit files
+  are copied, then `/usr/local/lib/pisowifi/current` is switched to the new
+  version in one step. `previous` keeps the old one.
+- The new version has 90 seconds to report healthy (firewall loaded, portal
+  and dashboard answering) and must then stay up. If it doesn't, the old
+  binary, units and data are put back and started, and the dashboard says
+  what happened. Settings, sales and customers' time are as they were when the
+  update started.
+- A power cut halfway is finished or undone at the next boot.
+- Sign in to the dashboard again afterwards.
+
+From a shell: `sudo pisowifi update` shows the installed version, how the last
+update went, and whether a newer one is out. `--install` downloads and
+installs it, and `--file pisowifi-armv7.tar.gz` installs a file.
+`journalctl -u pisowifi-update` has the details.
+
+### The hub
+
+The hub checks the same update list every day and writes in its log
+(`journalctl -u pisowifi-hub`) when a new version is out. Install it with
+`sudo pisowifi hub update --install`: same checks, same rollback, and the
+vendos keep working on their own for the minute it takes. To have it install
+new versions by itself at about 3 AM:
+`sudo systemctl enable --now pisowifi-hub-autoupdate.timer`. Without
+internet, use `sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz`, or
+`./install-hub.sh` from the unpacked bundle.
+
+### If a key is lost
+
+- **The signing key is gone from GitHub only:** put it back from the Keychain:
+  `security find-generic-password -s pisowifi-release-key -w | gh secret set PISOWIFI_RELEASE_KEY --repo cplus2jules/pisowifi`
+- **The signing key is gone everywhere:** run
+  `scripts/make-release-key.sh --replace`, commit the new `release-key.pub` and
+  make a release. Vendos still trust the old key, so they refuse the new
+  release until each one has been upgraded once over SSH with `./install.sh`
+  (it keeps everything). Keep your Mac backed up so this never happens.
+- **The deploy key is lost or leaked:** run
+  `scripts/make-release-key.sh --deploy-key`. Vendos don't depend on it: it
+  can only change files in `pisowifi-releases`, and vendos refuse anything
+  that isn't signed with your release key.
+
 ## Develop on the Mac
 
 ```bash
@@ -194,8 +330,15 @@ wrong-key rejection, one-time vouchers, backup round-trip, Argon2, session
 binding, lockout, rate math, ARP and lease parsing, the firewall rules and
 their self-repair, coins surviving a power cut, the MAC-clone check, the
 dashboard lock, Piso Pass (transfers between two vendos against a real hub
-over HTTP, syncs crossing claims, lease caps, pruning, offline vendos) and
-wallet passes (JWT claims, .pkpass manifest and signature, single-use links).
+over HTTP, syncs crossing claims, lease caps, pruning, offline vendos),
+wallet passes (JWT claims, .pkpass manifest and signature, single-use links)
+and updates: good, unsigned, foreign-signed, tampered, wrong-board and older
+bundles; the signed update list (changed, foreign-signed, replayed, paths
+that leave the server); a download from a local web server that fetches only
+its own board's file and refuses a changed or oversized one; a rehearsal on
+the Mac in which a broken release damages the database and is rolled back
+(binary, units and data); and one cut off by a power failure and undone at
+"boot".
 
 To try wallet passes locally, write a hub config whose `[wallet]` section
 points at the throwaway keys in `testdata/wallet/` and run
@@ -257,10 +400,10 @@ switched off.
 ### Set up the hub (once)
 
 1. **Get a server and a domain.** Any small Linux VPS works (1 vCPU / 512 MB is plenty). Point a DNS name such as `hub.yourstore.ph` at it.
-2. **Install the hub.** Build with `./scripts/build-pi.sh` (it also makes `dist/pisowifi-hub-x86_64.tar.gz`), copy that bundle to the server, then:
+2. **Install the hub.** Copy `pisowifi-hub-x86_64.tar.gz` from the newest release (or `./scripts/build-pi.sh`'s `dist/`) to the server, then:
 
    ```bash
-   sudo install -m 0755 pisowifi /usr/local/bin/ && sudo mkdir -p /etc/pisowifi && sudo cp hub.example.toml /etc/pisowifi/hub.toml && sudo cp pisowifi-hub.service /etc/systemd/system/ && sudo systemctl enable --now pisowifi-hub
+   tar xzf pisowifi-hub-x86_64.tar.gz && cd pisowifi-hub && sudo ./install-hub.sh
    ```
 
 3. **Turn on HTTPS.** Install Caddy, put your domain in `Caddyfile`, and copy it to `/etc/caddy/Caddyfile`. Caddy gets the certificate automatically.
@@ -453,4 +596,6 @@ wallet.
 | `web/wallet/` | Wallet pass images (drawn from `web/shared/icon.svg`) |
 | `testdata/wallet/` | Throwaway keys and certificates for the wallet tests |
 | `deploy/` | install/uninstall scripts, systemd unit, dnsmasq config, sample config |
-| `scripts/build-pi.sh` | Cross-compile and bundle for the Orange Pi |
+| `scripts/build-pi.sh` | Cross-compile and bundle for the Orange Pi (unsigned) |
+| `scripts/make-release-key.sh` | One-time setup of the release signing key and the deploy key |
+| `.github/workflows/release.yml` | Builds, signs and publishes a release to `pisowifi-releases` when you push a `v*` tag |
