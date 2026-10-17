@@ -102,17 +102,21 @@ enum Cmd {
     },
     /// Check for, or install, an update signed with your release key
     Update(UpdateArgs),
-    /// (scripts/release.sh) Create the release key if missing; print its public half
+    /// (scripts/make-release-key.sh) New release key: the public half goes to
+    /// FILE, the secret (hex) to stdout, which must not be a terminal
     #[command(hide = true)]
     ReleaseKey {
-        #[arg(long)]
-        key: PathBuf,
+        #[arg(long, value_name = "FILE")]
+        public_out: PathBuf,
     },
-    /// (scripts/release.sh) Sign a bundle: writes <bundle>.manifest
+    /// (CI) Sign a bundle in place with the secret key from an environment variable
     #[command(hide = true)]
     ReleaseSign {
+        #[arg(long, default_value = "PISOWIFI_RELEASE_KEY")]
+        key_env: String,
+        /// Refuse unless the key matches this public key file (release-key.pub)
         #[arg(long)]
-        key: PathBuf,
+        expect_public: PathBuf,
         #[arg(long)]
         bundle: PathBuf,
         #[arg(long)]
@@ -126,7 +130,7 @@ enum Cmd {
         #[arg(long)]
         notes_file: Option<PathBuf>,
     },
-    /// (scripts/release.sh) Check a signed bundle against a public key file
+    /// Check a signed bundle against a public key file
     #[command(hide = true)]
     ReleaseVerify {
         #[arg(long)]
@@ -145,13 +149,10 @@ struct UpdateArgs {
     /// Only check whether a newer version is out
     #[arg(long, conflicts_with = "file")]
     check: bool,
-    /// Install a downloaded bundle; its .manifest file must be next to it
+    /// Install a bundle downloaded from the GitHub release (it carries its signature)
     #[arg(long, value_name = "BUNDLE")]
     file: Option<PathBuf>,
-    /// The bundle's signed manifest, if it isn't next to the bundle
-    #[arg(long, value_name = "FILE", requires = "file")]
-    manifest: Option<PathBuf>,
-    /// Install from the update server [default: the address set in the dashboard]
+    /// Install from an update server [default: the address set in the dashboard; none until you set one]
     #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = "", conflicts_with = "file")]
     url: Option<String>,
     /// Show the installed version and how the last update went (the default)
@@ -173,7 +174,6 @@ impl From<UpdateArgs> for update::Args {
         update::Args {
             check: a.check,
             file: a.file,
-            manifest: a.manifest,
             url: a.url,
             run_pending: a.run_pending,
             install_dir: a.install_dir,
@@ -237,27 +237,42 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Cmd::ReleaseKey { key } => {
-            let k = release::load_or_create_key(&key)?;
-            println!("{}", hex::encode(k.verifying_key().as_bytes()));
+        Cmd::ReleaseKey { public_out } => {
+            use std::io::IsTerminal;
+            if std::io::stdout().is_terminal() {
+                bail!("this writes the secret key to stdout; pipe it somewhere instead (scripts/make-release-key.sh does)");
+            }
+            let (secret, public) = release::new_key();
+            std::fs::write(&public_out, release::public_file(&public))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&public_out, std::fs::Permissions::from_mode(0o644))?;
+            }
+            print!("{}", secret.as_str());
             return Ok(());
         }
-        Cmd::ReleaseSign { key, bundle, kind, target, version, min_from, notes_file } => {
+        Cmd::ReleaseSign { key_env, expect_public, bundle, kind, target, version, min_from, notes_file } => {
+            let key = release::key_from_env(&key_env)?;
+            let public = std::fs::read_to_string(&expect_public).with_context(|| format!("reading {}", expect_public.display()))?;
+            if key.verifying_key() != release::parse_public(&public)? {
+                bail!("{key_env} doesn't match {}, so vendos would refuse what it signs. Nothing was signed.", expect_public.display());
+            }
             let notes = match notes_file {
                 Some(f) => std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?,
                 None => String::new(),
             };
             let args = release::SignArgs { kind: release::Kind::parse(&kind)?, target: &target, version: &version, min_from: &min_from, notes: &notes };
-            let out = release::sign_bundle(&release::load_or_create_key(&key)?, &bundle, &args)?;
-            println!("Signed {}", out.display());
+            let sha = release::sign_bundle(&key, &bundle, &args)?;
+            println!("Signed {} (sha256 {sha})", bundle.display());
             return Ok(());
         }
         Cmd::ReleaseVerify { bundle, public_key, kind, target } => {
             let key = release::parse_public(&std::fs::read_to_string(&public_key)?)?;
-            let manifest = std::fs::read(release::manifest_path(&bundle))?;
             let expect = release::Expect { kind: release::Kind::parse(&kind)?, target: &target, current: None, allow_same: false };
-            let m = release::verify(&manifest, &std::fs::read(&bundle)?, Some(&key), &expect)?;
-            println!("OK: {} {} for {}, sha256 {}", bundle.display(), m.version, m.target, m.sha256);
+            let v = release::verify(&std::fs::read(&bundle)?, Some(&key), &expect)?;
+            let m = &v.manifest;
+            println!("OK: {} is version {} for {}, {} signed files", bundle.display(), m.version, m.target, m.files.len());
             return Ok(());
         }
         cmd => cmd,
@@ -338,9 +353,9 @@ fn main() -> Result<()> {
         }
         Cmd::Update(a) => {
             let p = update::Profile::vendo(&cfg, cli.dev);
-            let configured = || -> Result<String> {
+            let configured = || -> Result<Option<String>> {
                 let db = open_db(&cfg, cli.dev)?;
-                Ok(db.get_setting(update::URL_KEY)?.filter(|u| !u.is_empty()).unwrap_or_else(|| update::DEFAULT_URL.into()))
+                Ok(db.get_setting(update::URL_KEY)?.filter(|u| !u.is_empty()))
             };
             update::cli(&p, a.into(), cli.dev, &configured)
         }
@@ -360,7 +375,7 @@ fn main() -> Result<()> {
 fn run_hub(cfg: hub::HubConfig, cmd: HubCmd, dev: bool) -> Result<()> {
     if let HubCmd::Update(a) = cmd {
         let p = update::Profile::hub(&cfg.data_dir, cfg.listen, dev);
-        return update::cli(&p, a.into(), dev, &|| Ok(update::DEFAULT_URL.to_string()));
+        return update::cli(&p, a.into(), dev, &|| Ok(None));
     }
     ensure_data_dir(&cfg.data_dir)?;
     match &cmd {

@@ -800,14 +800,13 @@ $("pw-form").addEventListener("submit", (ev) => {
   });
 });
 
-// ---- software updates -------------------------------------------------------
+// ---- update -----------------------------------------------------------------
 
 let upd = null;
 let updTimer = null;
 let updRestarting = false;
 const UPD_ACTIVE = ["installing", "trial", "rolling_back"];
 
-const mb = (bytes) => (bytes / 1e6).toFixed(1) + " MB";
 const day = (ts) => new Date(ts * 1000).toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" });
 
 async function loadUpdate() {
@@ -823,68 +822,105 @@ async function loadUpdate() {
   if (currentTab === "settings" && active) updTimer = setTimeout(loadUpdate, 2000);
 }
 
-function renderUpdate() {
-  const u = upd, st = u.state, av = u.available;
+function renderUpdate(note, noteBad) {
+  const u = upd, st = u.state;
+  // An uploaded file comes first; a newer version online second.
+  const offer = u.ready || u.available;
   updRestarting = u.busy === "waiting" || !!(st && UPD_ACTIVE.includes(st.phase));
   const working = !!u.busy || updRestarting;
 
   $("upd-current").textContent = "Version " + u.current;
-  let latest;
-  if (!u.signed) latest = "Updates are off: this copy was built without a release key.";
-  else if (av) latest = "Version " + av.version + " · " + mb(av.size) + " · signed " + day(av.created);
-  else if (u.check_error) latest = "Couldn't check: " + u.check_error;
-  else if (u.last_check) latest = "You have the newest version (checked " + when(u.last_check) + ")";
-  else latest = "Not checked yet";
-  $("upd-latest").textContent = latest;
-  $("upd-latest").classList.toggle("muted", !av);
+  let last = "";
+  if (st && st.phase === "done") last = "Updated to " + st.to + " on " + day(st.at) + ".";
+  else if (st && (st.phase === "rolled_back" || st.phase === "failed")) last = day(st.at) + ": " + st.message;
+  $("upd-last").textContent = last;
+  $("upd-last").hidden = $("upd-last-label").hidden = !last || updRestarting;
 
   let pill = "Up to date", cls = "used";
   if (!u.signed) pill = "Off";
   else if (u.busy === "checking") { pill = "Checking"; cls = "off"; }
   else if (u.busy === "downloading") { pill = "Downloading"; cls = "off"; }
   else if (updRestarting) { pill = "Installing"; cls = "off"; }
-  else if (av) { pill = "Update ready"; cls = "on"; }
-  else if (!u.last_check || u.check_error) pill = "Not checked";
+  else if (offer) { pill = "Ready to install"; cls = "on"; }
   $("upd-status").textContent = pill;
   $("upd-status").className = "status " + cls;
 
-  $("upd-notes").hidden = !(av && av.notes);
-  if (av) {
-    $("upd-notes-title").textContent = "What's new in " + av.version;
-    $("upd-notes-text").textContent = av.notes;
+  $("upd-notes").hidden = !offer || working;
+  if (offer) {
+    $("upd-notes-title").textContent = u.ready
+      ? "Version " + offer.version + " checks out. Signed " + day(offer.created) + "."
+      : "Version " + offer.version + " is out. Signed " + day(offer.created) + ".";
+    $("upd-notes-text").textContent = offer.notes || "No notes for this version.";
   }
 
-  let msg = "", bad = false;
-  if (u.error) { msg = u.error; bad = true; }
-  else if (u.busy === "downloading") msg = "Downloading and checking version " + (av ? av.version : "") + "…";
-  else if (updRestarting) msg = "Installing. Customers stay online. The dashboard is back in about a minute; you'll need to sign in again.";
-  else if (st && st.phase === "done") msg = "Updated to version " + st.to + " on " + day(st.at) + ".";
-  else if (st && (st.phase === "rolled_back" || st.phase === "failed")) msg = "Last update (" + day(st.at) + "): " + st.message;
+  let msg = note || "", bad = !!noteBad;
+  if (!msg) {
+    if (!u.signed) msg = "Updates are off: this copy was built without a release key. Reinstall it once from a bundle on the GitHub release page.";
+    else if (u.error) { msg = u.error; bad = true; }
+    else if (u.busy === "checking") msg = "Checking…";
+    else if (u.busy === "downloading") msg = "Downloading and checking version " + (u.available ? u.available.version : "") + "…";
+    else if (updRestarting) msg = "Installing. Customers stay online. The dashboard is back in about a minute; you'll need to sign in again.";
+  }
   $("upd-msg").textContent = msg;
   $("upd-msg").hidden = !msg;
   $("upd-msg").classList.toggle("bad", bad);
 
-  $("upd-install").hidden = !av || !u.signed;
-  $("upd-install").disabled = working;
-  $("upd-check").disabled = working || !u.signed;
-  $("upd-auto").checked = u.auto;
-  $("upd-auto").disabled = !u.signed;
+  $("upd-pick-row").hidden = !u.signed || !!offer || working;
+  $("upd-ready-row").hidden = !offer || working;
+  $("upd-cancel").hidden = !u.ready;
+
+  $("upd-example").textContent = u.example_url;
   if (document.activeElement !== $("upd-url")) $("upd-url").value = u.url;
+  $("upd-auto").checked = u.auto;
+  $("upd-auto").disabled = !u.online;
+  $("upd-check").disabled = !u.online || working || !u.signed;
+  let latest = "";
+  if (!u.online) latest = "Online checks are off.";
+  else if (u.check_error) latest = "Couldn't check: " + u.check_error;
+  else if (u.last_check) latest = (u.available ? "Version " + u.available.version + " is out" : "You have the newest version") + " (checked " + when(u.last_check) + ").";
+  $("upd-latest").textContent = latest;
 }
 
-$("upd-check").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
-  $("upd-status").textContent = "Checking";
-  $("upd-status").className = "status off";
-  upd = await api("POST", "/update/check");
+$("upd-file").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = "";
+  if (!file) return;
+  if (file.size > 16 * 1024 * 1024) {
+    renderUpdate("That file is too big to be a Piso WiFi update.", true);
+    return;
+  }
+  const pick = $("upd-pick");
+  pick.classList.add("busy");
+  renderUpdate("Checking " + file.name + "…");
+  try {
+    const res = await fetch("/api/update/upload", {
+      method: "POST",
+      headers: { "x-pisowifi": "1", "x-csrf-token": csrf, "content-type": "application/octet-stream" },
+      body: file,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) return showLogin();
+    if (!res.ok) throw new Error(data.error || "Upload failed (" + res.status + ")");
+    upd = data;
+    renderUpdate();
+  } catch (e) {
+    renderUpdate(e.message, true);
+  } finally {
+    pick.classList.remove("busy");
+  }
+});
+
+$("upd-cancel").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
+  upd = await api("DELETE", "/update/upload");
   renderUpdate();
-  toast(upd.available ? "Version " + upd.available.version + " is ready to install"
-    : upd.check_error ? "Couldn't check right now" : "You have the newest version");
 }));
 
 $("upd-install").addEventListener("click", (ev) => {
-  const av = upd && upd.available;
-  if (!av) return;
-  if (!confirm("Install version " + av.version + " now?\n\nCustomers stay online. The dashboard restarts, so you'll sign in again. " +
+  const offer = upd && (upd.ready || upd.available);
+  if (!offer) return;
+  if (!confirm("Install version " + offer.version + " now?\n\nCustomers stay online. The dashboard restarts, so you'll sign in again. " +
     "If the new version doesn't start, this one is put back by itself.")) return;
   busy(ev.currentTarget, async () => {
     upd = await api("POST", "/update/install");
@@ -893,13 +929,18 @@ $("upd-install").addEventListener("click", (ev) => {
   });
 });
 
+$("upd-check").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
+  upd = await api("POST", "/update/check");
+  renderUpdate();
+}));
+
 const saveUpdateSettings = () => api("PUT", "/update/settings", { auto: $("upd-auto").checked, url: $("upd-url").value.trim() });
 
 $("upd-auto").addEventListener("change", async (ev) => {
   try {
     upd = await saveUpdateSettings();
     renderUpdate();
-    toast(upd.auto ? "Updates will install by themselves at 3 AM" : "Automatic updates are off");
+    toast(upd.auto ? "New versions will install by themselves at 3 AM" : "Automatic installs are off");
   } catch (e) {
     ev.target.checked = !ev.target.checked;
     toast(e.message, true);
@@ -911,7 +952,7 @@ $("upd-url-form").addEventListener("submit", (ev) => {
   busy(ev.submitter, async () => {
     upd = await saveUpdateSettings();
     renderUpdate();
-    toast("Saved. Tap Check now to look for updates there.");
+    toast(upd.online ? "Saved. Tap Check now to look there." : "Online checks are off");
   });
 });
 

@@ -36,6 +36,10 @@ pub fn router(st: Shared) -> Router {
         .route("/update", get(update_status))
         .route("/update/check", post(update_check))
         .route("/update/install", post(update_install))
+        .route(
+            "/update/upload",
+            post(update_upload).delete(update_cancel).layer(DefaultBodyLimit::max(crate::update::MAX_UPLOAD_BYTES)),
+        )
         .route("/update/settings", put(update_settings))
         .route("/logout", post(logout))
         .layer(from_fn_with_state(st.clone(), require_session));
@@ -507,7 +511,28 @@ async fn update_check(State(st): State<Shared>) -> Json<Value> {
     Json(st.updater.view())
 }
 
-/// Starts the download in the background; the card follows it via /update.
+/// The owner's file from the GitHub release: checked now, installed only
+/// after they confirm with Install now.
+async fn update_upload(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: bytes::Bytes) -> ApiResult<Json<Value>> {
+    let u = st.updater.clone();
+    let checked = tokio::task::spawn_blocking(move || u.upload(&body)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    match checked {
+        Ok(m) => st.db.audit(&actor(addr), "update_uploaded", &format!("version {}", m.version)),
+        Err(msg) => {
+            st.db.audit(&actor(addr), "update_refused", &msg);
+            return Err(ApiError::bad(msg));
+        }
+    }
+    Ok(Json(st.updater.view()))
+}
+
+async fn update_cancel(State(st): State<Shared>) -> Json<Value> {
+    st.updater.cancel_upload();
+    Json(st.updater.view())
+}
+
+/// The uploaded file, or (with online checks on) the newest version online;
+/// the card follows the progress via /update.
 async fn update_install(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>) -> ApiResult<Json<Value>> {
     st.updater.start_install(&actor(addr), false).map_err(ApiError::bad)?;
     Ok(Json(st.updater.view()))
@@ -526,6 +551,10 @@ async fn update_settings(
     Json(req): Json<UpdateSettingsReq>,
 ) -> ApiResult<Json<Value>> {
     let url = st.updater.set_settings(req.auto, &req.url).map_err(ApiError::bad)?;
-    st.db.audit(&actor(addr), "update_settings", &format!("install at 3 AM {} · {url}", if req.auto { "on" } else { "off" }));
+    let detail = match &url {
+        Some(u) => format!("online checks at {u}; install at 3 AM {}", if req.auto { "on" } else { "off" }),
+        None => "online checks off".into(),
+    };
+    st.db.audit(&actor(addr), "update_settings", &detail);
     Ok(Json(st.updater.view()))
 }

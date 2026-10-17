@@ -1,30 +1,37 @@
 //! Signed releases.
 //!
-//! The owner's Mac signs a small manifest for each bundle with an Ed25519
-//! key that never leaves it (scripts/release.sh). Every vendo and hub has
-//! the public half compiled in and refuses anything that doesn't verify:
+//! GitHub CI builds every release and signs it with an Ed25519 key kept as
+//! a repository secret (scripts/make-release-key.sh makes it, with a backup
+//! in the owner's Mac Keychain). Every vendo and hub has the public half
+//! compiled in (release-key.pub) and refuses anything that doesn't verify.
 //!
-//! * only the owner can publish an update: whoever controls the download
-//!   server, DNS or the GitHub account can serve files, but can't sign them;
-//! * the manifest pins the bundle's SHA-256 and size, the product (vendo or
-//!   hub) and the target board, so a valid signature can't be reused for a
-//!   different file or the wrong machine;
-//! * versions only go up: an older signed release (say, one with a known
-//!   bug) can't be replayed to downgrade a box.
+//! The signature travels inside the bundle: release-manifest.json lists the
+//! SHA-256 of every file next to it, plus the product, board, version and
+//! notes, and is signed. The one file on the release page is all an owner
+//! needs to upload, and
+//! * only the owner can publish an update: whoever gets hold of the file,
+//!   the download server or the network can change it, but can't sign it;
+//! * every file is pinned, and nothing unsigned can ride along;
+//! * a signature can't be reused for the other product or another board;
+//! * versions only go up, so an older signed release (one with a known bug,
+//!   say) can't be replayed to downgrade a box.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Domain separation: these signatures can't be confused with any other use of the key.
-const CONTEXT: &[u8] = b"pisowifi release manifest v1\n";
+const CONTEXT: &[u8] = b"pisowifi release manifest v2\n";
+pub const MANIFEST_NAME: &str = "release-manifest.json";
 pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 pub const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
-/// Unpacked size cap (a bundle is ~6 MB; this only stops a runaway gzip stream).
+/// Unpacked size cap (a bundle is a few MB; this only stops a runaway gzip stream).
 const MAX_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_NOTES_CHARS: usize = 4000;
 
@@ -54,7 +61,7 @@ impl Kind {
         }
     }
 
-    /// Files taken from a bundle; everything else in it (installer scripts,
+    /// Files an update installs; the rest of a bundle (installer scripts,
     /// examples) is only for first installs.
     pub fn files(self) -> &'static [&'static str] {
         match self {
@@ -73,7 +80,8 @@ pub fn asset_name(kind: Kind, target: &str) -> String {
     }
 }
 
-/// The signed manifest sits next to its bundle: <bundle>.manifest
+/// The manifest is also published next to its bundle (<bundle>.manifest),
+/// so an online check can see what's new without downloading everything.
 pub fn manifest_path(bundle: &Path) -> PathBuf {
     let mut s = bundle.as_os_str().to_owned();
     s.push(".manifest");
@@ -89,11 +97,10 @@ pub struct Version(pub u32, pub u32, pub u32);
 
 impl Version {
     pub fn parse(s: &str) -> Result<Version> {
-        let parts: Vec<&str> = s.trim().split('.').collect();
         let num = |p: &str| -> Option<u32> {
             (!p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse().ok()).flatten()
         };
-        match parts.as_slice() {
+        match s.trim().split('.').collect::<Vec<_>>().as_slice() {
             [a, b, c] => match (num(a), num(b), num(c)) {
                 (Some(a), Some(b), Some(c)) => Ok(Version(a, b, c)),
                 _ => bail!("\"{s}\" is not a version like 1.2.3"),
@@ -122,20 +129,17 @@ pub struct Manifest {
     pub kind: Kind,
     pub version: String,
     pub target: String,
-    /// Bundle file name (informational; the checksum is what counts).
-    pub file: String,
-    pub size: u64,
-    /// SHA-256 of the bundle, hex.
-    pub sha256: String,
     /// Boxes older than this must install an intermediate release first.
     pub min_from_version: String,
     #[serde(default)]
     pub notes: String,
     /// Unix time it was signed.
     pub created: i64,
+    /// SHA-256 (hex) of every file in the bundle, by name.
+    pub files: BTreeMap<String, String>,
 }
 
-/// What goes in the .manifest file.
+/// What release-manifest.json (and <bundle>.manifest) holds.
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     /// The manifest JSON exactly as signed. Kept as text so nothing is
@@ -155,7 +159,7 @@ fn signed_message(manifest: &str) -> Vec<u8> {
     [CONTEXT, manifest.as_bytes()].concat()
 }
 
-/// Signs a manifest; returns the .manifest file contents.
+/// Signs a manifest; returns the file contents.
 pub fn sign(key: &SigningKey, m: &Manifest) -> Result<String> {
     let text = serde_json::to_string(m)?;
     let sig = key.sign(&signed_message(&text));
@@ -174,13 +178,9 @@ pub fn open(file: &[u8], key: &VerifyingKey) -> Result<Manifest> {
         .ok()
         .and_then(|b| <[u8; 64]>::try_from(b).ok())
         .map(|b| Signature::from_bytes(&b));
-    let ok = sig.is_some_and(|s| key.verify_strict(&signed_message(&env.manifest), &s).is_ok());
-    if !ok {
-        bail!(
-            "This update isn't signed with your release key (signed by {}, expected {}). Nothing was changed.",
-            if env.key_id.len() == 16 && env.key_id.bytes().all(|b| b.is_ascii_hexdigit()) { &env.key_id } else { "unknown" },
-            key_id(key)
-        );
+    if !sig.is_some_and(|s| key.verify_strict(&signed_message(&env.manifest), &s).is_ok()) {
+        let by = if env.key_id.len() == 16 && env.key_id.bytes().all(|b| b.is_ascii_hexdigit()) { env.key_id.as_str() } else { "unknown" };
+        bail!("This update isn't signed with your release key (signed by {by}, expected {}). Nothing was changed.", key_id(key));
     }
     serde_json::from_str(&env.manifest).context("signed manifest doesn't parse")
 }
@@ -189,7 +189,7 @@ pub fn open(file: &[u8], key: &VerifyingKey) -> Result<Manifest> {
 pub struct Expect<'a> {
     pub kind: Kind,
     pub target: &'a str,
-    /// Installed version; `None` on a box with nothing installed yet.
+    /// Installed version; `None` when it doesn't matter (signing, checking a file).
     pub current: Option<Version>,
     /// Let the same version be installed again (only `install.sh`, run by root).
     pub allow_same: bool,
@@ -219,84 +219,119 @@ pub fn check(m: &Manifest, e: &Expect) -> Result<Version> {
     if m.notes.chars().count() > MAX_NOTES_CHARS {
         bail!("The release notes are too long.");
     }
-    if m.sha256.len() != 64 || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("The update's checksum is malformed.");
+    if !m.files.contains_key("pisowifi") {
+        bail!("The update has no pisowifi program in it.");
     }
-    if m.size == 0 || m.size > MAX_BUNDLE_BYTES {
-        bail!("The update's size is out of range.");
+    for (name, sha) in &m.files {
+        if !plain_name(name) || name == MANIFEST_NAME || sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("The update's file list is malformed.");
+        }
     }
     Ok(v)
 }
 
-/// The bundle must be exactly the file that was signed.
-pub fn check_bundle(m: &Manifest, bundle: &[u8]) -> Result<()> {
-    let digest = hex::encode(Sha256::digest(bundle));
-    if bundle.len() as u64 != m.size || !digest.eq_ignore_ascii_case(&m.sha256) {
-        bail!("The update file doesn't match its signed checksum (damaged or tampered with). Nothing was changed.");
+fn plain_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 100 && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+// ---- bundles ---------------------------------------------------------------------
+
+struct Entry {
+    name: String,
+    mode: u32,
+    mtime: u64,
+    data: Vec<u8>,
+}
+
+/// A bundle read into memory: one top folder of plain files. Anything else
+/// (links, devices, sub-folders, paths that climb out) is refused.
+struct Archive {
+    top: String,
+    entries: Vec<Entry>,
+}
+
+fn read_archive(bundle: &[u8]) -> Result<Archive> {
+    let damaged = || anyhow::anyhow!("This isn't a Piso WiFi update file (or it's damaged).");
+    if bundle.len() as u64 > MAX_BUNDLE_BYTES {
+        bail!("The update file is too large.");
     }
-    Ok(())
-}
-
-/// Everything at once: signature, product, board, version, checksum.
-pub fn verify(manifest: &[u8], bundle: &[u8], key: Option<&VerifyingKey>, e: &Expect) -> Result<Manifest> {
-    let key = key.ok_or_else(no_key_error)?;
-    let m = open(manifest, key)?;
-    check(&m, e)?;
-    check_bundle(&m, bundle)?;
-    Ok(m)
-}
-
-pub fn no_key_error() -> anyhow::Error {
-    anyhow::anyhow!("This copy was built without a release key, so it can't install updates. Reinstall from a bundle made with scripts/release.sh.")
-}
-
-/// The owner's release key, compiled in from release-key.pub.
-pub fn trusted_key() -> Option<VerifyingKey> {
-    parse_public(env!("PISOWIFI_RELEASE_PUBKEY")).ok()
-}
-
-pub fn parse_public(hex_key: &str) -> Result<VerifyingKey> {
-    let line = hex_key.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
-    let bytes: [u8; 32] = hex::decode(line).ok().and_then(|b| b.try_into().ok()).context("not a 64-character hex key")?;
-    VerifyingKey::from_bytes(&bytes).context("not a valid Ed25519 public key")
-}
-
-// ---- unpacking ---------------------------------------------------------------------
-
-/// Unpacks the allowed files of a (verified) bundle into `dest`. Only plain
-/// files directly under the bundle's top folder are taken: no links, no
-/// paths that climb out, nothing not on the list.
-pub fn unpack(bundle: &[u8], kind: Kind, dest: &Path) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(bundle).take(MAX_UNPACKED_BYTES);
     let mut tar = tar::Archive::new(gz);
-    let wanted = kind.files();
-    let mut seen = Vec::new();
-    for entry in tar.entries().context("reading the bundle")? {
-        let mut entry = entry.context("reading the bundle")?;
-        let path = entry.path().context("bad path in bundle")?.into_owned();
-        let parts: Vec<&str> = path.iter().map(|p| p.to_str().unwrap_or("\0")).filter(|p| *p != ".").collect();
-        let [top, name] = parts.as_slice() else { continue };
-        if !matches!(*top, "pisowifi" | "pisowifi-hub") || !wanted.contains(name) {
-            continue;
+    let mut top: Option<String> = None;
+    let mut entries: Vec<Entry> = Vec::new();
+    for entry in tar.entries().map_err(|_| damaged())? {
+        let mut entry = entry.map_err(|_| damaged())?;
+        let path = entry.path().map_err(|_| damaged())?.into_owned();
+        let mut parts = Vec::new();
+        for c in path.components() {
+            match c {
+                Component::Normal(p) => parts.push(p.to_str().ok_or_else(damaged)?.to_string()),
+                Component::CurDir => {}
+                _ => bail!("The update file has an unsafe path in it ({}).", path.display()),
+            }
         }
-        if !entry.header().entry_type().is_file() {
-            bail!("{name} in the bundle is not a plain file");
+        let kind = entry.header().entry_type();
+        let (dir, name) = match parts.as_slice() {
+            [dir] if kind.is_dir() => (dir.clone(), None),
+            [dir, name] if kind.is_file() && plain_name(name) => (dir.clone(), Some(name.clone())),
+            _ => bail!("The update file contains something it shouldn't ({}).", path.display()),
+        };
+        if !matches!(dir.as_str(), "pisowifi" | "pisowifi-hub") || top.as_ref().is_some_and(|t| *t != dir) {
+            bail!("The update file contains something it shouldn't ({}).", path.display());
         }
-        if seen.contains(&name.to_string()) {
-            bail!("{name} appears twice in the bundle");
+        top = Some(dir);
+        let Some(name) = name else { continue };
+        if entries.iter().any(|e| e.name == name) {
+            bail!("{name} appears twice in the update file.");
         }
+        let (mode, mtime) = (entry.header().mode().unwrap_or(0o644), entry.header().mtime().unwrap_or(0));
         let mut data = Vec::new();
-        entry.read_to_end(&mut data)?;
-        write_file(&dest.join(name), &data, if *name == "pisowifi" { 0o755 } else { 0o644 })?;
-        seen.push(name.to_string());
+        entry.read_to_end(&mut data).map_err(|_| damaged())?;
+        entries.push(Entry { name, mode, mtime, data });
     }
-    if !seen.iter().any(|n| n == "pisowifi") {
-        bail!("the bundle has no pisowifi binary");
-    }
-    Ok(())
+    Ok(Archive { top: top.ok_or_else(damaged)?, entries })
 }
 
-/// Same, from an unpacked bundle folder (install.sh's upgrade mode).
+/// A bundle whose signature and files all checked out.
+pub struct Verified {
+    pub manifest: Manifest,
+    entries: Vec<Entry>,
+}
+
+/// Everything at once: signature, product, board, version, every file.
+pub fn verify(bundle: &[u8], key: Option<&VerifyingKey>, e: &Expect) -> Result<Verified> {
+    let key = key.ok_or_else(no_key_error)?;
+    let archive = read_archive(bundle)?;
+    let (signed, entries): (Vec<_>, Vec<_>) = archive.entries.into_iter().partition(|e| e.name == MANIFEST_NAME);
+    let Some(signed) = signed.into_iter().next() else {
+        bail!("This file isn't signed. Use the bundle from the GitHub release page.");
+    };
+    let m = open(&signed.data, key)?;
+    check(&m, e)?;
+    let mismatch = || anyhow::anyhow!("The update file doesn't match what was signed (damaged or tampered with). Nothing was changed.");
+    if entries.len() != m.files.len() {
+        return Err(mismatch());
+    }
+    for entry in &entries {
+        let want = m.files.get(&entry.name).ok_or_else(mismatch)?;
+        if !hex::encode(Sha256::digest(&entry.data)).eq_ignore_ascii_case(want) {
+            return Err(mismatch());
+        }
+    }
+    Ok(Verified { manifest: m, entries })
+}
+
+impl Verified {
+    /// Writes the files an update installs into `dest`.
+    pub fn unpack(&self, kind: Kind, dest: &Path) -> Result<()> {
+        for e in self.entries.iter().filter(|e| kind.files().contains(&e.name.as_str())) {
+            write_file(&dest.join(&e.name), &e.data, if e.name == "pisowifi" { 0o755 } else { 0o644 })?;
+        }
+        Ok(())
+    }
+}
+
+/// The installable files of an unpacked bundle folder (install.sh's upgrade mode).
 pub fn copy_dir(src: &Path, kind: Kind, dest: &Path) -> Result<()> {
     for name in kind.files() {
         let from = src.join(name);
@@ -323,8 +358,6 @@ pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
-    #[cfg(not(unix))]
-    let _ = mode;
     let mut f = opts.open(path).with_context(|| format!("creating {}", path.display()))?;
     // Exactly `mode`, whatever the umask (the hub's service user must be
     // able to run the binary).
@@ -333,36 +366,46 @@ pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     f.write_all(data)?;
     f.sync_all()?;
     Ok(())
 }
 
-// ---- the owner's side ------------------------------------------------------------
+pub fn no_key_error() -> anyhow::Error {
+    anyhow::anyhow!("This copy was built without a release key, so it can't install updates. Reinstall it from a bundle on the GitHub release page.")
+}
 
-/// Loads the release key, creating it (mode 0600) the first time.
-pub fn load_or_create_key(path: &Path) -> Result<SigningKey> {
-    if let Some(dir) = path.parent() {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            }
-        }
-    }
-    #[cfg(unix)]
-    if path.exists() {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            bail!("{} can be read by other users (mode {:o}); run: chmod 600 {}", path.display(), mode & 0o777, path.display());
-        }
-    }
-    let raw = crate::keys::read_or_create_secret(path)?;
-    let seed: [u8; 32] = raw[..].try_into().context("release key")?;
+/// The owner's release key, compiled in from release-key.pub.
+pub fn trusted_key() -> Option<VerifyingKey> {
+    parse_public(env!("PISOWIFI_RELEASE_PUBKEY")).ok()
+}
+
+pub fn parse_public(text: &str) -> Result<VerifyingKey> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
+    let bytes: [u8; 32] = hex::decode(line).ok().and_then(|b| b.try_into().ok()).context("not a 64-character hex key")?;
+    VerifyingKey::from_bytes(&bytes).context("not a valid Ed25519 public key")
+}
+
+// ---- signing (CI, and the one-time key setup) ---------------------------------------
+
+/// A new release key: (secret as hex, public as hex).
+pub fn new_key() -> (Zeroizing<String>, String) {
+    let k = SigningKey::generate(&mut rand::rngs::OsRng);
+    (Zeroizing::new(hex::encode(k.to_bytes())), hex::encode(k.verifying_key().as_bytes()))
+}
+
+/// The secret release key from an environment variable (a CI secret), hex.
+pub fn key_from_env(name: &str) -> Result<SigningKey> {
+    let text = Zeroizing::new(std::env::var(name).map_err(|_| anyhow::anyhow!("{name} isn't set"))?);
+    let mut seed = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(text.trim(), &mut seed[..]).map_err(|_| anyhow::anyhow!("{name} must be 64 hex characters"))?;
     Ok(SigningKey::from_bytes(&seed))
+}
+
+pub fn public_file(public_hex: &str) -> String {
+    format!("# Piso WiFi release key (Ed25519, public half). Vendos and hubs built\n# with this file only install updates signed by the matching secret key.\n{public_hex}\n")
 }
 
 pub struct SignArgs<'a> {
@@ -373,26 +416,64 @@ pub struct SignArgs<'a> {
     pub notes: &'a str,
 }
 
-/// Writes <bundle>.manifest for `bundle`.
-pub fn sign_bundle(key: &SigningKey, bundle: &Path, a: &SignArgs) -> Result<PathBuf> {
-    let data = std::fs::read(bundle).with_context(|| format!("reading {}", bundle.display()))?;
+/// Signs a bundle in place: release-manifest.json goes inside it, a copy is
+/// written to <bundle>.manifest, and <bundle>.sha256 is refreshed if present.
+/// Returns the signed bundle's SHA-256.
+pub fn sign_bundle(key: &SigningKey, bundle: &Path, a: &SignArgs) -> Result<String> {
+    let archive = read_archive(&std::fs::read(bundle).with_context(|| format!("reading {}", bundle.display()))?)?;
+    // An older signature goes; so do macOS resource-fork files.
+    let entries: Vec<Entry> = archive.entries.into_iter().filter(|e| e.name != MANIFEST_NAME && !e.name.starts_with("._")).collect();
     let m = Manifest {
         product: "pisowifi".into(),
         kind: a.kind,
         version: Version::parse(a.version)?.to_string(),
         target: a.target.into(),
-        file: bundle.file_name().and_then(|n| n.to_str()).unwrap_or_default().into(),
-        size: data.len() as u64,
-        sha256: hex::encode(Sha256::digest(&data)),
         min_from_version: Version::parse(a.min_from)?.to_string(),
         notes: a.notes.trim().into(),
         created: chrono::Utc::now().timestamp(),
+        files: entries.iter().map(|e| (e.name.clone(), hex::encode(Sha256::digest(&e.data)))).collect(),
     };
-    // Same checks a box makes, so a bad manifest is caught here, not in the field.
+    // The same checks a box makes, so a bad release fails here, not in the field.
     check(&m, &Expect { kind: a.kind, target: a.target, current: None, allow_same: false })?;
-    let out = manifest_path(bundle);
-    std::fs::write(&out, sign(key, &m)?)?;
-    Ok(out)
+    let signed = sign(key, &m)?;
+    let mtime = entries.iter().map(|e| e.mtime).max().unwrap_or(0);
+    let mut all = entries;
+    all.push(Entry { name: MANIFEST_NAME.into(), mode: 0o644, mtime, data: signed.clone().into_bytes() });
+    let out = build_archive(&archive.top, &all, mtime)?;
+    let tmp = bundle.with_extension("signing");
+    std::fs::write(&tmp, &out)?;
+    std::fs::rename(&tmp, bundle)?;
+    std::fs::write(manifest_path(bundle), &signed)?;
+    let sha = hex::encode(Sha256::digest(&out));
+    let mut sum = bundle.as_os_str().to_owned();
+    sum.push(".sha256");
+    let sum = PathBuf::from(sum);
+    if sum.exists() {
+        let name = bundle.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        std::fs::write(&sum, format!("{sha}  {name}\n"))?;
+    }
+    // Belt and braces: what was written must verify.
+    verify(&out, Some(&key.verifying_key()), &Expect { kind: a.kind, target: a.target, current: None, allow_same: false })?;
+    Ok(sha)
+}
+
+fn build_archive(top: &str, entries: &[Entry], mtime: u64) -> Result<Vec<u8>> {
+    let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best()));
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Directory);
+    h.set_mode(0o755);
+    h.set_size(0);
+    h.set_mtime(mtime);
+    b.append_data(&mut h, format!("{top}/"), std::io::empty())?;
+    for e in entries {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(e.mode & 0o777);
+        h.set_size(e.data.len() as u64);
+        h.set_mtime(e.mtime);
+        b.append_data(&mut h, format!("{top}/{}", e.name), &e.data[..])?;
+    }
+    Ok(b.into_inner()?.finish()?)
 }
 
 #[cfg(test)]
@@ -405,40 +486,48 @@ pub mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    /// A gzipped tar shaped like build-pi.sh's output.
+    /// An unsigned bundle shaped like build-pi.sh's output.
     pub fn bundle_with(top: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
-        for (name, data) in files {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_mode(0o755);
-            h.set_cksum();
-            b.append_data(&mut h, format!("{top}/{name}"), *data).unwrap();
-        }
-        b.into_inner().unwrap().finish().unwrap()
+        let entries: Vec<Entry> = files.iter().map(|(n, d)| Entry { name: n.to_string(), mode: 0o755, mtime: 1, data: d.to_vec() }).collect();
+        build_archive(top, &entries, 1).unwrap()
     }
 
-    pub fn manifest_for(bundle: &[u8], kind: Kind, target: &str, version: &str, min_from: &str) -> Manifest {
-        Manifest {
-            product: "pisowifi".into(),
-            kind,
-            version: version.into(),
-            target: target.into(),
-            file: asset_name(kind, target),
-            size: bundle.len() as u64,
-            sha256: hex::encode(Sha256::digest(bundle)),
-            min_from_version: min_from.into(),
-            notes: "Faster coin counting.".into(),
-            created: 1_760_000_000,
-        }
+    /// A bundle signed the way CI signs it.
+    pub fn signed_bundle(key: &SigningKey, kind: Kind, target: &str, version: &str, min_from: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!("pisowifi-sign-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(asset_name(kind, target));
+        let top = if kind == Kind::Hub { "pisowifi-hub" } else { "pisowifi" };
+        std::fs::write(&path, bundle_with(top, files)).unwrap();
+        let args = SignArgs { kind, target, version, min_from, notes: "Faster coin counting." };
+        sign_bundle(key, &path, &args).unwrap();
+        let out = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Re-packs a signed bundle with `f` applied to its entries (to tamper).
+    fn repack(bundle: &[u8], f: impl FnOnce(&mut Vec<Entry>)) -> Vec<u8> {
+        let mut a = read_archive(bundle).unwrap();
+        f(&mut a.entries);
+        build_archive(&a.top, &a.entries, 1).unwrap()
     }
 
     fn expect(current: &str) -> Expect<'static> {
         Expect { kind: Kind::Vendo, target: TARGET_ARM, current: Some(Version::parse(current).unwrap()), allow_same: false }
     }
 
-    fn signed(key: &SigningKey, m: &Manifest) -> Vec<u8> {
-        sign(key, m).unwrap().into_bytes()
+    const BIN: &[u8] = b"new binary";
+
+    fn good(key: &SigningKey, version: &str) -> Vec<u8> {
+        signed_bundle(key, Kind::Vendo, TARGET_ARM, version, "0.1.0", &[("pisowifi", BIN), ("pisowifi.service", b"[Unit]"), ("install.sh", b"#!/bin/sh")])
+    }
+
+    fn err(r: Result<Verified>) -> String {
+        match r {
+            Ok(_) => panic!("accepted"),
+            Err(e) => e.to_string(),
+        }
     }
 
     #[test]
@@ -452,106 +541,18 @@ pub mod tests {
     }
 
     #[test]
-    fn a_good_bundle_verifies() {
+    fn a_good_bundle_verifies_and_unpacks_only_installable_files() {
         let key = test_key(1);
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"new binary")]);
-        let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, "0.2.0", "0.1.0");
-        let got = verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap();
-        assert_eq!(got, m);
-    }
-
-    #[test]
-    fn a_bundle_signed_by_another_key_is_refused() {
-        let (owner, attacker) = (test_key(1), test_key(2));
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"evil")]);
-        let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, "9.0.0", "0.0.0");
-        let e = verify(&signed(&attacker, &m), &bundle, Some(&owner.verifying_key()), &expect("0.1.0")).unwrap_err();
-        assert!(e.to_string().contains("isn't signed with your release key"), "{e}");
-        // Garbage, an empty signature, or no key compiled in: refused too.
-        assert!(verify(b"not json", &bundle, Some(&owner.verifying_key()), &expect("0.1.0")).is_err());
-        let mut env: serde_json::Value = serde_json::from_slice(&signed(&owner, &m)).unwrap();
-        env["signature"] = "".into();
-        assert!(verify(env.to_string().as_bytes(), &bundle, Some(&owner.verifying_key()), &expect("0.1.0")).is_err());
-        assert!(verify(&signed(&owner, &m), &bundle, None, &expect("0.1.0")).is_err());
-    }
-
-    #[test]
-    fn tampering_with_the_manifest_or_the_bundle_is_caught() {
-        let key = test_key(1);
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"new binary")]);
-        let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, "0.2.0", "0.1.0");
-        let good = signed(&key, &m);
-
-        // Edit a signed field (the version) without re-signing.
-        let mut env: serde_json::Value = serde_json::from_slice(&good).unwrap();
-        env["manifest"] = env["manifest"].as_str().unwrap().replace("0.2.0", "0.3.0").into();
-        let e = verify(env.to_string().as_bytes(), &bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap_err();
-        assert!(e.to_string().contains("isn't signed"), "{e}");
-
-        // Swap the bundle for another file.
-        let other = bundle_with("pisowifi", &[("pisowifi", b"backdoored binary")]);
-        let e = verify(&good, &other, Some(&key.verifying_key()), &expect("0.1.0")).unwrap_err();
-        assert!(e.to_string().contains("doesn't match its signed checksum"), "{e}");
-
-        // Flip one byte, keep the length.
-        let mut flipped = bundle.clone();
-        let mid = flipped.len() / 2;
-        flipped[mid] ^= 1;
-        assert!(verify(&good, &flipped, Some(&key.verifying_key()), &expect("0.1.0")).is_err());
-    }
-
-    #[test]
-    fn the_wrong_board_or_product_is_refused() {
-        let key = test_key(1);
-        let bundle = bundle_with("pisowifi-hub", &[("pisowifi", b"x86 binary")]);
-        let m = manifest_for(&bundle, Kind::Vendo, "x86_64-unknown-linux-musl", "0.2.0", "0.1.0");
-        let e = verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap_err();
-        assert!(e.to_string().contains("different kind of board"), "{e}");
-
-        let m = manifest_for(&bundle, Kind::Hub, TARGET_ARM, "0.2.0", "0.1.0");
-        let e = verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap_err();
-        assert!(e.to_string().contains("for the hub, not a vendo"), "{e}");
-    }
-
-    #[test]
-    fn older_or_same_versions_are_refused() {
-        let key = test_key(1);
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"old binary")]);
-        for (v, current) in [("0.1.0", "0.2.0"), ("0.2.0", "0.2.0"), ("0.9.0", "0.10.0")] {
-            let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, v, "0.0.0");
-            let e = verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect(current)).unwrap_err();
-            assert!(e.to_string().contains("not newer"), "{v} over {current}: {e}");
-        }
-        // install.sh may reinstall the same version, never an older one.
-        let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, "0.2.0", "0.0.0");
-        let same = Expect { allow_same: true, ..expect("0.2.0") };
-        assert!(verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &same).is_ok());
-        let older = Expect { allow_same: true, ..expect("0.3.0") };
-        assert!(verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &older).is_err());
-    }
-
-    #[test]
-    fn a_too_old_box_must_step_through_min_from_version() {
-        let key = test_key(1);
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"bin")]);
-        let m = manifest_for(&bundle, Kind::Vendo, TARGET_ARM, "0.5.0", "0.3.0");
-        let e = verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect("0.2.0")).unwrap_err();
-        assert!(e.to_string().contains("Install version 0.3.0 first"), "{e}");
-        assert!(verify(&signed(&key, &m), &bundle, Some(&key.verifying_key()), &expect("0.3.0")).is_ok());
-    }
-
-    #[test]
-    fn unpacking_takes_only_listed_plain_files() {
+        let v = verify(&good(&key, "0.2.0"), Some(&key.verifying_key()), &expect("0.1.0")).unwrap();
+        assert_eq!(v.manifest.version, "0.2.0");
+        assert_eq!(v.manifest.files.keys().collect::<Vec<_>>(), ["install.sh", "pisowifi", "pisowifi.service"]);
         let dir = std::env::temp_dir().join(format!("pisowifi-unpack-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
-        let bundle = bundle_with(
-            "pisowifi",
-            &[("pisowifi", b"bin"), ("pisowifi.service", b"[Unit]"), ("install.sh", b"#!/bin/sh"), ("config.example.toml", b"x")],
-        );
-        unpack(&bundle, Kind::Vendo, &dir).unwrap();
+        v.unpack(Kind::Vendo, &dir).unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
         assert_eq!(names, ["pisowifi", "pisowifi.service"]);
+        assert_eq!(std::fs::read(dir.join("pisowifi")).unwrap(), BIN);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -559,41 +560,129 @@ pub mod tests {
             assert_eq!(std::fs::metadata(dir.join("pisowifi.service")).unwrap().permissions().mode() & 0o777, 0o644);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // A symlink posing as the binary, or no binary at all, is refused.
-        std::fs::create_dir_all(&dir).unwrap();
+    #[test]
+    fn an_unsigned_or_foreign_signed_bundle_is_refused() {
+        let (owner, attacker) = (test_key(1), test_key(2));
+        let unsigned = bundle_with("pisowifi", &[("pisowifi", b"evil")]);
+        assert!(err(verify(&unsigned, Some(&owner.verifying_key()), &expect("0.1.0"))).contains("isn't signed"));
+        let foreign = good(&attacker, "9.0.0");
+        assert!(err(verify(&foreign, Some(&owner.verifying_key()), &expect("0.1.0"))).contains("isn't signed with your release key"));
+        assert!(err(verify(&good(&owner, "0.2.0"), None, &expect("0.1.0"))).contains("without a release key"));
+        assert!(err(verify(b"not a bundle", Some(&owner.verifying_key()), &expect("0.1.0"))).contains("isn't a Piso WiFi update"));
+    }
+
+    #[test]
+    fn tampering_with_any_file_or_the_manifest_is_caught() {
+        let key = test_key(1);
+        let pk = key.verifying_key();
+        let bundle = good(&key, "0.2.0");
+        let swapped = repack(&bundle, |es| es.iter_mut().find(|e| e.name == "pisowifi").unwrap().data = b"backdoor".to_vec());
+        assert!(err(verify(&swapped, Some(&pk), &expect("0.1.0"))).contains("doesn't match what was signed"));
+        let scripted = repack(&bundle, |es| es.iter_mut().find(|e| e.name == "install.sh").unwrap().data.push(b'!'));
+        assert!(err(verify(&scripted, Some(&pk), &expect("0.1.0"))).contains("doesn't match"));
+        let extra = repack(&bundle, |es| es.push(Entry { name: "extra.sh".into(), mode: 0o755, mtime: 1, data: b"x".to_vec() }));
+        assert!(err(verify(&extra, Some(&pk), &expect("0.1.0"))).contains("doesn't match"));
+        let missing = repack(&bundle, |es| es.retain(|e| e.name != "pisowifi.service"));
+        assert!(err(verify(&missing, Some(&pk), &expect("0.1.0"))).contains("doesn't match"));
+        // Raise the version inside the signed manifest without re-signing.
+        let bumped = repack(&bundle, |es| {
+            let m = es.iter_mut().find(|e| e.name == MANIFEST_NAME).unwrap();
+            m.data = String::from_utf8(m.data.clone()).unwrap().replace("0.2.0", "0.3.0").into_bytes();
+        });
+        assert!(err(verify(&bumped, Some(&pk), &expect("0.1.0"))).contains("isn't signed with your release key"));
+        // Flip a byte of the compressed file.
+        let mut flipped = bundle.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 1;
+        assert!(verify(&flipped, Some(&pk), &expect("0.1.0")).is_err());
+    }
+
+    #[test]
+    fn links_and_odd_paths_are_refused() {
+        let key = test_key(1);
         let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Symlink);
         h.set_size(0);
         b.append_link(&mut h, "pisowifi/pisowifi", "/bin/sh").unwrap();
         let linky = b.into_inner().unwrap().finish().unwrap();
-        assert!(unpack(&linky, Kind::Vendo, &dir).is_err());
-        assert!(unpack(&bundle_with("pisowifi", &[("README.md", b"hi")]), Kind::Vendo, &dir).is_err());
+        assert!(err(verify(&linky, Some(&key.verifying_key()), &expect("0.1.0"))).contains("shouldn't"));
+        for path in ["pisowifi/sub/pisowifi", "other/pisowifi", "pisowifi"] {
+            let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_mode(0o644);
+            b.append_data(&mut h, path, &b"x"[..]).unwrap();
+            let odd = b.into_inner().unwrap().finish().unwrap();
+            assert!(err(verify(&odd, Some(&key.verifying_key()), &expect("0.1.0"))).contains("shouldn't"), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_wrong_board_or_product_is_refused() {
+        let key = test_key(1);
+        let x86 = signed_bundle(&key, Kind::Vendo, "x86_64-unknown-linux-musl", "0.2.0", "0.1.0", &[("pisowifi", BIN)]);
+        assert!(err(verify(&x86, Some(&key.verifying_key()), &expect("0.1.0"))).contains("different kind of board"));
+        let hub = signed_bundle(&key, Kind::Hub, TARGET_ARM, "0.2.0", "0.1.0", &[("pisowifi", BIN)]);
+        assert!(err(verify(&hub, Some(&key.verifying_key()), &expect("0.1.0"))).contains("for the hub, not a vendo"));
+    }
+
+    #[test]
+    fn older_or_same_versions_are_refused() {
+        let key = test_key(1);
+        for (v, current) in [("0.1.0", "0.2.0"), ("0.2.0", "0.2.0"), ("0.9.0", "0.10.0")] {
+            let b = signed_bundle(&key, Kind::Vendo, TARGET_ARM, v, "0.0.0", &[("pisowifi", BIN)]);
+            assert!(err(verify(&b, Some(&key.verifying_key()), &expect(current))).contains("not newer"), "{v} over {current}");
+        }
+        // install.sh may reinstall the same version, never an older one.
+        let b = signed_bundle(&key, Kind::Vendo, TARGET_ARM, "0.2.0", "0.0.0", &[("pisowifi", BIN)]);
+        assert!(verify(&b, Some(&key.verifying_key()), &Expect { allow_same: true, ..expect("0.2.0") }).is_ok());
+        assert!(verify(&b, Some(&key.verifying_key()), &Expect { allow_same: true, ..expect("0.3.0") }).is_err());
+    }
+
+    #[test]
+    fn a_too_old_box_must_step_through_min_from_version() {
+        let key = test_key(1);
+        let b = signed_bundle(&key, Kind::Vendo, TARGET_ARM, "0.5.0", "0.3.0", &[("pisowifi", BIN)]);
+        assert!(err(verify(&b, Some(&key.verifying_key()), &expect("0.2.0"))).contains("Install version 0.3.0 first"));
+        assert!(verify(&b, Some(&key.verifying_key()), &expect("0.3.0")).is_ok());
+    }
+
+    #[test]
+    fn signing_in_place_writes_the_manifest_copy_and_checksum() {
+        let dir = std::env::temp_dir().join(format!("pisowifi-sign-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pisowifi-armv7.tar.gz");
+        std::fs::write(&path, bundle_with("pisowifi", &[("pisowifi", BIN), ("._pisowifi", b"mac junk")])).unwrap();
+        std::fs::write(dir.join("pisowifi-armv7.tar.gz.sha256"), "stale").unwrap();
+        let key = test_key(3);
+        let args = SignArgs { kind: Kind::Vendo, target: TARGET_ARM, version: "0.2.0", min_from: "0.1.0", notes: " Notes. " };
+        let sha = sign_bundle(&key, &path, &args).unwrap();
+        // Signing again replaces the old signature rather than signing it.
+        let sha2 = sign_bundle(&key, &path, &args).unwrap();
+        let bundle = std::fs::read(&path).unwrap();
+        assert_eq!(hex::encode(Sha256::digest(&bundle)), sha2);
+        assert_ne!(sha, "");
+        let v = verify(&bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap();
+        assert_eq!((v.manifest.notes.as_str(), v.manifest.files.len()), ("Notes.", 1), "the resource fork was dropped");
+        let copy = open(&std::fs::read(dir.join("pisowifi-armv7.tar.gz.manifest")).unwrap(), &key.verifying_key()).unwrap();
+        assert_eq!(copy, v.manifest);
+        assert_eq!(std::fs::read_to_string(dir.join("pisowifi-armv7.tar.gz.sha256")).unwrap(), format!("{sha2}  pisowifi-armv7.tar.gz\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn sign_bundle_writes_a_manifest_that_verifies() {
-        let dir = std::env::temp_dir().join(format!("pisowifi-sign-{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let key_path = dir.join("keys/release.key");
-        let key = load_or_create_key(&key_path).unwrap();
-        assert_eq!(load_or_create_key(&key_path).unwrap().to_bytes(), key.to_bytes(), "the key is created once");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-        let bundle_path = dir.join("pisowifi-armv7.tar.gz");
-        let bundle = bundle_with("pisowifi", &[("pisowifi", b"bin")]);
-        std::fs::write(&bundle_path, &bundle).unwrap();
-        let args = SignArgs { kind: Kind::Vendo, target: TARGET_ARM, version: "0.2.0", min_from: "0.1.0", notes: " Notes. " };
-        let out = sign_bundle(&key, &bundle_path, &args).unwrap();
-        assert_eq!(out, dir.join("pisowifi-armv7.tar.gz.manifest"));
-        let m = verify(&std::fs::read(&out).unwrap(), &bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap();
-        assert_eq!((m.version.as_str(), m.notes.as_str(), m.file.as_str()), ("0.2.0", "Notes.", "pisowifi-armv7.tar.gz"));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn keys_come_from_hex_and_the_public_file_parses() {
+        let (secret, public) = new_key();
+        std::env::set_var("PISOWIFI_TEST_RELEASE_KEY", secret.as_str());
+        let k = key_from_env("PISOWIFI_TEST_RELEASE_KEY").unwrap();
+        assert_eq!(hex::encode(k.verifying_key().as_bytes()), public);
+        assert_eq!(parse_public(&public_file(&public)).unwrap(), k.verifying_key());
+        std::env::set_var("PISOWIFI_TEST_RELEASE_KEY", "not hex");
+        assert!(key_from_env("PISOWIFI_TEST_RELEASE_KEY").is_err());
+        assert!(key_from_env("PISOWIFI_TEST_UNSET_KEY").is_err());
     }
 
     #[test]

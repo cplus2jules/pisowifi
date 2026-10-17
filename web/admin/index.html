@@ -388,12 +388,12 @@
         </div>
         <div class="card wide" id="upd-card">
           <div class="card-head">
-            <div><h2>Software updates</h2><p class="sub">Only versions signed with your release key get installed</p></div>
+            <div><h2>Update</h2><p class="sub">Install a new version from its GitHub release. Only files signed with your release key are accepted.</p></div>
             <span class="status used" id="upd-status">—</span>
           </div>
           <dl class="facts">
             <dt>This vendo</dt><dd id="upd-current">—</dd>
-            <dt>Newest</dt><dd id="upd-latest">—</dd>
+            <dt id="upd-last-label" hidden>Last update</dt><dd id="upd-last" hidden></dd>
           </dl>
           <div class="card-body">
             <div class="upd-notes" id="upd-notes" hidden>
@@ -401,22 +401,32 @@
               <p id="upd-notes-text"></p>
             </div>
             <p class="upd-msg" id="upd-msg" hidden></p>
-            <div class="row">
-              <button class="btn outline" type="button" id="upd-check">Check now</button>
-              <span class="grow"></span>
-              <button class="btn primary" type="button" id="upd-install" hidden>Install now</button>
+            <div class="row" id="upd-pick-row">
+              <label class="btn primary file-btn" id="upd-pick">Choose update file<input type="file" id="upd-file" accept=".gz,application/gzip,application/x-gzip"></label>
+              <span class="sub">pisowifi-armv7.tar.gz from the release page. It's checked before anything changes.</span>
             </div>
-            <label class="switch-row">
-              <input type="checkbox" class="switch" id="upd-auto">
-              <span>Install updates by itself at 3 AM<small>Waits if someone is putting in coins. Customers stay online while it installs, and a version that doesn't start is undone by itself.</small></span>
-            </label>
+            <div class="row" id="upd-ready-row" hidden>
+              <button class="btn outline" type="button" id="upd-cancel">Cancel</button>
+              <span class="grow"></span>
+              <button class="btn primary" type="button" id="upd-install">Install now</button>
+            </div>
             <details class="upd-more">
-              <summary>Where updates come from</summary>
-              <form class="row" id="upd-url-form">
-                <input type="url" id="upd-url" maxlength="300" placeholder="GitHub Releases (default)" aria-label="Update address">
-                <button class="btn outline" type="submit">Save</button>
+              <summary>Check for updates online</summary>
+              <form class="upd-online" id="upd-url-form">
+                <p class="sub">Off until you add an address. Vendos can't download from a private GitHub repository, so leave this empty for now; once releases are public it can be <code id="upd-example"></code>.</p>
+                <div class="row">
+                  <input type="url" id="upd-url" maxlength="300" placeholder="https://…" aria-label="Update address">
+                  <button class="btn outline" type="submit">Save</button>
+                </div>
+                <label class="switch-row">
+                  <input type="checkbox" class="switch" id="upd-auto">
+                  <span>Install new versions by itself at 3 AM<small>Waits if someone is putting in coins. Customers stay online, and a version that doesn't start is undone by itself.</small></span>
+                </label>
+                <div class="row">
+                  <button class="btn outline" type="button" id="upd-check">Check now</button>
+                  <span class="sub" id="upd-latest"></span>
+                </div>
               </form>
-              <p class="sub">Checked once a day. Leave it empty for GitHub Releases. While the GitHub repository is private the check finds nothing; copy the update onto the vendo and run <code>sudo pisowifi update --file pisowifi-armv7.tar.gz</code> instead.</p>
             </details>
           </div>
         </div>
