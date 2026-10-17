@@ -5,9 +5,15 @@
 # "Run workflow" on the Actions tab. Pull requests and ordinary pushes never
 # run it.
 #
+# Where it goes: the signed bundles and the signed update list
+# (channels/stable.json + .sig) are pushed to the public repository
+# cplus2jules/pisowifi-releases, which vendos and the hub check; this private
+# repository gets a GitHub Release with the same files for your records.
+#
 # The build job runs third-party build scripts (crates.io), so it never sees
-# the signing key. Only the sign job gets the PISOWIFI_RELEASE_KEY secret, in
-# one step, and it never echoes it, writes it to a file or uploads it.
+# a secret. The sign job gets PISOWIFI_RELEASE_KEY in one step and
+# RELEASES_DEPLOY_KEY (write access to pisowifi-releases only) in another.
+# Neither is echoed, written to a file or uploaded.
 name: Release
 
 on:
@@ -136,7 +142,7 @@ jobs:
             exit 1
           fi
 
-      - name: Sign
+      - name: Sign the bundles and the update list
         env:
           PISOWIFI_RELEASE_KEY: ${{ secrets.PISOWIFI_RELEASE_KEY }}
           MIN_FROM: ${{ inputs.min_from || '0.0.0' }}
@@ -156,6 +162,9 @@ jobs:
           }
           sign dist/pisowifi-armv7.tar.gz vendo armv7-unknown-linux-musleabihf
           sign dist/pisowifi-hub-x86_64.tar.gz hub x86_64-unknown-linux-musl
+          # What vendos and the hub check: version, notes, and each board's file.
+          tool/pisowifi-hub/pisowifi release-channel --key-env PISOWIFI_RELEASE_KEY --expect-public release-key.pub \
+            --channel stable --out-dir site/channels dist/pisowifi-armv7.tar.gz dist/pisowifi-hub-x86_64.tar.gz
 
       - name: Check the signatures against release-key.pub
         run: |
@@ -165,20 +174,68 @@ jobs:
             --kind hub --target x86_64-unknown-linux-musl
           (cd dist && sha256sum pisowifi-armv7.tar.gz > pisowifi-armv7.tar.gz.sha256 \
             && sha256sum pisowifi-hub-x86_64.tar.gz > pisowifi-hub-x86_64.tar.gz.sha256)
+          cat site/channels/stable.json
 
-      - name: Publish the GitHub release
+      - name: Publish to cplus2jules/pisowifi-releases
+        env:
+          RELEASES_DEPLOY_KEY: ${{ secrets.RELEASES_DEPLOY_KEY }}
+          RELEASES_REPO: cplus2jules/pisowifi-releases
+        run: |
+          if [[ -z "${RELEASES_DEPLOY_KEY:-}" ]]; then
+            echo "::error::The RELEASES_DEPLOY_KEY secret isn't set. Run scripts/make-release-key.sh --deploy-key once."
+            exit 1
+          fi
+          mkdir -p "site/v$VERSION"
+          cp dist/pisowifi-armv7.tar.gz dist/pisowifi-armv7.tar.gz.sha256 \
+            dist/pisowifi-hub-x86_64.tar.gz dist/pisowifi-hub-x86_64.tar.gz.sha256 "site/v$VERSION/"
+          # The two versions before this one stay, for boxes still downloading
+          # them; older ones go, so the repository stays small.
+          git clone --quiet --depth 1 "https://github.com/$RELEASES_REPO.git" old
+          shopt -s nullglob
+          keep=()
+          for d in old/v*/; do
+            d="${d#old/}"; d="${d%/}"
+            if [[ "$d" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$d" != "v$VERSION" ]]; then keep+=("$d"); fi
+          done
+          if ((${#keep[@]})); then
+            for d in $(printf '%s\n' "${keep[@]}" | sort -V | tail -n 2); do cp -R "old/$d" site/; done
+          fi
+          if [[ -f old/README.md ]]; then
+            cp old/README.md site/
+          else
+            printf '# Piso WiFi releases\n\nSigned update files for Piso WiFi vendos and the Piso Pass hub.\n' > site/README.md
+          fi
+          # One fresh commit each time (no history to grow).
+          cd site
+          git init --quiet -b main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "v$VERSION"
+          git ls-files
+          # GitHub's SSH host keys, from its API over HTTPS.
+          curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com " + .' > "$RUNNER_TEMP/known_hosts"
+          # The deploy key goes into ssh-agent's memory through a pipe, never a file.
+          eval "$(ssh-agent -s)" > /dev/null
+          trap 'ssh-agent -k > /dev/null' EXIT
+          printf '%s\n' "$RELEASES_DEPLOY_KEY" | ssh-add -q -
+          GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts -o StrictHostKeyChecking=yes" \
+            git push --quiet --force "git@github.com:$RELEASES_REPO.git" main
+
+      - name: Record it as a GitHub Release here
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           {
             cat unsigned/notes/RELEASE_NOTES.md
             echo
-            echo "**Vendo:** download \`pisowifi-armv7.tar.gz\`, then dashboard → Settings → Update → Choose update file."
-            echo "**Hub:** \`pisowifi-hub-x86_64.tar.gz\`, then \`sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz\`."
+            echo "Published to https://github.com/cplus2jules/pisowifi-releases/tree/main/v$VERSION"
             echo
-            echo "Both are signed with the key in \`release-key.pub\`; the \`.manifest\` files hold the same signed manifest for online checks."
+            echo "**Vendos** with internet show it in the dashboard (Settings → Update). Without internet, choose \`pisowifi-armv7.tar.gz\` there."
+            echo "**Hub:** \`sudo pisowifi hub update --install\`."
           } > body.md
           gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "v$VERSION" --notes-file body.md \
-            dist/pisowifi-armv7.tar.gz dist/pisowifi-armv7.tar.gz.manifest dist/pisowifi-armv7.tar.gz.sha256 \
-            dist/pisowifi-hub-x86_64.tar.gz dist/pisowifi-hub-x86_64.tar.gz.manifest dist/pisowifi-hub-x86_64.tar.gz.sha256
+            dist/pisowifi-armv7.tar.gz dist/pisowifi-armv7.tar.gz.sha256 \
+            dist/pisowifi-hub-x86_64.tar.gz dist/pisowifi-hub-x86_64.tar.gz.sha256 \
+            site/channels/stable.json site/channels/stable.json.sig

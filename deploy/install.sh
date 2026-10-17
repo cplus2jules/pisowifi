@@ -534,8 +534,9 @@ cat <<EOF
   Customers:  connect to the WiFi; the portal opens at http://$LAN_IP/
   Owner:      https://$LAN_IP:8443/   (compare the certificate fingerprint above)
   Logs:       journalctl -u pisowifi -f
-  Updates:    dashboard > Settings > Update (upload the file from the GitHub
-              release), or run ./install.sh from a newer bundle
+  Updates:    dashboard > Settings > Update. New versions show up there when
+              the vendo is online; without internet, upload the file from
+              github.com/cplus2jules/pisowifi-releases
   LPB backup: $BACKUP
   Roll back:  sudo ./uninstall.sh $BACKUP
 

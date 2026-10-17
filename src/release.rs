@@ -7,14 +7,17 @@
 //!
 //! The signature travels inside the bundle: release-manifest.json lists the
 //! SHA-256 of every file next to it, plus the product, board, version and
-//! notes, and is signed. The one file on the release page is all an owner
-//! needs to upload, and
+//! notes, and is signed. One file is all a box needs (downloaded, or
+//! uploaded in the dashboard when the vendo has no internet), and
 //! * only the owner can publish an update: whoever gets hold of the file,
 //!   the download server or the network can change it, but can't sign it;
 //! * every file is pinned, and nothing unsigned can ride along;
 //! * a signature can't be reused for the other product or another board;
 //! * versions only go up, so an older signed release (one with a known bug,
 //!   say) can't be replayed to downgrade a box.
+//!
+//! CI also publishes a signed update list (channels/stable.json) in the
+//! public releases repository; boxes check it to learn what's newest.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -66,7 +69,14 @@ impl Kind {
     pub fn files(self) -> &'static [&'static str] {
         match self {
             Kind::Vendo => &["pisowifi", "pisowifi.service", "pisowifi-update.service", "pisowifi-update.path", "README.md"],
-            Kind::Hub => &["pisowifi", "pisowifi-hub.service", "pisowifi-hub-update.service", "README.md"],
+            Kind::Hub => &[
+                "pisowifi",
+                "pisowifi-hub.service",
+                "pisowifi-hub-update.service",
+                "pisowifi-hub-autoupdate.service",
+                "pisowifi-hub-autoupdate.timer",
+                "README.md",
+            ],
         }
     }
 }
@@ -78,14 +88,6 @@ pub fn asset_name(kind: Kind, target: &str) -> String {
         Kind::Vendo => format!("pisowifi-{arch}.tar.gz"),
         Kind::Hub => format!("pisowifi-hub-{arch}.tar.gz"),
     }
-}
-
-/// The manifest is also published next to its bundle (<bundle>.manifest),
-/// so an online check can see what's new without downloading everything.
-pub fn manifest_path(bundle: &Path) -> PathBuf {
-    let mut s = bundle.as_os_str().to_owned();
-    s.push(".manifest");
-    PathBuf::from(s)
 }
 
 // ---- versions ------------------------------------------------------------------
@@ -139,7 +141,7 @@ pub struct Manifest {
     pub files: BTreeMap<String, String>,
 }
 
-/// What release-manifest.json (and <bundle>.manifest) holds.
+/// What release-manifest.json holds.
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     /// The manifest JSON exactly as signed. Kept as text so nothing is
@@ -304,7 +306,7 @@ pub fn verify(bundle: &[u8], key: Option<&VerifyingKey>, e: &Expect) -> Result<V
     let archive = read_archive(bundle)?;
     let (signed, entries): (Vec<_>, Vec<_>) = archive.entries.into_iter().partition(|e| e.name == MANIFEST_NAME);
     let Some(signed) = signed.into_iter().next() else {
-        bail!("This file isn't signed. Use the bundle from the GitHub release page.");
+        bail!("This file isn't signed. Use the bundle from the releases page (github.com/cplus2jules/pisowifi-releases).");
     };
     let m = open(&signed.data, key)?;
     check(&m, e)?;
@@ -374,7 +376,7 @@ pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<()> {
 }
 
 pub fn no_key_error() -> anyhow::Error {
-    anyhow::anyhow!("This copy was built without a release key, so it can't install updates. Reinstall it from a bundle on the GitHub release page.")
+    anyhow::anyhow!("This copy was built without a release key, so it can't install updates. Reinstall it once from a signed bundle (github.com/cplus2jules/pisowifi-releases).")
 }
 
 /// The owner's release key, compiled in from release-key.pub.
@@ -386,6 +388,124 @@ pub fn parse_public(text: &str) -> Result<VerifyingKey> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).unwrap_or("");
     let bytes: [u8; 32] = hex::decode(line).ok().and_then(|b| b.try_into().ok()).context("not a 64-character hex key")?;
     VerifyingKey::from_bytes(&bytes).context("not a valid Ed25519 public key")
+}
+
+// ---- the update list -----------------------------------------------------------------
+
+/// Vendos and the hub learn what's newest from a small signed file:
+/// channels/stable.json in the public releases repository, with its
+/// signature in stable.json.sig. It names each board's bundle by path,
+/// SHA-256 and size, so a box downloads only its own file and knows exactly
+/// what to expect before the bundle's own signature is even looked at.
+const CHANNEL_CONTEXT: &[u8] = b"pisowifi release channel v1\n";
+pub const MAX_CHANNEL_BYTES: u64 = 64 * 1024;
+pub const MAX_CHANNEL_SIG_BYTES: u64 = 1024;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Channel {
+    /// Always "pisowifi".
+    pub product: String,
+    /// "stable".
+    pub channel: String,
+    pub version: String,
+    /// Unix time CI signed it. A box ignores a list older than the newest one
+    /// it has seen, so an old list can't be replayed to hide an update.
+    pub issued_at: i64,
+    #[serde(default)]
+    pub notes: String,
+    pub files: Vec<ChannelFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelFile {
+    pub kind: Kind,
+    pub target: String,
+    /// Relative to the list itself, e.g. ../v0.2.0/pisowifi-armv7.tar.gz.
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+impl Channel {
+    /// This box's bundle, if the release has one for it.
+    pub fn file(&self, kind: Kind, target: &str) -> Option<&ChannelFile> {
+        self.files.iter().find(|f| f.kind == kind && f.target == target)
+    }
+}
+
+fn channel_message(json: &[u8]) -> Vec<u8> {
+    [CHANNEL_CONTEXT, json].concat()
+}
+
+/// The .sig file for a list: the signature in hex.
+pub fn sign_channel(key: &SigningKey, json: &[u8]) -> String {
+    hex::encode(key.sign(&channel_message(json)).to_bytes()) + "\n"
+}
+
+/// Checks the signature, then parses. As with manifests, nothing in the list
+/// is looked at before the signature is known to be good.
+pub fn open_channel(json: &[u8], sig: &[u8], key: &VerifyingKey) -> Result<Channel> {
+    if json.len() as u64 > MAX_CHANNEL_BYTES || sig.len() as u64 > MAX_CHANNEL_SIG_BYTES {
+        bail!("The update list is too large.");
+    }
+    let sig = std::str::from_utf8(sig)
+        .ok()
+        .and_then(|s| hex::decode(s.trim()).ok())
+        .and_then(|b| <[u8; 64]>::try_from(b).ok())
+        .map(|b| Signature::from_bytes(&b));
+    if !sig.is_some_and(|s| key.verify_strict(&channel_message(json), &s).is_ok()) {
+        bail!("The update list isn't signed with your release key, so it was ignored.");
+    }
+    let c: Channel = serde_json::from_slice(json).context("signed update list doesn't parse")?;
+    if c.product != "pisowifi" {
+        bail!("This isn't a Piso WiFi update list.");
+    }
+    Version::parse(&c.version)?;
+    if c.notes.chars().count() > MAX_NOTES_CHARS {
+        bail!("The release notes are too long.");
+    }
+    for f in &c.files {
+        let sha_ok = f.sha256.len() == 64 && f.sha256.bytes().all(|b| b.is_ascii_hexdigit());
+        if !channel_path_ok(&f.path) || !sha_ok || f.size == 0 || f.size > MAX_BUNDLE_BYTES {
+            bail!("The update list is malformed.");
+        }
+    }
+    Ok(c)
+}
+
+/// Leading `..` segments, then plain names (letters, digits, `.`, `_`, `-`, `+`).
+fn channel_path_ok(path: &str) -> bool {
+    let mut parts = path.split('/').peekable();
+    while parts.peek() == Some(&"..") {
+        parts.next();
+    }
+    let rest: Vec<&str> = parts.collect();
+    path.len() <= 200
+        && !rest.is_empty()
+        && rest.iter().all(|p| !p.is_empty() && *p != "." && *p != ".." && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b)))
+}
+
+/// Where a file named in the list is: its path, relative to the list's own address.
+pub fn channel_file_url(channel_url: &str, path: &str) -> Result<String> {
+    if !channel_path_ok(path) {
+        bail!("The update list is malformed.");
+    }
+    let (scheme, rest) = channel_url.split_once("://").context("not a web address")?;
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    // [host, dir, ..., list.json]
+    let mut segs: Vec<&str> = rest.split('/').collect();
+    segs.pop();
+    for p in path.split('/') {
+        if p == ".." {
+            if segs.len() <= 1 {
+                bail!("The update list points outside its server.");
+            }
+            segs.pop();
+        } else {
+            segs.push(p);
+        }
+    }
+    Ok(format!("{scheme}://{}", segs.join("/")))
 }
 
 // ---- signing (CI, and the one-time key setup) ---------------------------------------
@@ -416,8 +536,8 @@ pub struct SignArgs<'a> {
     pub notes: &'a str,
 }
 
-/// Signs a bundle in place: release-manifest.json goes inside it, a copy is
-/// written to <bundle>.manifest, and <bundle>.sha256 is refreshed if present.
+/// Signs a bundle in place: release-manifest.json goes inside it, and
+/// <bundle>.sha256 is refreshed if present.
 /// Returns the signed bundle's SHA-256.
 pub fn sign_bundle(key: &SigningKey, bundle: &Path, a: &SignArgs) -> Result<String> {
     let archive = read_archive(&std::fs::read(bundle).with_context(|| format!("reading {}", bundle.display()))?)?;
@@ -438,12 +558,11 @@ pub fn sign_bundle(key: &SigningKey, bundle: &Path, a: &SignArgs) -> Result<Stri
     let signed = sign(key, &m)?;
     let mtime = entries.iter().map(|e| e.mtime).max().unwrap_or(0);
     let mut all = entries;
-    all.push(Entry { name: MANIFEST_NAME.into(), mode: 0o644, mtime, data: signed.clone().into_bytes() });
+    all.push(Entry { name: MANIFEST_NAME.into(), mode: 0o644, mtime, data: signed.into_bytes() });
     let out = build_archive(&archive.top, &all, mtime)?;
     let tmp = bundle.with_extension("signing");
     std::fs::write(&tmp, &out)?;
     std::fs::rename(&tmp, bundle)?;
-    std::fs::write(manifest_path(bundle), &signed)?;
     let sha = hex::encode(Sha256::digest(&out));
     let mut sum = bundle.as_os_str().to_owned();
     sum.push(".sha256");
@@ -455,6 +574,55 @@ pub fn sign_bundle(key: &SigningKey, bundle: &Path, a: &SignArgs) -> Result<Stri
     // Belt and braces: what was written must verify.
     verify(&out, Some(&key.verifying_key()), &Expect { kind: a.kind, target: a.target, current: None, allow_same: false })?;
     Ok(sha)
+}
+
+/// Writes <out_dir>/<name>.json and <name>.json.sig for a set of signed
+/// bundles of one release. Each bundle is checked in full first; the list
+/// points at them as ../v<version>/<file name>, which is where CI puts them
+/// in the releases repository.
+pub fn write_channel(key: &SigningKey, name: &str, bundles: &[PathBuf], out_dir: &Path) -> Result<Channel> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_lowercase()) {
+        bail!("channel name must be lowercase letters");
+    }
+    let public = key.verifying_key();
+    let mut files = Vec::new();
+    let mut release: Option<(String, String)> = None;
+    for path in bundles {
+        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let archive = read_archive(&data)?;
+        let signed = archive.entries.iter().find(|e| e.name == MANIFEST_NAME).with_context(|| format!("{} isn't signed", path.display()))?;
+        let m = open(&signed.data, &public)?;
+        verify(&data, Some(&public), &Expect { kind: m.kind, target: &m.target, current: None, allow_same: false })?;
+        match &release {
+            None => release = Some((m.version.clone(), m.notes.clone())),
+            Some((v, n)) if *v == m.version && *n == m.notes => {}
+            Some(_) => bail!("{} is from a different release than the other bundles", path.display()),
+        }
+        if files.iter().any(|f: &ChannelFile| f.kind == m.kind && f.target == m.target) {
+            bail!("two bundles for {:?} {}", m.kind, m.target);
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).context("bundle file name")?;
+        files.push(ChannelFile {
+            kind: m.kind,
+            target: m.target.clone(),
+            path: format!("../v{}/{file_name}", m.version),
+            sha256: hex::encode(Sha256::digest(&data)),
+            size: data.len() as u64,
+        });
+    }
+    let (version, notes) = release.context("no bundles given")?;
+    let c = Channel { product: "pisowifi".into(), channel: name.into(), version, issued_at: chrono::Utc::now().timestamp(), notes, files };
+    let json = serde_json::to_string_pretty(&c)? + "\n";
+    let sig = sign_channel(key, json.as_bytes());
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::write(out_dir.join(format!("{name}.json")), &json)?;
+    std::fs::write(out_dir.join(format!("{name}.json.sig")), &sig)?;
+    // What was written must open, the same way a box opens it.
+    let back = open_channel(&std::fs::read(out_dir.join(format!("{name}.json")))?, &std::fs::read(out_dir.join(format!("{name}.json.sig")))?, &public)?;
+    if back != c {
+        bail!("the written update list doesn't read back the same");
+    }
+    Ok(c)
 }
 
 fn build_archive(top: &str, entries: &[Entry], mtime: u64) -> Result<Vec<u8>> {
@@ -651,7 +819,7 @@ pub mod tests {
     }
 
     #[test]
-    fn signing_in_place_writes_the_manifest_copy_and_checksum() {
+    fn signing_in_place_replaces_the_signature_and_checksum() {
         let dir = std::env::temp_dir().join(format!("pisowifi-sign-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pisowifi-armv7.tar.gz");
@@ -667,8 +835,6 @@ pub mod tests {
         assert_ne!(sha, "");
         let v = verify(&bundle, Some(&key.verifying_key()), &expect("0.1.0")).unwrap();
         assert_eq!((v.manifest.notes.as_str(), v.manifest.files.len()), ("Notes.", 1), "the resource fork was dropped");
-        let copy = open(&std::fs::read(dir.join("pisowifi-armv7.tar.gz.manifest")).unwrap(), &key.verifying_key()).unwrap();
-        assert_eq!(copy, v.manifest);
         assert_eq!(std::fs::read_to_string(dir.join("pisowifi-armv7.tar.gz.sha256")).unwrap(), format!("{sha2}  pisowifi-armv7.tar.gz\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -689,5 +855,94 @@ pub mod tests {
     fn asset_names_match_build_pi() {
         assert_eq!(asset_name(Kind::Vendo, TARGET_ARM), "pisowifi-armv7.tar.gz");
         assert_eq!(asset_name(Kind::Hub, "x86_64-unknown-linux-musl"), "pisowifi-hub-x86_64.tar.gz");
+    }
+
+    pub const TARGET_HUB: &str = "x86_64-unknown-linux-musl";
+
+    /// A release the way CI lays it out: both bundles in dist/, and the
+    /// update list written next to them. Returns (dir, list, sig).
+    pub fn signed_release(key: &SigningKey, version: &str, vendo_target: &str) -> (PathBuf, Vec<u8>, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("pisowifi-channel-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        let mut paths = Vec::new();
+        for (kind, target, unit) in [(Kind::Vendo, vendo_target, "pisowifi.service"), (Kind::Hub, TARGET_HUB, "pisowifi-hub.service")] {
+            let data = signed_bundle(key, kind, target, version, "0.1.0", &[("pisowifi", b"#!/bin/sh\n"), (unit, b"[Unit]\n")]);
+            let path = dir.join("dist").join(asset_name(kind, target));
+            std::fs::write(&path, data).unwrap();
+            paths.push(path);
+        }
+        write_channel(key, "stable", &paths, &dir.join("channels")).unwrap();
+        let list = std::fs::read(dir.join("channels/stable.json")).unwrap();
+        let sig = std::fs::read(dir.join("channels/stable.json.sig")).unwrap();
+        (dir, list, sig)
+    }
+
+    #[test]
+    fn the_update_list_is_signed_and_names_each_bundle() {
+        let key = test_key(7);
+        let (dir, list, sig) = signed_release(&key, "1.2.0", TARGET_ARM);
+        let c = open_channel(&list, &sig, &key.verifying_key()).unwrap();
+        assert_eq!((c.product.as_str(), c.channel.as_str(), c.version.as_str()), ("pisowifi", "stable", "1.2.0"));
+        assert_eq!(c.notes, "Faster coin counting.");
+        let vendo = c.file(Kind::Vendo, TARGET_ARM).unwrap();
+        let bundle = std::fs::read(dir.join("dist/pisowifi-armv7.tar.gz")).unwrap();
+        assert_eq!(vendo.path, "../v1.2.0/pisowifi-armv7.tar.gz");
+        assert_eq!(vendo.sha256, hex::encode(Sha256::digest(&bundle)));
+        assert_eq!(vendo.size, bundle.len() as u64);
+        assert_eq!(c.file(Kind::Hub, TARGET_HUB).unwrap().path, "../v1.2.0/pisowifi-hub-x86_64.tar.gz");
+        assert!(c.file(Kind::Hub, TARGET_ARM).is_none());
+        let url = "https://raw.githubusercontent.com/cplus2jules/pisowifi-releases/main/channels/stable.json";
+        assert_eq!(
+            channel_file_url(url, &vendo.path).unwrap(),
+            "https://raw.githubusercontent.com/cplus2jules/pisowifi-releases/main/v1.2.0/pisowifi-armv7.tar.gz"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_or_foreign_update_list_is_refused() {
+        let key = test_key(7);
+        let (dir, list, sig) = signed_release(&key, "1.2.0", TARGET_ARM);
+        let pk = key.verifying_key();
+        // Every byte is covered: a changed version, size or path is caught.
+        let text = String::from_utf8(list.clone()).unwrap();
+        for changed in [text.replace("1.2.0", "9.9.9"), text.replace("\"size\": ", "\"size\": 1"), text.replace("../v1.2.0/", "../v1.1.0/")] {
+            assert!(open_channel(changed.as_bytes(), &sig, &pk).unwrap_err().to_string().contains("isn't signed"));
+        }
+        // Another key, a damaged or missing signature.
+        assert!(open_channel(&list, &sig, &test_key(8).verifying_key()).is_err());
+        assert!(open_channel(&list, b"00", &pk).is_err());
+        assert!(open_channel(&list, b"", &pk).is_err());
+        // A manifest signature can't stand in for the list's (domain separation).
+        let as_manifest = hex::encode(key.sign(&signed_message(std::str::from_utf8(&list).unwrap())).to_bytes());
+        assert!(open_channel(&list, as_manifest.as_bytes(), &pk).is_err());
+        // Even signed, a path may only climb out with leading `..` and never leave the server.
+        for bad in ["/etc/passwd", "v1/../../x", "v1//x", "", "v1/./x", "v1/x y"] {
+            assert!(!channel_path_ok(bad), "{bad}");
+        }
+        assert!(channel_file_url("https://host/stable.json", "../x.tar.gz").is_err());
+        assert_eq!(channel_file_url("https://host/a/stable.json?x=1", "b.tar.gz").unwrap(), "https://host/a/b.tar.gz");
+        let mut c = open_channel(&list, &sig, &pk).unwrap();
+        c.files[0].path = "../../../../etc/passwd/x".into();
+        let json = serde_json::to_vec(&c).unwrap();
+        let resigned = sign_channel(&key, &json);
+        let c = open_channel(&json, resigned.as_bytes(), &pk).unwrap();
+        assert!(channel_file_url("https://host/a/stable.json", &c.files[0].path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_update_list_covers_one_release_only() {
+        let key = test_key(7);
+        let dir = std::env::temp_dir().join(format!("pisowifi-channel-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.tar.gz");
+        let b = dir.join("b.tar.gz");
+        std::fs::write(&a, signed_bundle(&key, Kind::Vendo, TARGET_ARM, "1.2.0", "0.1.0", &[("pisowifi", b"x")])).unwrap();
+        std::fs::write(&b, signed_bundle(&key, Kind::Hub, TARGET_HUB, "1.3.0", "0.1.0", &[("pisowifi", b"x")])).unwrap();
+        assert!(write_channel(&key, "stable", &[a.clone(), b], &dir).is_err());
+        // Only bundles signed with the same key.
+        assert!(write_channel(&test_key(8), "stable", &[a], &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

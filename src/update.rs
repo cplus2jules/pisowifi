@@ -1,10 +1,13 @@
 //! Installing updates without risking the shop.
 //!
 //! Who does what:
-//! * The daemon (sandboxed) checks the update server once a day. When the
-//!   owner taps Install (or at 3 AM, if they turned that on) it downloads
-//!   and verifies the bundle, stages it in <data_dir>/update/staged and
-//!   writes <data_dir>/update/request.
+//! * The daemon (sandboxed) checks the signed update list (channels/
+//!   stable.json in the public releases repository) a few minutes after it
+//!   starts and about once a day. When the owner taps Install (or at 3 AM,
+//!   if they turned that on) it downloads this board's bundle, checks its
+//!   size, SHA-256 and signature, stages it in <data_dir>/update/staged and
+//!   writes <data_dir>/update/request. A vendo without internet gets the
+//!   same bundle uploaded in the dashboard instead.
 //! * pisowifi-update.path sees the request and starts pisowifi-update.service,
 //!   which runs `pisowifi update --run-pending` as root. It never trusts the
 //!   daemon's checks: it verifies the signature and checksum again from the
@@ -29,11 +32,12 @@
 use crate::config::Config;
 use crate::db::Db;
 use crate::engine::Engine;
-use crate::release::{self, Expect, Kind, Manifest, Version};
+use crate::release::{self, Channel, ChannelFile, Expect, Kind, Manifest, Version};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
@@ -44,10 +48,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const URL_KEY: &str = "update_url";
 /// Dashboard uploads (a bundle is a few MB).
 pub const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
-pub const AUTO_KEY: &str = "update_auto";
 const HEALTH: &str = "health.json";
 const INCOMING: &str = ".incoming";
 
@@ -98,6 +100,8 @@ pub struct Profile {
     pub listen: Vec<SocketAddr>,
     /// Check that the nftables table is loaded.
     pub firewall: bool,
+    /// When the newest update list seen was signed (refuses replayed old lists).
+    pub seen: PathBuf,
 }
 
 impl Profile {
@@ -110,23 +114,26 @@ impl Profile {
             update_dir: cfg.storage.data_dir.join("update"),
             listen: vec![cfg.portal.listen, cfg.admin.listen],
             firewall: !dev,
+            seen: cfg.storage.data_dir.join("update").join("list-seen"),
         }
     }
 
     pub fn hub(data_dir: &Path, listen: SocketAddr, dev: bool) -> Profile {
+        let update_dir: PathBuf = if dev { data_dir.join("update") } else { "/var/lib/pisowifi-update".into() };
         Profile {
             kind: Kind::Hub,
             service: "pisowifi-hub.service".into(),
             update_service: "pisowifi-hub-update.service".into(),
             data_dir: data_dir.to_path_buf(),
-            update_dir: if dev { data_dir.join("update") } else { "/var/lib/pisowifi-update".into() },
+            seen: update_dir.join("list-seen"),
+            update_dir,
             listen: vec![listen],
             firewall: false,
         }
     }
 
     fn units(&self) -> impl Iterator<Item = &'static str> {
-        self.kind.files().iter().copied().filter(|f| f.ends_with(".service") || f.ends_with(".path"))
+        self.kind.files().iter().copied().filter(|f| [".service", ".path", ".timer"].iter().any(|ext| f.ends_with(ext)))
     }
 
     fn staged(&self) -> PathBuf {
@@ -135,7 +142,7 @@ impl Profile {
 }
 
 /// The updater's own units get enabled when a release brings them; the
-/// main service is install.sh's business.
+/// main service is install.sh's business, and the hub's 3 AM timer the owner's.
 fn wants_enable(unit: &str) -> bool {
     unit.contains("-update.")
 }
@@ -877,81 +884,146 @@ fn request(update_dir: &Path) -> Result<()> {
     write_atomic(&update_dir.join("request"), b"", 0o600)
 }
 
-// ---- checking online (off until an address is set) ---------------------------------------
+// ---- checking online ----------------------------------------------------------------------
 
-/// Where GitHub serves the newest release's files. It only works once the
-/// repository is public; until then updates are installed from the file.
-pub const GITHUB_URL: &str = "https://github.com/cplus2jules/pisowifi/releases/latest/download";
+/// The signed update list CI publishes in the public releases repository.
+pub const CHANNEL_URL: &str = "https://raw.githubusercontent.com/cplus2jules/pisowifi-releases/main/channels/stable.json";
 
-/// An empty address turns online checks off.
+/// A custom update list address; empty means the default one.
 pub fn clean_url(url: &str, dev: bool) -> Result<Option<String>> {
-    let u = url.trim().trim_end_matches('/');
+    let u = url.trim();
     if u.is_empty() {
         return Ok(None);
     }
     if u.len() > 300 || u.chars().any(|c| c.is_whitespace() || c.is_control()) {
         bail!("That doesn't look like a web address.");
     }
-    if u.starts_with("https://") || (dev && u.starts_with("http://")) {
-        Ok(Some(u.into()))
-    } else {
-        bail!("The update address must start with https://")
+    if !(u.starts_with("https://") || (dev && u.starts_with("http://"))) {
+        bail!("The update address must start with https://");
     }
+    if !u.ends_with(".json") {
+        bail!("The update address is the update list itself, ending in .json (for example {CHANNEL_URL}).");
+    }
+    Ok(Some(u.into()))
 }
 
-fn get(url: &str, limit: u64, timeout: Duration) -> Result<Vec<u8>> {
+/// HTTPS only (plain http just for dev mode's local test server), redirects
+/// included, with a size cap and timeouts so a slow or hostile server can't
+/// hold the vendo up or fill its disk.
+fn get(url: &str, limit: u64, total: Duration, dev: bool) -> Result<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
+        .https_only(!dev)
+        .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(60))
-        .timeout(timeout)
+        .timeout(total)
         .redirects(5)
         .user_agent(concat!("pisowifi/", env!("CARGO_PKG_VERSION")))
         .build();
     match agent.get(url).call() {
         Ok(r) => {
             let mut data = Vec::new();
-            r.into_reader().take(limit + 1).read_to_end(&mut data).context("Download interrupted.")?;
+            r.into_reader().take(limit + 1).read_to_end(&mut data).context("The download was interrupted.")?;
             if data.len() as u64 > limit {
                 bail!("The update server sent more than expected.");
             }
             Ok(data)
         }
-        // GitHub answers 404 for private repositories too.
-        Err(ureq::Error::Status(404, _)) => bail!("No release found at the update address (a private GitHub repository looks like this too)."),
+        Err(ureq::Error::Status(404, _)) => bail!("Nothing has been published at the update address yet."),
         Err(ureq::Error::Status(code, _)) => bail!("The update server answered {code}."),
-        Err(_) => bail!("Couldn't reach the update server."),
+        Err(_) => bail!("Couldn't reach the update server (is this box online?)."),
     }
 }
 
-/// The newest signed manifest for this product and board. Its version is
-/// left for the caller to compare.
-pub fn fetch_manifest(base: &str, kind: Kind, target: &str, key: Option<&VerifyingKey>) -> Result<Manifest> {
+/// The update list, signature checked.
+pub fn fetch_channel(url: &str, key: Option<&VerifyingKey>, dev: bool) -> Result<Channel> {
     let key = key.ok_or_else(release::no_key_error)?;
-    let bytes = get(&format!("{base}/{}.manifest", release::asset_name(kind, target)), release::MAX_MANIFEST_BYTES, Duration::from_secs(30))?;
-    let m = release::open(&bytes, key)?;
-    release::check(&m, &Expect { kind, target, current: None, allow_same: false })?;
-    Ok(m)
+    let list = get(url, release::MAX_CHANNEL_BYTES, Duration::from_secs(30), dev)?;
+    let sig = get(&format!("{url}.sig"), release::MAX_CHANNEL_SIG_BYTES, Duration::from_secs(30), dev)?;
+    release::open_channel(&list, &sig, key)
 }
 
-/// The bundle itself; the caller verifies it.
-pub fn fetch_bundle(base: &str, kind: Kind, target: &str) -> Result<Vec<u8>> {
-    get(&format!("{base}/{}", release::asset_name(kind, target)), release::MAX_BUNDLE_BYTES, Duration::from_secs(20 * 60))
+/// A newer version for this box, found on the update list.
+#[derive(Clone, Debug)]
+pub struct Offer {
+    pub version: Version,
+    pub notes: String,
+    pub issued_at: i64,
+    pub file: ChannelFile,
+    pub url: String,
+}
+
+/// The newest list this box has seen (its issued_at), kept in a file.
+fn seen(path: &Path) -> i64 {
+    fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Asks the update list what's newest. None: up to date, or the release has
+/// nothing for this board.
+pub fn check_online(p: &Profile, url: &str, key: Option<&VerifyingKey>, current: Version, dev: bool) -> Result<Option<Offer>> {
+    let c = fetch_channel(url, key, dev)?;
+    if c.issued_at < seen(&p.seen) {
+        bail!("The update server sent an older update list than before, so it was ignored. Try again later.");
+    }
+    let note = || -> Result<()> {
+        match p.seen.parent() {
+            Some(dir) if !dir.exists() => ensure_dir(dir, 0o700)?,
+            _ => {}
+        }
+        write_atomic(&p.seen, format!("{}\n", c.issued_at).as_bytes(), 0o644)
+    };
+    // The hub's unprivileged daemon can't write here; its root-side installs do.
+    if let Err(e) = note() {
+        tracing::debug!("can't note the update list's date: {e:#}");
+    }
+    let Some(file) = c.file(p.kind, release::TARGET).cloned() else { return Ok(None) };
+    let version = Version::parse(&c.version)?;
+    if version <= current {
+        return Ok(None);
+    }
+    Ok(Some(Offer { version, notes: c.notes, issued_at: c.issued_at, url: release::channel_file_url(url, &file.path)?, file }))
+}
+
+/// Downloads an offered bundle and checks everything: size and SHA-256
+/// against the list, then the bundle's own signature, board and version.
+pub fn download(p: &Profile, o: &Offer, key: Option<&VerifyingKey>, current: Version, dev: bool) -> Result<Vec<u8>> {
+    let data = get(&o.url, o.file.size, Duration::from_secs(20 * 60), dev)?;
+    if data.len() as u64 != o.file.size || !hex::encode(Sha256::digest(&data)).eq_ignore_ascii_case(&o.file.sha256) {
+        bail!("The download doesn't match the update list (damaged or tampered with). Nothing was changed.");
+    }
+    let v = release::verify(&data, key, &Expect { kind: p.kind, target: release::TARGET, current: Some(current), allow_same: false })?;
+    if Version::parse(&v.manifest.version)? != o.version {
+        bail!("The download is a different version than the update list says. Nothing was changed.");
+    }
+    Ok(data)
 }
 
 // ---- `pisowifi update` -------------------------------------------------------------------
 
 pub struct Args {
     pub check: bool,
+    pub install: bool,
+    /// (the hub's 3 AM timer) Like install, but quiet when up to date, and
+    /// a version that had to be rolled back isn't tried again.
+    pub auto: bool,
     pub file: Option<PathBuf>,
+    /// Another update list address for --check / --install; on its own it installs.
     pub url: Option<String>,
     pub run_pending: bool,
     pub install_dir: Option<PathBuf>,
     pub allow_same: bool,
 }
 
+fn update_cmd(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Vendo => "pisowifi update",
+        Kind::Hub => "pisowifi hub update",
+    }
+}
+
 pub fn cli(p: &Profile, a: Args, dev: bool, configured_url: &dyn Fn() -> Result<Option<String>>) -> Result<()> {
     let l = Layout::system();
     let key = release::trusted_key();
+    let cmd = update_cmd(p.kind);
     if a.run_pending || a.install_dir.is_some() {
         if dev {
             bail!("Installing happens on the vendo or hub itself, not in dev mode.");
@@ -976,43 +1048,58 @@ pub fn cli(p: &Profile, a: Args, dev: bool, configured_url: &dyn Fn() -> Result<
     // newer one, run straight from a bundle).
     let current = installed_version(&l.bin_link).unwrap_or_else(|_| Version::current());
     let expect = Expect { kind: p.kind, target: release::TARGET, current: Some(current), allow_same: false };
-    let base = |u: &Option<String>| -> Result<String> {
-        let url = match u.as_deref().filter(|u| !u.is_empty()) {
-            Some(u) => clean_url(u, dev)?,
-            None => configured_url()?,
-        };
-        url.ok_or_else(|| {
-            anyhow::anyhow!("No update address is set, so there's nothing to check online. Install the file from the GitHub release: pisowifi update --file <bundle>")
-        })
+    let list_url = || -> Result<Option<String>> {
+        match a.url.as_deref().filter(|u| !u.is_empty()) {
+            Some(u) => clean_url(u, dev),
+            None => configured_url(),
+        }
     };
-    if a.check {
-        let base = base(&a.url)?;
-        let m = fetch_manifest(&base, p.kind, release::TARGET, key.as_ref())?;
-        let v = Version::parse(&m.version)?;
-        if v > current {
-            println!("Version {v} is available (installed: {current}).");
-            if !m.notes.is_empty() {
-                println!("\n{}\n", m.notes);
-            }
-        } else {
-            println!("Up to date: version {current}.");
+    let online = a.check || a.install || a.auto || a.url.is_some();
+    if a.file.is_none() && !online {
+        print_status(&l, current)?;
+        match list_url() {
+            Ok(Some(url)) => match check_online(p, &url, key.as_ref(), current, dev) {
+                Ok(Some(o)) => println!("Version {} is available. Install it with: sudo {cmd} --install", o.version),
+                Ok(None) => println!("Up to date with the update list."),
+                Err(e) => println!("Couldn't check online: {e}"),
+            },
+            Ok(None) => println!("Online checks are off."),
+            Err(e) => println!("Couldn't check online: {e}"),
         }
         return Ok(());
     }
     let bundle = if let Some(file) = &a.file {
         read_limited(file, release::MAX_BUNDLE_BYTES)?
-    } else if a.url.is_some() {
-        let base = base(&a.url)?;
-        let m = fetch_manifest(&base, p.kind, release::TARGET, key.as_ref())?;
-        release::check(&m, &expect)?;
-        println!("Downloading version {}…", m.version);
-        fetch_bundle(&base, p.kind, release::TARGET)?
     } else {
-        return print_status(&l, current);
+        let url = list_url()?.ok_or_else(|| match p.kind {
+            Kind::Vendo => anyhow::anyhow!("Online checks are off. Turn them on in the dashboard (Settings → Update), or install a file: sudo {cmd} --file <bundle>"),
+            Kind::Hub => anyhow::anyhow!("Online checks are off (update_url = \"\" in hub.toml). Install a file instead: sudo {cmd} --file <bundle>"),
+        })?;
+        let Some(o) = check_online(p, &url, key.as_ref(), current, dev)? else {
+            if !a.auto {
+                println!("Up to date: version {current}.");
+            }
+            return Ok(());
+        };
+        println!("Version {} is available (installed: {current}).", o.version);
+        if !o.notes.is_empty() {
+            println!("\n{}\n", o.notes);
+        }
+        if a.check {
+            println!("Install it with: sudo {cmd} --install");
+            return Ok(());
+        }
+        let failed = read_state(&l.state_path()).and_then(|s| s.failed_version);
+        if a.auto && failed.as_deref() == Some(o.version.to_string().as_str()) {
+            println!("Version {} couldn't start last time, so it isn't installed automatically. Install it by hand: sudo {cmd} --install", o.version);
+            return Ok(());
+        }
+        println!("Downloading version {} ({:.1} MB)…", o.version, o.file.size as f64 / 1e6);
+        download(p, &o, key.as_ref(), current, dev)?
     };
     let v = release::verify(&bundle, key.as_ref(), &expect)?;
     println!("Checked: version {} for {}, signed with your release key.", v.manifest.version, v.manifest.target);
-    if !v.manifest.notes.is_empty() {
+    if a.file.is_some() && !v.manifest.notes.is_empty() {
         println!("\n{}\n", v.manifest.notes);
     }
     if dev {
@@ -1076,12 +1163,44 @@ fn follow(l: &Layout, since: i64) -> Result<()> {
 
 // ---- the dashboard's side (vendo daemon) ------------------------------------------------------
 
+/// "0" turns online checks off; they're on unless the owner says otherwise.
+pub const ONLINE_KEY: &str = "update_online";
+/// Another update list address; empty means the default one.
+pub const URL_KEY: &str = "update_url";
+pub const AUTO_KEY: &str = "update_auto";
+
+/// The vendo's update list address from its settings; None while online checks are off.
+pub fn vendo_url(db: &Db) -> Result<Option<String>> {
+    if db.get_setting(ONLINE_KEY)?.as_deref() == Some("0") {
+        return Ok(None);
+    }
+    Ok(Some(db.get_setting(URL_KEY)?.filter(|u| !u.is_empty()).unwrap_or_else(|| CHANNEL_URL.into())))
+}
+
+/// The hub's, from update_url in hub.toml: left out means the default, "" means off.
+pub fn hub_url(setting: Option<&str>, dev: bool) -> Result<Option<String>> {
+    match setting {
+        None => Ok(Some(CHANNEL_URL.into())),
+        Some(u) if u.trim().is_empty() => Ok(None),
+        Some(u) => clean_url(u, dev),
+    }
+}
+
+/// When to look again: about a day after a good check, sooner after a
+/// failed one, spread out so a fleet of vendos doesn't ask all at once.
+fn next_check(ok: bool) -> i64 {
+    use rand::Rng;
+    let mut r = rand::thread_rng();
+    crate::db::now() + if ok { 22 * 3600 + r.gen_range(0..4 * 3600) } else { 3600 + r.gen_range(0..3600) }
+}
+
 #[derive(Default)]
 struct Status {
     last_check: Option<i64>,
+    next_check: i64,
     check_error: Option<String>,
-    /// Newest version seen online.
-    found: Option<Manifest>,
+    /// A newer version on the update list.
+    found: Option<Offer>,
     /// An uploaded file that checked out, waiting for Install now.
     ready: Option<Manifest>,
     /// "checking", "downloading" or "waiting" (staged; the installer takes over).
@@ -1111,39 +1230,43 @@ impl Updater {
         Arc::new(Updater { p, dev, db, key: release::trusted_key(), state_path, st: Mutex::new(Status::default()) })
     }
 
-    /// The online update address; None means online checks are off.
+    /// The update list address; None while online checks are off.
     pub fn url(&self) -> Option<String> {
-        self.db.get_setting(URL_KEY).ok().flatten().filter(|u| !u.is_empty())
+        vendo_url(&self.db).ok().flatten()
     }
 
     pub fn auto(&self) -> bool {
         self.db.get_setting(AUTO_KEY).ok().flatten().as_deref() == Some("1")
     }
 
-    pub fn set_settings(&self, auto: bool, url: &str) -> Result<Option<String>, String> {
+    pub fn set_settings(&self, online: bool, auto: bool, url: &str) -> Result<(), String> {
         let url = clean_url(url, self.dev).map_err(|e| e.to_string())?;
+        let custom = self.db.get_setting(URL_KEY).ok().flatten().unwrap_or_default();
+        self.db.set_setting(ONLINE_KEY, if online { "1" } else { "0" }).map_err(|e| e.to_string())?;
         self.db.set_setting(URL_KEY, url.as_deref().unwrap_or("")).map_err(|e| e.to_string())?;
-        self.db.set_setting(AUTO_KEY, if auto && url.is_some() { "1" } else { "0" }).map_err(|e| e.to_string())?;
-        if url.is_none() {
-            let mut s = self.st.lock().unwrap();
-            (s.found, s.check_error, s.last_check) = (None, None, None);
+        self.db.set_setting(AUTO_KEY, if auto && online { "1" } else { "0" }).map_err(|e| e.to_string())?;
+        let mut s = self.st.lock().unwrap();
+        if !online || custom != url.unwrap_or_default() {
+            // What was found came from elsewhere; look again soon.
+            (s.found, s.check_error, s.last_check, s.next_check) = (None, None, None, 0);
         }
-        Ok(url)
+        Ok(())
     }
 
     pub fn view(&self) -> Value {
         let current = Version::current();
         let s = self.st.lock().unwrap();
-        let available = s.found.as_ref().filter(|m| Version::parse(&m.version).is_ok_and(|v| v > current)).map(summary);
-        let url = self.url();
+        let available = s.found.as_ref().filter(|o| o.version > current).map(|o| {
+            json!({ "version": o.version.to_string(), "notes": o.notes, "issued_at": o.issued_at, "size": o.file.size })
+        });
         json!({
             "current": current.to_string(),
             "signed": self.key.is_some(),
             "ready": s.ready.as_ref().map(summary),
             "available": available,
-            "online": url.is_some(),
-            "url": url.unwrap_or_default(),
-            "example_url": GITHUB_URL,
+            "online": self.url().is_some(),
+            "url": self.db.get_setting(URL_KEY).ok().flatten().unwrap_or_default(),
+            "default_url": CHANNEL_URL,
             "last_check": s.last_check,
             "check_error": s.check_error,
             "busy": s.busy,
@@ -1157,8 +1280,8 @@ impl Updater {
         self.st.lock().unwrap().busy = b;
     }
 
-    /// The owner uploaded a bundle: check it now, keep it until they tap
-    /// Install now. Nothing is installed yet.
+    /// The owner uploaded a bundle (a vendo with no internet): check it now,
+    /// keep it until they tap Install now. Nothing is installed yet.
     pub fn upload(&self, bundle: &[u8]) -> Result<Manifest, String> {
         if self.st.lock().unwrap().busy.is_some() {
             return Err("An update is already on its way in.".into());
@@ -1172,13 +1295,18 @@ impl Updater {
         Ok(v.manifest)
     }
 
+    /// The owner tapped Check now: an old download message is out of date.
+    pub fn clear_error(&self) {
+        self.st.lock().unwrap().error = None;
+    }
+
     pub fn cancel_upload(&self) {
         let _ = fs::remove_dir_all(self.p.update_dir.join("uploaded"));
         self.st.lock().unwrap().ready = None;
     }
 
-    /// Asks the update server what's newest (only when an address is set).
-    /// Failures are quiet: shown in the card, logged at info level.
+    /// Asks the update list what's newest. Failures are quiet: shown in the
+    /// card, logged at info level.
     pub async fn check(self: &Arc<Self>) {
         let Some(url) = self.url() else { return };
         {
@@ -1188,26 +1316,32 @@ impl Updater {
             }
             s.busy = Some("checking");
         }
-        let (key, kind) = (self.key, self.p.kind);
-        let res = tokio::task::spawn_blocking(move || fetch_manifest(&url, kind, release::TARGET, key.as_ref())).await;
+        let me = self.clone();
+        let res = tokio::task::spawn_blocking(move || check_online(&me.p, &url, me.key.as_ref(), Version::current(), me.dev)).await;
         let mut s = self.st.lock().unwrap();
         s.busy = None;
         s.last_check = Some(crate::db::now());
+        let res = res.map_err(anyhow::Error::from).and_then(|r| r);
+        s.next_check = next_check(res.is_ok());
         match res {
-            Ok(Ok(m)) => {
-                s.found = Some(m);
+            Ok(found) => {
+                if let Some(o) = &found {
+                    if s.found.as_ref().is_none_or(|f| f.version != o.version) {
+                        tracing::info!("update: version {} is available", o.version);
+                    }
+                }
+                s.found = found;
                 s.check_error = None;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing::info!("update check: {e}");
                 s.check_error = Some(e.to_string());
             }
-            Err(e) => s.check_error = Some(e.to_string()),
         }
     }
 
     /// Install now: the uploaded file if there is one, otherwise the newest
-    /// version online. The installer takes it from there.
+    /// version on the update list. The installer takes it from there.
     pub fn start_install(self: &Arc<Self>, actor: &str, auto: bool) -> Result<(), String> {
         if self.key.is_none() {
             return Err(release::no_key_error().to_string());
@@ -1235,7 +1369,7 @@ impl Updater {
             }
         }
         if self.url().is_none() {
-            return Err("Choose the update file first.".into());
+            return Err("Online checks are off. Choose the update file instead.".into());
         }
         s.busy = Some("checking");
         s.error = None;
@@ -1277,40 +1411,46 @@ impl Updater {
     }
 
     fn download_and_stage(&self, auto: bool) -> Result<String> {
-        let url = self.url().context("online updates are off")?;
-        let m = fetch_manifest(&url, self.p.kind, release::TARGET, self.key.as_ref())?;
-        let expect = Expect { kind: self.p.kind, target: release::TARGET, current: Some(Version::current()), allow_same: false };
-        let v = release::check(&m, &expect)?;
+        let url = self.url().context("online checks are off")?;
+        // Asked again, so Install always gets the newest.
+        let current = Version::current();
+        let Some(o) = check_online(&self.p, &url, self.key.as_ref(), current, self.dev)? else {
+            self.st.lock().unwrap().found = None;
+            bail!("Already up to date (version {current}).");
+        };
         let failed = read_state(&self.state_path).and_then(|s| s.failed_version);
-        if auto && failed.as_deref() == Some(m.version.as_str()) {
-            bail!("Version {v} couldn't start last time, so it isn't installed automatically. Tap Install now to try again.");
+        if auto && failed.as_deref() == Some(o.version.to_string().as_str()) {
+            bail!("Version {} couldn't start last time, so it isn't installed automatically. Tap Install now to try again.", o.version);
         }
         self.set_busy(Some("downloading"));
-        let bundle = fetch_bundle(&url, self.p.kind, release::TARGET)?;
-        release::verify(&bundle, self.key.as_ref(), &expect)?;
+        let bundle = download(&self.p, &o, self.key.as_ref(), current, self.dev)?;
+        let v = o.version;
+        self.st.lock().unwrap().found = Some(o);
         if self.dev {
             bail!("Dev mode: version {v} downloaded and checks out. Installing happens only on the vendo.");
         }
         stage(&self.p.update_dir, &bundle)?;
         request(&self.p.update_dir)?;
-        self.st.lock().unwrap().found = Some(m);
         Ok(v.to_string())
     }
 }
 
-/// Daily check, and the optional 3 AM install (only while no one is
-/// inserting coins). Nothing happens until an update address is set.
+/// Checks the update list a couple of minutes after start and about once a
+/// day after that, and does the optional 3 AM install (only while no one
+/// is inserting coins).
 pub fn spawn_daily(u: Arc<Updater>, engine: Arc<Engine>) {
     use chrono::Timelike;
+    use rand::Rng;
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(if u.dev { 10 } else { 120 })).await;
+        let first = if u.dev { 10 } else { rand::thread_rng().gen_range(60..240) };
+        tokio::time::sleep(Duration::from_secs(first)).await;
         let mut tick = tokio::time::interval(Duration::from_secs(10 * 60));
         loop {
             tick.tick().await;
             if u.url().is_none() {
                 continue;
             }
-            let due = u.st.lock().unwrap().last_check.is_none_or(|t| crate::db::now() - t >= 24 * 3600 - 600);
+            let due = u.st.lock().unwrap().next_check <= crate::db::now();
             if due {
                 u.check().await;
             }
@@ -1318,7 +1458,7 @@ pub fn spawn_daily(u: Arc<Updater>, engine: Arc<Engine>) {
             let today = now.date_naive();
             let ready = {
                 let s = u.st.lock().unwrap();
-                let newer = s.found.as_ref().is_some_and(|m| Version::parse(&m.version).is_ok_and(|v| v > Version::current()));
+                let newer = s.found.as_ref().is_some_and(|o| o.version > Version::current());
                 newer && s.busy.is_none() && s.auto_day != Some(today)
             };
             if ready && now.hour() == 3 && u.auto() && engine.slot_admin().state == "idle" && !engine.counting() {
@@ -1327,6 +1467,32 @@ pub fn spawn_daily(u: Arc<Updater>, engine: Arc<Engine>) {
                     tracing::info!("automatic update: {e}");
                 }
             }
+        }
+    });
+}
+
+/// The hub has no dashboard: it checks the same way and says so in its log.
+/// Installing is `sudo pisowifi hub update --install`, or the optional
+/// pisowifi-hub-autoupdate.timer.
+pub fn spawn_hub_checks(p: Profile, url: Option<String>, dev: bool) {
+    use rand::Rng;
+    let Some(url) = url else { return };
+    tokio::spawn(async move {
+        let p = Arc::new(p);
+        let mut wait = if dev { 10 } else { rand::thread_rng().gen_range(60..240) };
+        loop {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            let (p2, url2) = (p.clone(), url.clone());
+            let res = tokio::task::spawn_blocking(move || check_online(&p2, &url2, release::trusted_key().as_ref(), Version::current(), dev))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r);
+            match &res {
+                Ok(Some(o)) => tracing::info!("update: version {} is available. Install it with: sudo pisowifi hub update --install", o.version),
+                Ok(None) => tracing::debug!("update: up to date"),
+                Err(e) => tracing::info!("update check: {e}"),
+            }
+            wait = (next_check(res.is_ok()) - crate::db::now()).max(60) as u64;
         }
     });
 }
@@ -1457,6 +1623,7 @@ mod tests {
             update_dir: data.join("update"),
             listen: vec![],
             firewall: false,
+            seen: data.join("update/list-seen"),
         };
         let mut svc = FakeSystemd { bin: layout.bin_link.clone(), data, child: None, calls: vec![] };
         svc.start().unwrap();
@@ -1652,11 +1819,124 @@ mod tests {
 
     #[test]
     fn update_addresses_must_be_https() {
-        assert_eq!(clean_url(" ", false).unwrap(), None, "empty turns online checks off");
-        assert_eq!(clean_url(" https://example.com/rel/ ", false).unwrap().as_deref(), Some("https://example.com/rel"));
-        assert!(clean_url("http://example.com", false).is_err());
-        assert!(clean_url("http://127.0.0.1:9000", true).is_ok());
-        assert!(clean_url("https://a b", false).is_err());
-        assert!(clean_url("file:///etc/passwd", false).is_err());
+        assert_eq!(clean_url(" ", false).unwrap(), None, "empty means the usual list");
+        assert_eq!(clean_url(" https://example.com/rel/stable.json ", false).unwrap().as_deref(), Some("https://example.com/rel/stable.json"));
+        assert!(clean_url("https://example.com/rel/", false).is_err(), "the list itself, not a folder");
+        assert!(clean_url("http://example.com/stable.json", false).is_err());
+        assert!(clean_url("http://127.0.0.1:9000/stable.json", true).is_ok());
+        assert!(clean_url("https://a b/stable.json", false).is_err());
+        assert!(clean_url("file:///etc/stable.json", false).is_err());
+        assert_eq!(hub_url(None, false).unwrap().as_deref(), Some(CHANNEL_URL));
+        assert_eq!(hub_url(Some(""), false).unwrap(), None);
+    }
+
+    /// A tiny web server for the update list tests. Serves files under
+    /// `root`, and remembers what was asked for.
+    fn serve(root: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&req).lines().next().unwrap_or_default().to_string();
+                let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(path.clone());
+                let _ = match fs::read(root.join(path.trim_start_matches('/'))) {
+                    Ok(body) => conn
+                        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes())
+                        .and_then(|_| conn.write_all(&body)),
+                    Err(_) => conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                };
+            }
+        });
+        (base, asked)
+    }
+
+    /// The releases repository as CI publishes it, served locally.
+    struct Published {
+        dir: PathBuf,
+        url: String,
+        asked: Arc<Mutex<Vec<String>>>,
+        profile: Profile,
+        bundle_path: PathBuf,
+    }
+
+    impl Drop for Published {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn publish(version: &str) -> Published {
+        let (dir, _, _) = release::tests::signed_release(&test_key(1), version, release::TARGET);
+        let ver_dir = dir.join(format!("v{version}"));
+        fs::rename(dir.join("dist"), &ver_dir).unwrap();
+        let (base, asked) = serve(dir.clone());
+        let data = dir.join("data");
+        let profile = Profile {
+            kind: Kind::Vendo,
+            service: "pisowifi.service".into(),
+            update_service: "pisowifi-update.service".into(),
+            data_dir: data.clone(),
+            update_dir: data.join("update"),
+            listen: vec![],
+            firewall: false,
+            seen: data.join("update/list-seen"),
+        };
+        let bundle_path = ver_dir.join(release::asset_name(Kind::Vendo, release::TARGET));
+        Published { url: format!("{base}/channels/stable.json"), dir, asked, profile, bundle_path }
+    }
+
+    #[test]
+    fn a_vendo_finds_a_new_version_and_downloads_only_its_own_bundle() {
+        let pb = publish("0.2.0");
+        let key = test_key(1).verifying_key();
+        let o = check_online(&pb.profile, &pb.url, Some(&key), Version(0, 1, 0), true).unwrap().expect("0.2.0 is newer");
+        assert_eq!((o.version, o.notes.as_str()), (Version(0, 2, 0), "Faster coin counting."));
+        let bundle = download(&pb.profile, &o, Some(&key), Version(0, 1, 0), true).unwrap();
+        assert_eq!(bundle, fs::read(&pb.bundle_path).unwrap());
+        let asset = release::asset_name(Kind::Vendo, release::TARGET);
+        assert_eq!(*pb.asked.lock().unwrap(), ["/channels/stable.json", "/channels/stable.json.sig", &format!("/v0.2.0/{asset}")]);
+        // Already on it: nothing to offer, nothing downloaded.
+        assert!(check_online(&pb.profile, &pb.url, Some(&key), Version(0, 2, 0), true).unwrap().is_none());
+        assert!(check_online(&pb.profile, &pb.url, Some(&key), Version(0, 3, 0), true).unwrap().is_none());
+        // Another key's list is refused.
+        let err = check_online(&pb.profile, &pb.url, Some(&test_key(2).verifying_key()), Version(0, 1, 0), true).unwrap_err();
+        assert!(err.to_string().contains("isn't signed"), "{err}");
+    }
+
+    #[test]
+    fn an_old_list_a_changed_download_or_plain_http_is_refused() {
+        let pb = publish("0.2.0");
+        let key = test_key(1).verifying_key();
+        let o = check_online(&pb.profile, &pb.url, Some(&key), Version(0, 1, 0), true).unwrap().unwrap();
+        // Replaying an older (validly signed) list could hide an update.
+        fs::write(&pb.profile.seen, format!("{}\n", o.issued_at + 1)).unwrap();
+        let err = check_online(&pb.profile, &pb.url, Some(&key), Version(0, 1, 0), true).unwrap_err();
+        assert!(err.to_string().contains("older update list"), "{err}");
+        // A changed file of the same size, or a longer one, is caught before its signature is even read.
+        let good = fs::read(&pb.bundle_path).unwrap();
+        let mut changed = good.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&pb.bundle_path, &changed).unwrap();
+        assert!(download(&pb.profile, &o, Some(&key), Version(0, 1, 0), true).unwrap_err().to_string().contains("doesn't match"));
+        fs::write(&pb.bundle_path, [good.as_slice(), b"extra"].concat()).unwrap();
+        assert!(download(&pb.profile, &o, Some(&key), Version(0, 1, 0), true).unwrap_err().to_string().contains("more than expected"));
+        // Outside dev mode only HTTPS is used.
+        fs::remove_file(&pb.profile.seen).unwrap();
+        assert!(check_online(&pb.profile, &pb.url, Some(&key), Version(0, 1, 0), false).is_err());
+        // An older installed version is still refused by the bundle check itself.
+        fs::write(&pb.bundle_path, &good).unwrap();
+        assert!(download(&pb.profile, &o, Some(&key), Version(0, 2, 0), true).unwrap_err().to_string().contains("not newer"));
     }
 }

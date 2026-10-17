@@ -507,12 +507,13 @@ async fn update_status(State(st): State<Shared>) -> Json<Value> {
 }
 
 async fn update_check(State(st): State<Shared>) -> Json<Value> {
+    st.updater.clear_error();
     st.updater.check().await;
     Json(st.updater.view())
 }
 
-/// The owner's file from the GitHub release: checked now, installed only
-/// after they confirm with Install now.
+/// The owner's file (for a vendo with no internet): checked now, installed
+/// only after they confirm with Install now.
 async fn update_upload(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: bytes::Bytes) -> ApiResult<Json<Value>> {
     let u = st.updater.clone();
     let checked = tokio::task::spawn_blocking(move || u.upload(&body)).await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -540,7 +541,9 @@ async fn update_install(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo
 
 #[derive(Deserialize)]
 struct UpdateSettingsReq {
+    online: bool,
     auto: bool,
+    /// Another update list address; empty means the default one.
     #[serde(default)]
     url: String,
 }
@@ -550,11 +553,15 @@ async fn update_settings(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<UpdateSettingsReq>,
 ) -> ApiResult<Json<Value>> {
-    let url = st.updater.set_settings(req.auto, &req.url).map_err(ApiError::bad)?;
-    let detail = match &url {
-        Some(u) => format!("online checks at {u}; install at 3 AM {}", if req.auto { "on" } else { "off" }),
+    st.updater.set_settings(req.online, req.auto, &req.url).map_err(ApiError::bad)?;
+    let detail = match st.updater.url() {
+        Some(u) => format!("online checks at {u}; install at 3 AM {}", if st.updater.auto() { "on" } else { "off" }),
         None => "online checks off".into(),
     };
     st.db.audit(&actor(addr), "update_settings", &detail);
+    if req.online {
+        let u = st.updater.clone();
+        tokio::spawn(async move { u.check().await });
+    }
     Ok(Json(st.updater.view()))
 }

@@ -29,7 +29,7 @@ HUB=dist/pisowifi-hub
 mkdir -p "$HUB"
 cp "target/$HUB_TARGET/release/pisowifi" "$HUB/"
 cp deploy/install-hub.sh deploy/hub.example.toml deploy/pisowifi-hub.service deploy/pisowifi-hub-update.service \
-  deploy/Caddyfile README.md "$HUB/"
+  deploy/pisowifi-hub-autoupdate.service deploy/pisowifi-hub-autoupdate.timer deploy/Caddyfile README.md "$HUB/"
 chmod +x "$HUB/install-hub.sh" "$HUB/pisowifi"
 (cd dist && tar czf pisowifi-hub-x86_64.tar.gz pisowifi-hub && shasum -a 256 pisowifi-hub-x86_64.tar.gz > pisowifi-hub-x86_64.tar.gz.sha256)
 echo "Built dist/pisowifi-hub-x86_64.tar.gz ($(du -h dist/pisowifi-hub-x86_64.tar.gz | cut -f1))"

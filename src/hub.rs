@@ -203,6 +203,10 @@ pub struct HubConfig {
     /// "Add to Google/Apple Wallet" (optional; off when left out).
     #[serde(default)]
     pub wallet: Option<crate::wallet::WalletConfig>,
+    /// The signed update list to check; left out means the usual one, ""
+    /// turns online checks off.
+    #[serde(default)]
+    pub update_url: Option<String>,
 }
 
 impl HubConfig {
@@ -211,7 +215,7 @@ impl HubConfig {
         Ok(toml::from_str(&raw).context("parsing hub config")?)
     }
     pub fn dev(data_dir: PathBuf) -> HubConfig {
-        HubConfig { listen: "127.0.0.1:8700".parse().unwrap(), data_dir, tls_cert: None, tls_key: None, wallet: None }
+        HubConfig { listen: "127.0.0.1:8700".parse().unwrap(), data_dir, tls_cert: None, tls_key: None, wallet: None, update_url: None }
     }
 }
 
@@ -866,7 +870,7 @@ async fn wallet_logo() -> Response {
     ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "public, max-age=86400")], crate::wallet::GOOGLE_LOGO).into_response()
 }
 
-pub async fn run(cfg: HubConfig) -> Result<()> {
+pub async fn run(cfg: HubConfig, dev: bool) -> Result<()> {
     let db = HubDb::open(&cfg.data_dir)?;
     let (passes, held, today) = db.summary()?;
     tracing::info!("hub: {passes} passes, {} h of time held, ₱{today} in the last 24 h", held / 3600);
@@ -893,6 +897,10 @@ pub async fn run(cfg: HubConfig) -> Result<()> {
     // An update is only kept once the new version gets this far.
     if let Err(e) = crate::update::report_healthy(&cfg.data_dir, false) {
         tracing::warn!("writing health report: {e:#}");
+    }
+    match crate::update::hub_url(cfg.update_url.as_deref(), dev) {
+        Ok(url) => crate::update::spawn_hub_checks(crate::update::Profile::hub(&cfg.data_dir, cfg.listen, dev), url, dev),
+        Err(e) => tracing::warn!("update_url in hub.toml: {e}"),
     }
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},

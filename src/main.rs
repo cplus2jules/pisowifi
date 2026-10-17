@@ -142,17 +142,38 @@ enum Cmd {
         #[arg(long)]
         target: String,
     },
+    /// (CI) Write the signed update list (<out-dir>/<channel>.json and .sig) for signed bundles
+    #[command(hide = true)]
+    ReleaseChannel {
+        #[arg(long, default_value = "PISOWIFI_RELEASE_KEY")]
+        key_env: String,
+        /// Refuse unless the key matches this public key file (release-key.pub)
+        #[arg(long)]
+        expect_public: PathBuf,
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(required = true)]
+        bundles: Vec<PathBuf>,
+    },
 }
 
 #[derive(clap::Args)]
 struct UpdateArgs {
     /// Only check whether a newer version is out
-    #[arg(long, conflicts_with = "file")]
+    #[arg(long, conflicts_with_all = ["file", "install"])]
     check: bool,
-    /// Install a bundle downloaded from the GitHub release (it carries its signature)
+    /// Download the newest version and install it
+    #[arg(long, conflicts_with = "file")]
+    install: bool,
+    /// (the hub's 3 AM timer) Like --install, quiet when up to date
+    #[arg(long, hide = true, conflicts_with = "file")]
+    auto: bool,
+    /// Install a bundle file instead (it carries its signature), for a box without internet
     #[arg(long, value_name = "BUNDLE")]
     file: Option<PathBuf>,
-    /// Install from an update server [default: the address set in the dashboard; none until you set one]
+    /// Use another update list (…/stable.json); on its own it installs from there
     #[arg(long, value_name = "URL", num_args = 0..=1, default_missing_value = "", conflicts_with = "file")]
     url: Option<String>,
     /// Show the installed version and how the last update went (the default)
@@ -173,6 +194,8 @@ impl From<UpdateArgs> for update::Args {
     fn from(a: UpdateArgs) -> Self {
         update::Args {
             check: a.check,
+            install: a.install,
+            auto: a.auto,
             file: a.file,
             url: a.url,
             run_pending: a.run_pending,
@@ -267,6 +290,16 @@ fn main() -> Result<()> {
             println!("Signed {} (sha256 {sha})", bundle.display());
             return Ok(());
         }
+        Cmd::ReleaseChannel { key_env, expect_public, channel, out_dir, bundles } => {
+            let key = release::key_from_env(&key_env)?;
+            let public = std::fs::read_to_string(&expect_public).with_context(|| format!("reading {}", expect_public.display()))?;
+            if key.verifying_key() != release::parse_public(&public)? {
+                bail!("{key_env} doesn't match {}, so vendos would refuse what it signs. Nothing was signed.", expect_public.display());
+            }
+            let c = release::write_channel(&key, &channel, &bundles, &out_dir)?;
+            println!("Wrote {}/{channel}.json for version {} ({} bundles)", out_dir.display(), c.version, c.files.len());
+            return Ok(());
+        }
         Cmd::ReleaseVerify { bundle, public_key, kind, target } => {
             let key = release::parse_public(&std::fs::read_to_string(&public_key)?)?;
             let expect = release::Expect { kind: release::Kind::parse(&kind)?, target: &target, current: None, allow_same: false };
@@ -353,13 +386,10 @@ fn main() -> Result<()> {
         }
         Cmd::Update(a) => {
             let p = update::Profile::vendo(&cfg, cli.dev);
-            let configured = || -> Result<Option<String>> {
-                let db = open_db(&cfg, cli.dev)?;
-                Ok(db.get_setting(update::URL_KEY)?.filter(|u| !u.is_empty()))
-            };
+            let configured = || update::vendo_url(&open_db(&cfg, cli.dev)?);
             update::cli(&p, a.into(), cli.dev, &configured)
         }
-        Cmd::Hub { .. } | Cmd::AllowMac { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } => unreachable!(),
+        Cmd::Hub { .. } | Cmd::AllowMac { .. } | Cmd::ReleaseKey { .. } | Cmd::ReleaseSign { .. } | Cmd::ReleaseVerify { .. } | Cmd::ReleaseChannel { .. } => unreachable!(),
         Cmd::Restore { from } => {
             let source = if keys::chip_id_readable(cli.dev) { keys::Source::Chip } else { keys::Source::File };
             let k = keys::derive(&cfg.storage.data_dir, source, false)?;
@@ -375,11 +405,11 @@ fn main() -> Result<()> {
 fn run_hub(cfg: hub::HubConfig, cmd: HubCmd, dev: bool) -> Result<()> {
     if let HubCmd::Update(a) = cmd {
         let p = update::Profile::hub(&cfg.data_dir, cfg.listen, dev);
-        return update::cli(&p, a.into(), dev, &|| Ok(None));
+        return update::cli(&p, a.into(), dev, &|| update::hub_url(cfg.update_url.as_deref(), dev));
     }
     ensure_data_dir(&cfg.data_dir)?;
     match &cmd {
-        HubCmd::Run => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(hub::run(cfg)),
+        HubCmd::Run => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(hub::run(cfg, dev)),
         HubCmd::AddVendo { name } => {
             let name = brand::clean_text(name, 40);
             let code = hub::HubDb::open(&cfg.data_dir)?.add_enroll_code(&name)?;

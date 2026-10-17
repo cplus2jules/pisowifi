@@ -243,6 +243,8 @@ label { display: grid; gap: 6px; font-weight: 600; font-size: 12.5px; color: var
 .upd-more .row input { flex: 1; min-width: 200px; width: auto; }
 .upd-online { display: grid; gap: 12px; }
 .upd-online .row .sub { margin: 0; }
+.upd-online code { word-break: break-all; }
+.upd-url-label small { font-weight: 400; }
 #upd-pick.busy { opacity: .6; pointer-events: none; }
 
 .rates { display: grid; gap: 10px; }

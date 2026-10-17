@@ -17,7 +17,7 @@ ask()  { local a; read -r -p "$1 [y/N] " a; [[ "$a" =~ ^[Yy] ]]; }
 NEW="$(./pisowifi --version | awk '{print $2}')"
 CONF=/etc/pisowifi/hub.toml
 LIB=/usr/local/lib/pisowifi
-UNITS=(pisowifi-hub.service pisowifi-hub-update.service)
+UNITS=(pisowifi-hub.service pisowifi-hub-update.service pisowifi-hub-autoupdate.service pisowifi-hub-autoupdate.timer)
 
 # ---- Upgrade ---------------------------------------------------------------------
 if [[ -f "$CONF" && -e /usr/local/bin/pisowifi ]] && systemctl cat pisowifi-hub.service >/dev/null 2>&1; then
@@ -85,7 +85,10 @@ cat <<EOF
   The hub is running ($CONF).
   Next:     HTTPS with Caddy (see Caddyfile), then on this server:
             sudo pisowifi hub add-vendo --name "Barangay A"
-  Updates:  download pisowifi-hub-x86_64.tar.gz from the GitHub release, then
-            sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz
+  Updates:  the hub checks for new versions every day and says so in its log
+            (journalctl -u pisowifi-hub). To install one:
+              sudo pisowifi hub update --install
+            Or let it install them by itself at about 3 AM:
+              sudo systemctl enable --now pisowifi-hub-autoupdate.timer
 
 EOF

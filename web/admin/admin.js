@@ -841,7 +841,8 @@ function renderUpdate(note, noteBad) {
   else if (u.busy === "checking") { pill = "Checking"; cls = "off"; }
   else if (u.busy === "downloading") { pill = "Downloading"; cls = "off"; }
   else if (updRestarting) { pill = "Installing"; cls = "off"; }
-  else if (offer) { pill = "Ready to install"; cls = "on"; }
+  else if (u.ready) { pill = "Ready to install"; cls = "on"; }
+  else if (u.available) { pill = "Update available"; cls = "on"; }
   $("upd-status").textContent = pill;
   $("upd-status").className = "status " + cls;
 
@@ -849,13 +850,13 @@ function renderUpdate(note, noteBad) {
   if (offer) {
     $("upd-notes-title").textContent = u.ready
       ? "Version " + offer.version + " checks out. Signed " + day(offer.created) + "."
-      : "Version " + offer.version + " is out. Signed " + day(offer.created) + ".";
+      : "Version " + offer.version + " is available. Released " + day(offer.issued_at) + ".";
     $("upd-notes-text").textContent = offer.notes || "No notes for this version.";
   }
 
   let msg = note || "", bad = !!noteBad;
   if (!msg) {
-    if (!u.signed) msg = "Updates are off: this copy was built without a release key. Reinstall it once from a bundle on the GitHub release page.";
+    if (!u.signed) msg = "Updates are off: this copy was built without a release key. Reinstall it once from a signed bundle.";
     else if (u.error) { msg = u.error; bad = true; }
     else if (u.busy === "checking") msg = "Checking…";
     else if (u.busy === "downloading") msg = "Downloading and checking version " + (u.available ? u.available.version : "") + "…";
@@ -865,19 +866,24 @@ function renderUpdate(note, noteBad) {
   $("upd-msg").hidden = !msg;
   $("upd-msg").classList.toggle("bad", bad);
 
-  $("upd-pick-row").hidden = !u.signed || !!offer || working;
   $("upd-ready-row").hidden = !offer || working;
   $("upd-cancel").hidden = !u.ready;
+  $("upd-check-row").hidden = !u.signed || !!u.ready || working;
+  $("upd-check").disabled = !u.online;
+  $("upd-upload").hidden = !u.signed || !!u.ready || working;
+  // Without internet the upload is the way in, so it opens by itself.
+  if (!u.online || u.check_error) $("upd-upload").open = true;
 
-  $("upd-example").textContent = u.example_url;
+  $("upd-default").textContent = u.default_url;
   if (document.activeElement !== $("upd-url")) $("upd-url").value = u.url;
+  $("upd-online").checked = u.online;
   $("upd-auto").checked = u.auto;
   $("upd-auto").disabled = !u.online;
-  $("upd-check").disabled = !u.online || working || !u.signed;
   let latest = "";
   if (!u.online) latest = "Online checks are off.";
   else if (u.check_error) latest = "Couldn't check: " + u.check_error;
-  else if (u.last_check) latest = (u.available ? "Version " + u.available.version + " is out" : "You have the newest version") + " (checked " + when(u.last_check) + ").";
+  else if (u.last_check) latest = (u.available ? "Version " + u.available.version + " is available" : "You have the newest version") + " (checked " + when(u.last_check) + ").";
+  else latest = "Not checked yet.";
   $("upd-latest").textContent = latest;
 }
 
@@ -934,25 +940,34 @@ $("upd-check").addEventListener("click", (ev) => busy(ev.currentTarget, async ()
   renderUpdate();
 }));
 
-const saveUpdateSettings = () => api("PUT", "/update/settings", { auto: $("upd-auto").checked, url: $("upd-url").value.trim() });
-
-$("upd-auto").addEventListener("change", async (ev) => {
-  try {
-    upd = await saveUpdateSettings();
-    renderUpdate();
-    toast(upd.auto ? "New versions will install by themselves at 3 AM" : "Automatic installs are off");
-  } catch (e) {
-    ev.target.checked = !ev.target.checked;
-    toast(e.message, true);
-  }
+const saveUpdateSettings = () => api("PUT", "/update/settings", {
+  online: $("upd-online").checked,
+  auto: $("upd-auto").checked,
+  url: $("upd-url").value.trim(),
 });
+
+for (const id of ["upd-online", "upd-auto"]) {
+  $(id).addEventListener("change", async (ev) => {
+    try {
+      upd = await saveUpdateSettings();
+      renderUpdate();
+      loadUpdate();
+      if (id === "upd-online") toast(upd.online ? "The vendo checks for new versions online" : "Online checks are off");
+      else toast(upd.auto ? "New versions will install by themselves at 3 AM" : "Automatic installs are off");
+    } catch (e) {
+      ev.target.checked = !ev.target.checked;
+      toast(e.message, true);
+    }
+  });
+}
 
 $("upd-url-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
   busy(ev.submitter, async () => {
     upd = await saveUpdateSettings();
     renderUpdate();
-    toast(upd.online ? "Saved. Tap Check now to look there." : "Online checks are off");
+    loadUpdate();
+    toast(upd.url ? "Saved. Checking there now." : "Saved. Using the usual update list.");
   });
 });
 
