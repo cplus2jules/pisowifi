@@ -318,7 +318,8 @@ label { display: grid; gap: 6px; font-weight: 600; font-size: 12.5px; color: var
   .earn-body { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
-  .app { grid-template-columns: 1fr; }
+  /* minmax(0, …): a plain 1fr can't shrink below the nav row, which would widen the whole page. */
+  .app { grid-template-columns: minmax(0, 1fr); }
   .side { position: sticky; top: 61px; z-index: 4; height: auto; padding: 0; border-right: 0; border-bottom: 1px solid var(--line); background: var(--bg); }
   .nav { display: flex; overflow-x: auto; scrollbar-width: none; }
   .nav button { padding: 12px 14px; border-left: 0; border-bottom: 3px solid transparent; white-space: nowrap; }
