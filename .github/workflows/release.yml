@@ -1,0 +1,184 @@
+# Builds, signs and publishes a release (README → Updating).
+#
+# Only the owner can start it, and starting it is the approval: push a
+# version tag (git tag -a v0.2.0 -m "notes" && git push origin v0.2.0), or use
+# "Run workflow" on the Actions tab. Pull requests and ordinary pushes never
+# run it.
+#
+# The build job runs third-party build scripts (crates.io), so it never sees
+# the signing key. Only the sign job gets the PISOWIFI_RELEASE_KEY secret, in
+# one step, and it never echoes it, writes it to a file or uploads it.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "What changed (owners see this in the dashboard before installing)"
+        required: false
+        default: ""
+      min_from:
+        description: "Oldest version that may update straight to this one"
+        required: false
+        default: "0.0.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: "1.98.1"
+  ZIG_VERSION: "0.17.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version and release key
+        id: version
+        run: |
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -1)"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version."
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::Run releases from main (this run is on $GITHUB_REF_NAME)."
+            exit 1
+          fi
+          if [[ ! -f release-key.pub ]]; then
+            echo "::error::release-key.pub is missing. Run scripts/make-release-key.sh once and commit the file."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Release notes
+        env:
+          NOTES: ${{ inputs.notes }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p notes
+          # A tag push: the notes are the annotated tag's message.
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")"
+            if [[ "$(jq -r .object.type <<<"$ref")" == tag ]]; then
+              NOTES="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$(jq -r .object.sha <<<"$ref")" --jq .message \
+                | sed '/-----BEGIN PGP SIGNATURE-----/,$d')"
+            fi
+          fi
+          printf '%s\n' "$NOTES" > notes/RELEASE_NOTES.md
+
+      - name: Install Rust, zig and cargo-zigbuild
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --target armv7-unknown-linux-musleabihf --target x86_64-unknown-linux-musl
+          rustup default "$RUST_VERSION"
+          python3 -m pip install --user --quiet "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run the tests
+        run: cargo test --locked
+
+      - name: Build the vendo and hub bundles
+        env:
+          SKIP_TESTS: "1"
+        run: scripts/build-pi.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned
+          path: |
+            dist/pisowifi-armv7.tar.gz
+            dist/pisowifi-hub-x86_64.tar.gz
+            notes/RELEASE_NOTES.md
+          retention-days: 1
+          if-no-files-found: error
+
+  sign:
+    name: Sign and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned
+          path: unsigned
+
+      - name: Refuse to overwrite a published version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::v$VERSION is already published. Raise the version in Cargo.toml first."
+            exit 1
+          fi
+
+      - name: Sign
+        env:
+          PISOWIFI_RELEASE_KEY: ${{ secrets.PISOWIFI_RELEASE_KEY }}
+          MIN_FROM: ${{ inputs.min_from || '0.0.0' }}
+        run: |
+          if [[ -z "${PISOWIFI_RELEASE_KEY:-}" ]]; then
+            echo "::error::The PISOWIFI_RELEASE_KEY secret isn't set. Run scripts/make-release-key.sh once."
+            exit 1
+          fi
+          mkdir -p dist tool
+          cp unsigned/dist/*.tar.gz dist/
+          # The hub's x86_64 build runs on this runner, so it does the signing.
+          tar xzf dist/pisowifi-hub-x86_64.tar.gz -C tool pisowifi-hub/pisowifi
+          sign() {
+            tool/pisowifi-hub/pisowifi release-sign --key-env PISOWIFI_RELEASE_KEY --expect-public release-key.pub \
+              --bundle "$1" --kind "$2" --target "$3" --version "$VERSION" --min-from "$MIN_FROM" \
+              --notes-file unsigned/notes/RELEASE_NOTES.md
+          }
+          sign dist/pisowifi-armv7.tar.gz vendo armv7-unknown-linux-musleabihf
+          sign dist/pisowifi-hub-x86_64.tar.gz hub x86_64-unknown-linux-musl
+
+      - name: Check the signatures against release-key.pub
+        run: |
+          tool/pisowifi-hub/pisowifi release-verify --bundle dist/pisowifi-armv7.tar.gz --public-key release-key.pub \
+            --kind vendo --target armv7-unknown-linux-musleabihf
+          tool/pisowifi-hub/pisowifi release-verify --bundle dist/pisowifi-hub-x86_64.tar.gz --public-key release-key.pub \
+            --kind hub --target x86_64-unknown-linux-musl
+          (cd dist && sha256sum pisowifi-armv7.tar.gz > pisowifi-armv7.tar.gz.sha256 \
+            && sha256sum pisowifi-hub-x86_64.tar.gz > pisowifi-hub-x86_64.tar.gz.sha256)
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            cat unsigned/notes/RELEASE_NOTES.md
+            echo
+            echo "**Vendo:** download \`pisowifi-armv7.tar.gz\`, then dashboard → Settings → Update → Choose update file."
+            echo "**Hub:** \`pisowifi-hub-x86_64.tar.gz\`, then \`sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz\`."
+            echo
+            echo "Both are signed with the key in \`release-key.pub\`; the \`.manifest\` files hold the same signed manifest for online checks."
+          } > body.md
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "v$VERSION" --notes-file body.md \
+            dist/pisowifi-armv7.tar.gz dist/pisowifi-armv7.tar.gz.manifest dist/pisowifi-armv7.tar.gz.sha256 \
+            dist/pisowifi-hub-x86_64.tar.gz dist/pisowifi-hub-x86_64.tar.gz.manifest dist/pisowifi-hub-x86_64.tar.gz.sha256

@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Builds the Orange Pi bundle on your Mac: dist/pisowifi-armv7.tar.gz
+# (and the hub's). These are unsigned: releases are built and signed by
+# GitHub CI (.github/workflows/release.yml), which runs this same script.
 # Needs: rustup target armv7-unknown-linux-musleabihf, zig, cargo-zigbuild.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+# macOS tar would otherwise add ._ resource-fork files to the bundles.
+export COPYFILE_DISABLE=1
 
 TARGET=armv7-unknown-linux-musleabihf
-cargo test --quiet
+# CI runs the tests in a step of their own.
+[[ "${SKIP_TESTS:-}" == 1 ]] || cargo test --quiet
 cargo zigbuild --release --target "$TARGET"
 
 OUT=dist/pisowifi

@@ -2,8 +2,8 @@
 // * PISOWIFI_TARGET: the target triple this binary is built for, so a bundle
 //   for another board is refused;
 // * PISOWIFI_RELEASE_PUBKEY: the owner's Ed25519 release key (hex), from
-//   release-key.pub. scripts/release.sh writes that file the first time it
-//   runs. Without it, the build still works but refuses every update.
+//   release-key.pub, which scripts/make-release-key.sh writes once. Without
+//   it the build still works, but refuses every update.
 use std::{env, fs};
 
 fn main() {

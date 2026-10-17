@@ -85,7 +85,7 @@ cat <<EOF
   The hub is running ($CONF).
   Next:     HTTPS with Caddy (see Caddyfile), then on this server:
             sudo pisowifi hub add-vendo --name "Barangay A"
-  Updates:  sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz
-            (its .manifest next to it), or run this script from a newer bundle.
+  Updates:  download pisowifi-hub-x86_64.tar.gz from the GitHub release, then
+            sudo pisowifi hub update --file pisowifi-hub-x86_64.tar.gz
 
 EOF
