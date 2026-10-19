@@ -10,9 +10,10 @@ export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 export COPYFILE_DISABLE=1
 
 TARGET=armv7-unknown-linux-musleabihf
-# CI runs the tests in a step of their own.
+# CI skips them: they run on the Mac before a release is tagged.
 [[ "${SKIP_TESTS:-}" == 1 ]] || cargo test --quiet
-cargo zigbuild --release --target "$TARGET"
+# --locked: build exactly the dependencies in Cargo.lock.
+cargo zigbuild --locked --release --target "$TARGET"
 
 OUT=dist/pisowifi
 rm -rf dist && mkdir -p "$OUT"
@@ -24,7 +25,7 @@ chmod +x "$OUT"/*.sh "$OUT/pisowifi"
 
 # Hub for a regular cloud server (x86_64 Linux).
 HUB_TARGET=x86_64-unknown-linux-musl
-cargo zigbuild --release --target "$HUB_TARGET"
+cargo zigbuild --locked --release --target "$HUB_TARGET"
 HUB=dist/pisowifi-hub
 mkdir -p "$HUB"
 cp "target/$HUB_TARGET/release/pisowifi" "$HUB/"

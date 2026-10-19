@@ -216,7 +216,7 @@ rather than starting an empty database.
 ## Updating
 
 You develop on the Mac and push to GitHub as usual. When a version is ready,
-you tag it: GitHub tests it, builds it, signs it and publishes it, and every
+you tag it: GitHub builds it, signs it and publishes it, and every
 vendo with internet offers it the same day. An ordinary push ships nothing.
 
 - **`cplus2jules/pisowifi`** (private) holds the code. Each release is also
@@ -258,16 +258,17 @@ don't know the key yet. Give each one the first release over SSH, once
 
 ### Every release
 
-1. Raise `version` in `Cargo.toml` (say to `0.2.0`), commit and push.
-2. Tag it. The tag's message is the release notes owners see before installing:
+1. Run the tests on the Mac: `cargo test`. GitHub doesn't run them, to save
+   Actions minutes, so this is the check before every vendo gets the update.
+2. Raise `version` in `Cargo.toml` (say to `0.2.0`), commit and push.
+3. Tag it. The tag's message is the release notes owners see before installing:
 
    ```bash
    git tag -a v0.2.0 -m "Coins are counted faster."
    git push origin v0.2.0
    ```
 
-That's all. Actions → Release shows the progress. GitHub runs the tests,
-builds the vendo (`pisowifi-armv7.tar.gz`) and hub
+That's all. Actions → Release shows the progress. GitHub builds the vendo (`pisowifi-armv7.tar.gz`) and hub
 (`pisowifi-hub-x86_64.tar.gz`) bundles, signs them, writes the signed update
 list, and pushes all of it to `pisowifi-releases` as one fresh commit, so that
 repository stays small. You can also start a release from Actions → Release →

@@ -44,7 +44,7 @@ env:
 
 jobs:
   build:
-    name: Test and build
+    name: Build
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -96,9 +96,9 @@ jobs:
           python3 -m pip install --user --quiet "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Run the tests
-        run: cargo test --locked
-
+      # The tests run on the Mac before a release is tagged (README → Every
+      # release), not here: that saves about 4½ of this account's limited
+      # Actions minutes per release.
       - name: Build the vendo and hub bundles
         env:
           SKIP_TESTS: "1"
