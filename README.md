@@ -625,7 +625,9 @@ wallet.
 | Unlimited PPPoE | `accel-ppp` or `pppoe-server` on a VLAN, with monthly accounts managed from the dashboard. |
 | VLAN + auto-select coinslot | Each sub-vendo on its own VLAN (managed switch). The coin slot that's reserved follows the VLAN the customer is on. |
 | GCash / Maya | Needs a merchant account (PayMongo / Xendit / Maya Business). Payment webhooks would credit time just like coins. |
-| E-loading, cash-in, phone rental, PisoNet, kiosk | Separate modules on the same engine and ledger. |
+| E-loading | Researched 2026-10-19, not started. Customers pick a network, type the number twice, drop coins, and the load is paid from the owner's prepaid wallet with a provider. It uses the same coin slot, sales ledger and activity log. LoadCentral closed in Nov 2024, and no Philippine e-load service offers small owners an open API. First step: ask DafoxTech (what AdoPiSoft uses) for API access, with Reloadly (sandbox, USD wallet, US$100 minimum) as the fallback. Build it against a practice provider first. |
+| Cash-in (GCash / Maya / GoTyme / MariBank) | On hold. Sending customers' cash to their wallets through the owner's own payout account counts as money transfer under BSP rules (OPS and remittance registration, AMLA). It is possible only through a BSP-registered partner that offers it to vendos. |
+| Phone rental, PisoNet, kiosk | Separate modules on the same engine and ledger. |
 | Remote monitoring | The hub now sees every vendo's heartbeat; a hub web dashboard (chain-wide earnings, offline alerts) is next. |
 | Multi-owner networks | Phase 2 of Piso Pass: different owners sharing passes, with settlement for time used at someone else's vendo. |
 
