@@ -132,6 +132,14 @@ function setClock(secs) {
 
 // ---- rendering --------------------------------------------------------------
 
+// "Until about 5:25 AM" over "Tue, Oct 21", by the phone's own clock and language.
+function setUntil(sub, left) {
+  const t = new Date(Date.now() + left * 1000);
+  const time = "Until about " + t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const day = t.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  if (sub.textContent !== time + day) sub.replaceChildren(time, el("span", day, "until-day"));
+}
+
 function renderClock() {
   if (!state) return;
   const left = state.running ? Math.max(0, state.remaining_secs - elapsed()) : state.remaining_secs;
@@ -143,9 +151,8 @@ function renderClock() {
   m.classList.toggle("empty", left === 0);
   $("status-text").textContent = online ? "Online" : paused ? "Paused" : "Offline";
   $("meter-label").textContent = online ? "You're online" : paused ? "Time saved" : "No time yet";
-  $("meter-sub").textContent = online
-    ? "Until about " + new Date(Date.now() + left * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
-    : paused ? "Paused. Your time isn't running." : state.blocked ? "Talk to the owner to get online" : "Drop a coin to get online";
+  if (online) setUntil($("meter-sub"), left);
+  else $("meter-sub").textContent = paused ? "Paused. Your time isn't running." : state.blocked ? "Talk to the owner to get online" : "Drop a coin to get online";
   $("pause").hidden = !online;
   $("resume").hidden = !paused;
   renderDrain(left, online);
@@ -233,6 +240,9 @@ function render() {
     $("busy").hidden = slot.state !== "busy";
     $("slot-title").textContent = state.remaining_secs > 0 ? "Add more time" : "Insert coin";
     $("slot-sub").textContent = state.remaining_secs > 0 ? "Top up before your time runs out" : "Tap here first, then drop your coins";
+    $("ob-away").textContent = state.auto_pause_mins
+      ? " Leave the WiFi and your time pauses by itself after " + state.auto_pause_mins + " minutes, then starts again when you're back."
+      : "";
     renderRates();
     renderClock();
   };
@@ -481,7 +491,8 @@ function confetti(from) {
   if (REDUCE) return;
   const box = from.getBoundingClientRect();
   const layer = $("confetti");
-  const colors = ["#5A43E6", "#D4F04C", "#C3B9F7", "#7B5FF2", "#1E1F2E"];
+  const b = state && state.brand;
+  const colors = b ? [b.accent, b.button || LIME, mix(b.accent, "#ffffff", 0.62), mix(b.accent, "#ffffff", 0.2), "#1E1F2E"] : ["#5A43E6", LIME, "#C3B9F7", "#7B5FF2", "#1E1F2E"];
   for (let i = 0; i < 36; i++) {
     const p = document.createElement("i");
     const w = 6 + Math.random() * 6;
@@ -505,6 +516,15 @@ function confetti(from) {
 
 // ---- owner branding -----------------------------------------------------------
 
+const LIME = "#D4F04C";
+
+// Relative luminance (0 black … 1 white) of "#RRGGBB".
+function luminance(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 function mix(hex, other, t) {
   const p = (h, i) => parseInt(h.slice(i, i + 2), 16);
   return "#" + [1, 3, 5].map((i) => Math.round(p(hex, i) * (1 - t) + p(other, i) * t).toString(16).padStart(2, "0")).join("");
@@ -518,21 +538,43 @@ function svgEl(tag, attrs) {
 }
 
 // Built-in coin + WiFi mark in the owner's accent colour.
-function defaultMark(accent) {
+function defaultMark(accent, button) {
   const s = svgEl("svg", { viewBox: "0 0 64 64" });
   const g = svgEl("g", { fill: "none", stroke: accent, "stroke-width": 4, "stroke-linecap": "round" });
   g.append(svgEl("path", { d: "M27.05 32.05a7 7 0 0 1 9.9 0" }), svgEl("path", { d: "M22.8 27.8a13 13 0 0 1 18.4 0" }));
-  s.append(svgEl("rect", { width: 64, height: 64, rx: 18, fill: accent }), svgEl("circle", { cx: 32, cy: 32, r: 20, fill: "#D4F04C" }), g,
+  s.append(svgEl("rect", { width: 64, height: 64, rx: 18, fill: accent }), svgEl("circle", { cx: 32, cy: 32, r: 20, fill: button }), g,
     svgEl("circle", { cx: 32, cy: 38, r: 3, fill: accent }));
   return s;
 }
 
 function logoNode(b) {
-  if (!b.logo) return defaultMark(b.accent);
+  if (!b.logo) return defaultMark(b.accent, b.button || LIME);
   const img = document.createElement("img");
   img.src = b.logo;
   img.alt = "";
   return img;
+}
+
+// The owner's font for the name. Fonts are built into the vendo (no
+// internet needed); each is loaded once, only when picked.
+const nameFonts = {};
+function applyNameFont(b) {
+  const root = document.documentElement.style;
+  root.setProperty("--name-weight", String(b.name_weight || 800));
+  const key = b.name_font;
+  if (!key || !window.FontFace || !document.fonts) {
+    root.removeProperty("--name-font");
+    root.removeProperty("--name-track");
+    return;
+  }
+  const family = "Name " + key;
+  if (!nameFonts[key]) {
+    nameFonts[key] = new FontFace(family, "url(/fonts/" + key + ".woff2)", { weight: "1 1000", display: "swap", sizeAdjust: (b.name_size || 100) + "%" });
+    document.fonts.add(nameFonts[key]);
+    nameFonts[key].load().catch(() => {});
+  }
+  root.setProperty("--name-font", '"' + family + '", var(--font)');
+  root.setProperty("--name-track", "0");
 }
 
 let brandKey = "";
@@ -550,6 +592,13 @@ function applyBrand(b) {
   root.setProperty("--lavender-2", mix(b.accent, "#ffffff", 0.8));
   root.setProperty("--lavender-3", mix(b.accent, "#ffffff", 0.62));
   document.querySelector("#ring-grad stop:last-child").setAttribute("stop-color", b.accent);
+  // The coin button's colour, with text that stays readable on it.
+  const btn = b.button || LIME, dark = luminance(btn) < 0.2;
+  root.setProperty("--lime", btn);
+  root.setProperty("--lime-ink", dark ? mix(btn, "#ffffff", 0.78) : mix(btn, "#000000", 0.7));
+  root.setProperty("--lime-bright", dark ? mix(btn, "#ffffff", 0.55) : btn);
+  root.setProperty("--on-lime", dark ? "#ffffff" : "var(--ink)");
+  document.querySelector("#ring-grad stop:first-child").setAttribute("stop-color", btn);
   $("logo").replaceChildren(logoNode(b));
   $("ob-logo").replaceChildren(logoNode(b));
   $("ob-name").textContent = b.name;
@@ -558,6 +607,7 @@ function applyBrand(b) {
   $("hs-name").textContent = b.name;
   renderSoundBtn();
   renderNotice(b.notice || "");
+  applyNameFont(b);
 
   const fig = $("poster"), img = $("poster-img");
   if (b.poster) {
@@ -673,6 +723,8 @@ async function refresh() {
     state = await api("/me");
     fetchedAt = performance.now();
     render();
+    // Its time was paused while it was away and started again just now.
+    if (state.welcome_back) toast("Welcome back! Your time started again.");
     renderPass();
     renderHome();
     maybeOnboard();

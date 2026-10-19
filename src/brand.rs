@@ -14,6 +14,8 @@ use std::sync::{Arc, RwLock};
 pub const ASSETS: &[&str] = &["logo", "poster", "icon"];
 pub const MAX_ASSET_BYTES: usize = 1536 * 1024;
 pub const DEFAULT_ACCENT: &str = "#5A43E6";
+/// The big coin button (and small highlights), until the owner picks another.
+pub const DEFAULT_BUTTON: &str = "#D4F04C";
 /// Where customers land once online, until the owner picks another page (or none).
 pub const DEFAULT_AFTER_URL: &str = "https://www.google.com/search?q=cats";
 
@@ -21,6 +23,8 @@ pub const DEFAULT_AFTER_URL: &str = "https://www.google.com/search?q=cats";
 pub struct Brand {
     pub name: String,
     pub accent: String,
+    /// Colour of the big coin button, `#RRGGBB`.
+    pub button: String,
     pub wifi_name: String,
     pub logo: Option<String>,
     pub icon: Option<String>,
@@ -30,6 +34,12 @@ pub struct Brand {
     pub after_url: String,
     /// A short message for customers at the top of the page (empty: none).
     pub notice: String,
+    /// Font for the name, a key of [`crate::fonts::FONTS`] ("": the phone's own).
+    pub name_font: String,
+    /// Thickness of the name, within that font's range.
+    pub name_weight: u16,
+    /// The font's size adjustment, in percent.
+    pub name_size: u16,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,6 +119,7 @@ impl BrandStore {
             brand: RwLock::new(Brand {
                 name: String::new(),
                 accent: DEFAULT_ACCENT.into(),
+                button: DEFAULT_BUTTON.into(),
                 wifi_name: String::new(),
                 logo: None,
                 icon: None,
@@ -116,6 +127,9 @@ impl BrandStore {
                 sounds: true,
                 after_url: String::new(),
                 notice: String::new(),
+                name_font: String::new(),
+                name_weight: crate::fonts::SYSTEM.2,
+                name_size: 100,
             }),
             assets: RwLock::new(assets),
         };
@@ -142,6 +156,19 @@ impl BrandStore {
     /// `notice` must already be cleaned by [`clean_text`].
     pub fn set_notice(&self, db: &Db, notice: &str) -> Result<()> {
         db.set_setting("notice", notice)?;
+        self.refresh(db)
+    }
+
+    /// `hex` must pass [`valid_accent`].
+    pub fn set_button(&self, db: &Db, hex: &str) -> Result<()> {
+        db.set_setting("button_color", hex)?;
+        self.refresh(db)
+    }
+
+    /// `font` must be "" or a key of [`crate::fonts::FONTS`].
+    pub fn set_name_font(&self, db: &Db, font: &str, weight: Option<u16>) -> Result<()> {
+        db.set_setting("name_font", font)?;
+        db.set_setting("name_weight", &crate::fonts::weight_for(font, weight).to_string())?;
         self.refresh(db)
     }
 
@@ -197,9 +224,13 @@ impl BrandStore {
         let assets = self.assets.read().unwrap();
         let url = |n: &str| assets.get(n).map(|a| format!("/brand/{n}?v={}", a.version));
         let accent = db.get_setting("accent")?.filter(|a| valid_accent(a)).unwrap_or_else(|| DEFAULT_ACCENT.into());
+        let font = db.get_setting("name_font")?.and_then(|k| crate::fonts::find(&k));
+        let key = font.map_or("", |f| f.key);
+        let weight = crate::fonts::weight_for(key, db.get_setting("name_weight")?.and_then(|w| w.parse().ok()));
         let b = Brand {
             name: db.get_setting("portal_name")?.unwrap_or_else(|| "Piso WiFi".into()),
             accent,
+            button: db.get_setting("button_color")?.filter(|a| valid_accent(a)).unwrap_or_else(|| DEFAULT_BUTTON.into()),
             wifi_name: db.get_setting("wifi_name")?.unwrap_or_default(),
             logo: url("logo"),
             icon: url("icon"),
@@ -207,6 +238,9 @@ impl BrandStore {
             sounds: db.get_setting("portal_sounds")?.is_none_or(|v| v != "0"),
             after_url: db.get_setting("after_url")?.unwrap_or_else(|| DEFAULT_AFTER_URL.into()),
             notice: db.get_setting("notice")?.unwrap_or_default(),
+            name_font: key.to_string(),
+            name_weight: weight,
+            name_size: font.map_or(100, |f| f.size),
         };
         *self.brand.write().unwrap() = b;
         Ok(())

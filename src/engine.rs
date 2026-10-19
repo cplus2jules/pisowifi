@@ -38,6 +38,16 @@ pub const MAX_GRANT_SECS: u64 = 400 * 86400;
 pub const PASS_TRUST: Duration = Duration::from_secs(120);
 /// What a blocked phone is told when it tries to buy or use time.
 pub const BLOCKED: &str = "This device can't buy time here. Please talk to the owner.";
+/// Setting: minutes a phone can be off the WiFi before its running time
+/// pauses by itself (0: never).
+pub const AUTO_PAUSE_KEY: &str = "auto_pause_mins";
+pub const AUTO_PAUSE_DEFAULT_MINS: u32 = 5;
+/// What the dashboard offers. Shorter would pause phones that are only
+/// asleep and slow to answer.
+pub const AUTO_PAUSE_CHOICES: &[u32] = &[0, 2, 3, 5, 10, 15, 30];
+/// A phone whose time resumed when it came back is welcomed if it opens
+/// the page within this long.
+const WELCOME_BACK_FOR: Duration = Duration::from_secs(30 * 60);
 
 pub struct Engine {
     state: Mutex<State>,
@@ -81,6 +91,12 @@ struct State {
     last_sync: Option<Instant>,
     /// Devices the owner blocked: they get no time here, from anywhere.
     blocked: HashSet<Mac>,
+    /// Auto-pause after this many minutes off the WiFi (0: off).
+    auto_pause_mins: u32,
+    /// When each phone with time was last known to be on the WiFi.
+    seen: HashMap<Mac, Instant>,
+    /// Phones whose time resumed when they came back, not yet welcomed.
+    welcomes: HashMap<Mac, Instant>,
 }
 
 #[derive(Default)]
@@ -97,6 +113,9 @@ struct Client {
     until: Option<Instant>,
     /// Time banked while paused.
     banked: Duration,
+    /// Paused by auto-pause because the phone left the WiFi: it resumes by
+    /// itself when the phone is back (time the customer paused doesn't).
+    away: bool,
 }
 
 impl Client {
@@ -148,6 +167,10 @@ pub struct MeView {
     pub rates: Vec<Rate>,
     /// The owner blocked this phone.
     pub blocked: bool,
+    /// Minutes off the WiFi before time pauses by itself (0: off).
+    pub auto_pause_mins: u32,
+    /// This phone just came back and its paused time started again (shown once).
+    pub welcome_back: bool,
 }
 
 #[derive(Serialize)]
@@ -156,6 +179,8 @@ pub struct ClientView {
     pub ip: String,
     pub remaining_secs: u64,
     pub running: bool,
+    /// Paused because it left the WiFi; starts again when it's back.
+    pub away: bool,
 }
 
 #[derive(Serialize)]
@@ -224,6 +249,7 @@ impl Engine {
     ) -> anyhow::Result<Arc<Engine>> {
         let now = Instant::now();
         let blocked: HashSet<Mac> = db.load_blocked()?.into_iter().collect();
+        let auto_pause_mins = auto_pause_mins_of(db.get_setting(AUTO_PAUSE_KEY)?.as_deref());
         let mut clients = HashMap::new();
         for row in db.load_clients()? {
             if blocked.contains(&row.mac) {
@@ -232,13 +258,15 @@ impl Engine {
             let left = Duration::from_secs(row.remaining_secs.min(MAX_GRANT_SECS));
             // Downtime isn't charged: the clock resumes where it stopped.
             let c = if row.paused {
-                Client { ip: row.ip, until: None, banked: left }
+                Client { ip: row.ip, until: None, banked: left, away: row.away }
             } else {
-                Client { ip: row.ip, until: Some(now + left), banked: Duration::ZERO }
+                Client { ip: row.ip, until: Some(now + left), banked: Duration::ZERO, away: false }
             };
             clients.insert(row.mac, c);
         }
         tracing::info!("restored {} customer sessions", clients.len());
+        // Nobody was watched while the service was down: everyone starts as here.
+        let seen = clients.keys().map(|m| (*m, now)).collect();
         let rates = db.rates()?;
         let links: HashMap<Mac, String> = db.load_links()?.into_iter().collect();
         let open = db.open_slot().unwrap_or_else(|e| {
@@ -266,6 +294,9 @@ impl Engine {
                 clone_alerts: HashMap::new(),
                 last_sync: None,
                 blocked,
+                auto_pause_mins,
+                seen,
+                welcomes: HashMap::new(),
             }),
             writer: Mutex::new(()),
             db,
@@ -319,7 +350,10 @@ impl Engine {
     pub fn me(&self, mac: Mac, ip: Ipv4Addr) -> MeView {
         let now = Instant::now();
         let mut st = self.state.lock().unwrap();
-        self.rebind(&mut st, mac, ip, now);
+        // The page asking is the phone itself (unless it's a copy of its MAC elsewhere).
+        let real = self.rebind(&mut st, mac, ip, now);
+        let resumed = real && self.saw_locked(&mut st, mac, now);
+        let welcome_back = real && st.welcomes.remove(&mac).is_some();
         let (remaining, running) = st
             .clients
             .get(&mac)
@@ -343,7 +377,7 @@ impl Engine {
                 coins: if s.mac == mac { s.coins.clone() } else { vec![] },
             },
         };
-        MeView {
+        let view = MeView {
             device: mac.masked(),
             ip: ip.to_string(),
             remaining_secs: remaining,
@@ -351,7 +385,14 @@ impl Engine {
             slot,
             rates: st.rates.clone(),
             blocked: st.blocked.contains(&mac),
+            auto_pause_mins: st.auto_pause_mins,
+            welcome_back,
+        };
+        drop(st);
+        if resumed {
+            self.flush(false);
         }
+        view
     }
 
     /// DHCP may hand a device a new IP; move its grant along with it. Only
@@ -515,6 +556,7 @@ impl Engine {
             Some(c) if c.until.is_some() => {
                 c.banked = c.remaining(now);
                 c.until = None;
+                c.away = false;
                 self.fw.revoke(mac, c.ip);
                 true
             }
@@ -544,6 +586,8 @@ impl Engine {
                 c.until = Some(now + c.banked);
                 self.fw.allow(mac, c.ip, c.banked.as_secs());
                 c.banked = Duration::ZERO;
+                c.away = false;
+                st.seen.insert(mac, now);
                 Resume::Resumed
             }
             _ => Resume::Nothing,
@@ -694,6 +738,7 @@ impl Engine {
                 ip: c.ip.to_string(),
                 remaining_secs: c.remaining(now).as_secs(),
                 running: c.until.is_some(),
+                away: c.away,
             })
             .collect();
         v.sort_by(|a, b| b.running.cmp(&a.running).then(b.remaining_secs.cmp(&a.remaining_secs)));
@@ -745,8 +790,101 @@ impl Engine {
         st.cooldown.retain(|_, t| now - *t < EMPTY_SLOT_COOLDOWN);
         st.voucher_fails.retain(|_, (_, t)| t.elapsed() < VOUCHER_LOCKOUT);
         st.clone_alerts.retain(|_, t| now - *t < CLONE_ALERT_EVERY);
+        let State { seen, clients, welcomes, .. } = &mut *st;
+        seen.retain(|m, _| clients.contains_key(m));
+        welcomes.retain(|_, t| now - *t < WELCOME_BACK_FOR);
         drop(st);
         self.flush(false);
+    }
+
+    // ---- auto-pause -----------------------------------------------------
+
+    pub fn auto_pause_mins(&self) -> u32 {
+        self.state.lock().unwrap().auto_pause_mins
+    }
+
+    /// `mins` must be one of [`AUTO_PAUSE_CHOICES`].
+    pub fn set_auto_pause(&self, mins: u32) -> anyhow::Result<()> {
+        self.db.set_setting(AUTO_PAUSE_KEY, &mins.to_string())?;
+        let now = Instant::now();
+        let mut st = self.state.lock().unwrap();
+        if st.auto_pause_mins == 0 && mins > 0 {
+            // Nobody was watched while it was off: everyone starts as here.
+            let State { seen, clients, .. } = &mut *st;
+            seen.extend(clients.keys().map(|m| (*m, now)));
+        }
+        st.auto_pause_mins = mins;
+        Ok(())
+    }
+
+    /// Phones for the presence watcher to look for: those with running time
+    /// (while auto-pause is on) and those it paused, so they resume when back.
+    pub fn watched(&self) -> Vec<(Mac, Ipv4Addr)> {
+        let st = self.state.lock().unwrap();
+        let on = st.auto_pause_mins > 0;
+        st.clients.iter().filter(|(_, c)| c.away || (on && c.until.is_some())).map(|(m, c)| (*m, c.ip)).collect()
+    }
+
+    /// What the presence watcher found on the WiFi just now (MAC → address).
+    /// Running time of a phone gone longer than the auto-pause setting
+    /// pauses; time paused that way starts again once its phone is back.
+    pub fn presence(&self, here: &HashMap<Mac, Ipv4Addr>) {
+        self.presence_at(here, Instant::now());
+    }
+
+    fn presence_at(&self, here: &HashMap<Mac, Ipv4Addr>, now: Instant) {
+        let mut st = self.state.lock().unwrap();
+        let mut changed = false;
+        for (&mac, &ip) in here {
+            // Its time follows it to a new address only if dnsmasq gave it that one.
+            if st.clients.contains_key(&mac) && self.rebind(&mut st, mac, ip, now) {
+                changed |= self.saw_locked(&mut st, mac, now);
+            }
+        }
+        if st.auto_pause_mins > 0 {
+            let after = Duration::from_secs(u64::from(st.auto_pause_mins) * 60);
+            let gone: Vec<Mac> = st
+                .clients
+                .iter()
+                .filter(|(m, c)| c.until.is_some() && st.seen.get(m).is_none_or(|t| now.saturating_duration_since(*t) >= after))
+                .map(|(m, _)| *m)
+                .collect();
+            for mac in gone {
+                let c = st.clients.get_mut(&mac).unwrap();
+                c.banked = c.remaining(now);
+                c.until = None;
+                c.away = true;
+                self.fw.revoke(mac, c.ip);
+                tracing::info!(%mac, "left the WiFi: time paused until it's back");
+                changed = true;
+            }
+        }
+        drop(st);
+        if changed {
+            self.flush(false);
+        }
+    }
+
+    /// `mac` is on the WiFi now. Time auto-pause paused starts again, unless
+    /// it's Piso Pass time and the hub is out of touch (the pass may have
+    /// been claimed elsewhere meanwhile). Returns whether it started.
+    fn saw_locked(&self, st: &mut State, mac: Mac, now: Instant) -> bool {
+        if !st.clients.contains_key(&mac) {
+            return false;
+        }
+        st.seen.insert(mac, now);
+        let trusted = !st.links.contains_key(&mac) || Self::pass_trusted(st);
+        let c = st.clients.get_mut(&mac).unwrap();
+        if !c.away || c.until.is_some() || c.banked.is_zero() || !trusted {
+            return false;
+        }
+        c.until = Some(now + c.banked);
+        self.fw.allow(mac, c.ip, c.banked.as_secs());
+        c.banked = Duration::ZERO;
+        c.away = false;
+        st.welcomes.insert(mac, now);
+        tracing::info!(%mac, "back on the WiFi: time started again");
+        true
     }
 
     /// Checkpoints running clocks (every 30 s and on shutdown), so a power
@@ -976,7 +1114,9 @@ impl Engine {
         }
         let now = Instant::now();
         let left = Duration::from_secs(secs.min(MAX_GRANT_SECS));
-        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO });
+        st.seen.insert(mac, now);
+        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO, away: false });
+        c.away = false;
         if run {
             c.until = Some(now + left);
             c.banked = Duration::ZERO;
@@ -1000,7 +1140,9 @@ impl Engine {
         let now = Instant::now();
         let ip = self.ip_for(st, mac, ip, now);
         let add = Duration::from_secs(secs.min(MAX_GRANT_SECS));
-        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO });
+        st.seen.insert(mac, now);
+        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO, away: false });
+        c.away = false;
         let total = (c.remaining(now) + add).min(Duration::from_secs(MAX_GRANT_SECS));
         c.until = Some(now + total);
         c.banked = Duration::ZERO;
@@ -1025,6 +1167,7 @@ impl Engine {
                         ip: c.ip,
                         remaining_secs: c.remaining(now).as_secs(),
                         paused: c.until.is_none(),
+                        away: c.away,
                     });
                     client_marks.push((*m, Some(c.clone())));
                 }
@@ -1088,6 +1231,11 @@ impl Engine {
             en.set(on, *line);
         }
     }
+}
+
+/// The saved auto-pause setting; unset or unexpected means the default.
+fn auto_pause_mins_of(setting: Option<&str>) -> u32 {
+    setting.and_then(|v| v.trim().parse().ok()).filter(|m| AUTO_PAUSE_CHOICES.contains(m)).unwrap_or(AUTO_PAUSE_DEFAULT_MINS)
 }
 
 fn grants_of(st: &State, now: Instant) -> Vec<Grant> {
@@ -1327,6 +1475,95 @@ mod tests {
         assert!(e.pass_of(a).is_none());
         assert!(e.me(a, IP).running && coins - remaining(&e, a) <= 1);
         assert!(e.sync_snapshot(100).1.is_empty(), "nothing reported sold for the pass");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `mins` minutes from now. (Not "ago": a test machine that booted a
+    /// minute ago has no Instant an hour back.)
+    fn later(mins: u64) -> Instant {
+        Instant::now() + Duration::from_secs(mins * 60)
+    }
+
+    fn view(e: &Engine, mac: Mac) -> ClientView {
+        e.clients().into_iter().find(|c| c.mac == mac.to_string()).unwrap()
+    }
+
+    #[test]
+    fn a_phone_that_leaves_is_paused_and_starts_again_when_back() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        assert_eq!(e.auto_pause_mins(), AUTO_PAUSE_DEFAULT_MINS);
+        let here = HashMap::from([(mac, IP)]);
+        e.presence(&here);
+        e.presence_at(&HashMap::new(), later(4));
+        assert!(view(&e, mac).running, "gone 4 minutes: not yet");
+
+        e.presence_at(&HashMap::new(), later(5));
+        let v = view(&e, mac);
+        assert!(!v.running && v.away && v.remaining_secs > 0);
+        assert!(e.grants().is_empty(), "no internet while paused");
+        let row = e.db.load_clients().unwrap().into_iter().find(|r| r.mac == mac).unwrap();
+        assert!(row.paused && row.away, "saved at once");
+
+        // Still away after a restart, and back on the WiFi later: it runs again.
+        drop(e);
+        let e = engine_at(&dir, true, None);
+        assert!(view(&e, mac).away);
+        e.presence(&here);
+        assert!(view(&e, mac).running && !view(&e, mac).away);
+        assert_eq!(e.grants().len(), 1);
+        let me = e.me(mac, IP);
+        assert!(me.running && me.welcome_back);
+        assert!(!e.me(mac, IP).welcome_back, "welcomed once");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn opening_the_page_counts_as_being_back() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        e.presence_at(&HashMap::new(), later(30));
+        assert!(view(&e, mac).away);
+        let me = e.me(mac, IP);
+        assert!(me.running && me.welcome_back);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn time_the_customer_paused_stays_paused_when_they_come_back() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        assert!(e.pause(mac, IP));
+        e.presence_at(&HashMap::new(), later(30));
+        e.presence(&HashMap::from([(mac, IP)]));
+        let me = e.me(mac, IP);
+        assert!(!me.running && !me.welcome_back);
+        assert!(!view(&e, mac).away);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_pause_can_be_turned_off_and_on() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        e.set_auto_pause(0).unwrap();
+        assert!(e.watched().is_empty());
+        e.presence_at(&HashMap::new(), later(60));
+        assert!(view(&e, mac).running, "off: time keeps running");
+        // Turned on again: nobody was watched meanwhile, so everyone starts as here.
+        e.set_auto_pause(10).unwrap();
+        e.presence(&HashMap::new());
+        assert!(view(&e, mac).running);
+        assert_eq!(e.watched(), vec![(mac, IP)]);
+        drop(e);
+        assert_eq!(engine_at(&dir, true, None).auto_pause_mins(), 10, "saved");
+        assert_eq!(auto_pause_mins_of(None), AUTO_PAUSE_DEFAULT_MINS);
+        assert_eq!(auto_pause_mins_of(Some("0")), 0);
+        assert_eq!(auto_pause_mins_of(Some("7")), AUTO_PAUSE_DEFAULT_MINS, "not a choice");
         let _ = std::fs::remove_dir_all(dir);
     }
 

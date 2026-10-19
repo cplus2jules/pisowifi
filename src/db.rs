@@ -31,6 +31,8 @@ pub struct ClientRow {
     pub ip: std::net::Ipv4Addr,
     pub remaining_secs: u64,
     pub paused: bool,
+    /// Paused because the phone left the WiFi (auto-pause): resumes when it's back.
+    pub away: bool,
 }
 
 /// Coins in the slot that haven't been credited yet. Saved on every coin,
@@ -296,6 +298,11 @@ const SCHEMA_V6: &str = "
 CREATE TABLE blocked (mac TEXT PRIMARY KEY, ts INTEGER NOT NULL);
 ";
 
+/// v7: time paused by auto-pause (the phone left) rather than by the customer.
+const SCHEMA_V7: &str = "
+ALTER TABLE clients ADD COLUMN away INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Voucher alphabet without look-alikes (no 0/O, 1/I/L).
 const VOUCHER_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
@@ -354,6 +361,12 @@ impl Db {
             let tx = c.transaction()?;
             tx.execute_batch(SCHEMA_V6)?;
             tx.pragma_update(None, "user_version", 6)?;
+            tx.commit()?;
+        }
+        if v < 7 {
+            let tx = c.transaction()?;
+            tx.execute_batch(SCHEMA_V7)?;
+            tx.pragma_update(None, "user_version", 7)?;
             tx.commit()?;
         }
         Ok(())
@@ -518,19 +531,27 @@ impl Db {
         Ok(())
     }
 
+    /// (schema version, SQLCipher version), for Settings → System.
+    pub fn versions(&self) -> (i64, String) {
+        let c = self.conn.lock().unwrap();
+        let schema = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        let cipher = c.query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0)).unwrap_or_default();
+        (schema, cipher)
+    }
+
     // ---- clients (persisted session time) -------------------------------
 
     pub fn load_clients(&self) -> Result<Vec<ClientRow>> {
         let c = self.conn.lock().unwrap();
-        let mut st = c.prepare("SELECT mac, ip, remaining_secs, paused FROM clients WHERE remaining_secs > 0")?;
+        let mut st = c.prepare("SELECT mac, ip, remaining_secs, paused, away FROM clients WHERE remaining_secs > 0")?;
         let rows = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, bool>(3)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, bool>(3)?, r.get::<_, bool>(4)?))
         })?;
         let mut out = vec![];
         for row in rows {
-            let (mac, ip, secs, paused) = row?;
+            let (mac, ip, secs, paused, away) = row?;
             if let (Ok(mac), Ok(ip)) = (Mac::parse(&mac), ip.parse()) {
-                out.push(ClientRow { mac, ip, remaining_secs: secs.max(0) as u64, paused });
+                out.push(ClientRow { mac, ip, remaining_secs: secs.max(0) as u64, paused, away: paused && away });
             }
         }
         Ok(out)
@@ -552,10 +573,10 @@ impl Db {
         let ts = now();
         for r in &b.clients {
             tx.execute(
-                "INSERT INTO clients (mac, ip, remaining_secs, paused, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO clients (mac, ip, remaining_secs, paused, away, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(mac) DO UPDATE SET ip = excluded.ip, remaining_secs = excluded.remaining_secs,
-                 paused = excluded.paused, updated_at = excluded.updated_at",
-                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs.min(i64::MAX as u64) as i64, r.paused, ts],
+                 paused = excluded.paused, away = excluded.away, updated_at = excluded.updated_at",
+                params![r.mac.to_string(), r.ip.to_string(), r.remaining_secs.min(i64::MAX as u64) as i64, r.paused, r.away, ts],
             )?;
         }
         for m in &b.clients_gone {
@@ -1339,7 +1360,7 @@ mod tests {
     fn batches_upsert_and_delete_single_rows() {
         let (_d, db) = test_db();
         let (a, b) = (Mac::parse("02:00:00:00:00:0a").unwrap(), Mac::parse("02:00:00:00:00:0b").unwrap());
-        let row = |mac, secs, paused| ClientRow { mac, ip: "10.0.0.9".parse().unwrap(), remaining_secs: secs, paused };
+        let row = |mac, secs, paused| ClientRow { mac, ip: "10.0.0.9".parse().unwrap(), remaining_secs: secs, paused, away: false };
         db.save(&Batch { clients: vec![row(a, 100, false), row(b, 200, true)], ..Default::default() }).unwrap();
         db.save(&Batch { clients: vec![row(a, 70, false)], ..Default::default() }).unwrap();
         let mut rows = db.load_clients().unwrap();

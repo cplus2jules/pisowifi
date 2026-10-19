@@ -339,6 +339,14 @@
           </div>
         </div>
       </form>
+      <div class="card" id="away-card">
+        <div class="card-head"><div><h2>Auto-pause</h2><p class="sub">When a phone leaves the WiFi, its time stops counting. It starts again by itself when the phone is back, so customers don't lose time for walking away.</p></div></div>
+        <div class="card-body away-body">
+          <p class="away-q">Pause a phone's time once it's been gone for</p>
+          <div class="seg" id="away-mins" role="radiogroup" aria-label="Auto-pause after"><span class="seg-pill" aria-hidden="true"></span></div>
+          <p class="sub">Phones asleep in a pocket still count as here. Time a customer pauses themselves waits until they tap Resume.</p>
+        </div>
+      </div>
     </section>
 
     <!-- vouchers -->
@@ -405,9 +413,21 @@
             </div>
 
             <fieldset class="swatches">
+              <legend>Font for the name</legend>
+              <div class="font-grid" id="font-grid" role="radiogroup" aria-label="Font for the name"></div>
+              <div class="weight-row"><label for="b-weight">Thickness</label><input type="range" id="b-weight" min="300" max="900" step="10" value="800"><output id="b-weight-out" for="b-weight">Extra bold</output></div>
+            </fieldset>
+
+            <fieldset class="swatches">
               <legend>Accent colour</legend>
               <div class="swatch-row" id="swatches"></div>
               <p class="sub warn" id="accent-warn" hidden>This colour is light, so white text on it may be hard to read.</p>
+            </fieldset>
+
+            <fieldset class="swatches">
+              <legend>Coin button colour</legend>
+              <div class="swatch-row" id="button-swatches"></div>
+              <p class="sub">The big Insert coin button, plus small touches like the Best value tag.</p>
             </fieldset>
 
             <div class="uploads">
@@ -569,6 +589,16 @@
             <div class="row"><span class="grow"></span><button class="btn primary" type="submit">Change password</button></div>
           </div>
         </form>
+        <div class="card wide" id="sys-card">
+          <div class="card-head">
+            <div><h2>System</h2><p class="sub">What this vendo runs on: its software, operating system and everything connected to it. Handy for whoever works on it next.</p></div>
+            <button class="btn outline small" type="button" id="sys-copy" disabled><svg class="ic"><use href="#i-copy"/></svg><span>Copy details</span></button>
+          </div>
+          <div class="card-body">
+            <p class="sys-warn" id="sys-clock" hidden></p>
+            <div class="sys-grid" id="sys-grid"><p class="sub">Reading the vendo…</p></div>
+          </div>
+        </div>
       </div>
     </section>
   </main>

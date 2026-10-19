@@ -43,6 +43,7 @@ pub fn router(st: Shared) -> Router {
         .route("/home-icon-maskable.png", get(|st: State<Shared>| home_icon(st, 512, false)))
         .route("/captive-api", get(captive_api))
         .route("/brand/{name}", get(app::brand_image))
+        .route("/fonts/{file}", get(crate::fonts::serve))
         .nest("/api", api)
         .fallback(fallback)
         .layer(from_fn_with_state(st.clone(), app::portal_host_guard))

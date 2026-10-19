@@ -10,6 +10,7 @@ mod demo;
 mod devices;
 mod engine;
 mod firewall;
+mod fonts;
 mod gpio;
 mod health;
 mod homeicon;
@@ -18,10 +19,12 @@ mod hubclient;
 mod keys;
 mod net;
 mod portal;
+mod presence;
 mod pwpolicy;
 mod rates;
 mod release;
 mod server;
+mod sysinfo;
 mod tls;
 mod update;
 mod wallet;
@@ -609,6 +612,9 @@ async fn run(cfg: Config, dev: bool) -> Result<()> {
             }
         }
     });
+
+    // Auto-pause: which phones are still on the WiFi.
+    presence::spawn(engine.clone(), cfg.network.lan_iface.clone(), dev);
 
     // Piso Pass: heartbeat to the hub every 30 s.
     let hub_client = hubclient::HubClient::load(&db, &cfg.storage.data_dir)?;

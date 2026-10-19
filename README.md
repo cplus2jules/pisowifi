@@ -13,8 +13,17 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
   a ding for each coin, a jingle once online. Customers can mute them.
   A bar under the clock drains as time runs; with 5 minutes left the page
   says so and nudges the *Add more time* button. Your message for customers
-  scrolls across the top. Tapping a price flips its coins.
-- **Your branding**: name, tagline, accent colour, logo and an advert poster,
+  scrolls across the top. Tapping a price flips its coins. The clock card
+  says when time runs out, with the date.
+- **Auto-pause**: when a phone has been off the WiFi for a few minutes (you
+  pick 2 to 30 on the dashboard's *Rates* page, or off), its time stops. It
+  starts again by itself when the phone is back, and the page says
+  *Welcome back*. Every 20 s the vendo only checks whether the phone still
+  answers on the network (ARP), and a phone asleep in a pocket still counts as
+  here. Time a customer paused stays paused until they tap *Resume*.
+- **Your branding**: name (in one of six fonts or the phone's own, with a
+  thickness slider; the fonts are built in, so they work before customers
+  pay), accent colour, the coin button's colour, logo and an advert poster,
   sound effects on or off, and the page customers land on once online (a
   Google search for cats until you change it), set on the dashboard's
   *Customer page*. That page also prints a QR sign: one code joins the WiFi
@@ -35,6 +44,11 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
   - **Daily goal** with a streak counter, and **vendo health**: temperature,
     processor, memory, storage and the internet cable.
   - Live: a sale makes the day's total count up and coins drop into the jar.
+  - **System** (Settings): the software versions, the operating system, the
+    board, storage, every network port (its role, chip and driver), USB
+    devices and the coin slot wiring, with *Copy details* for whoever works on
+    the vendo next. It warns when the vendo's clock is off (the board has no
+    clock battery, so it drifts until it has internet).
 - **Encrypted database**: SQLCipher (AES-256 with an HMAC-SHA512 check on every page).
 
 ## What's in the box
@@ -638,6 +652,7 @@ wallet.
 | `src/` | Rust daemon: engine, firewall, gpio, db, auth, portal, admin, hub, wallet |
 | `web/portal/` | Customer UI (compiled into the binary) |
 | `web/admin/` | Owner dashboard (compiled into the binary) |
+| `web/fonts/` | The name fonts (Latin subsets of variable fonts) and their licences, `OFL.txt` |
 | `web/wallet/` | Wallet pass images (drawn from `web/shared/icon.svg`) |
 | `testdata/wallet/` | Throwaway keys and certificates for the wallet tests |
 | `deploy/` | install/uninstall scripts, systemd unit, dnsmasq config, sample config |

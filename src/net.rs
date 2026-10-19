@@ -86,6 +86,18 @@ fn parse_arp(table: &str, ip: Ipv4Addr, iface: &str) -> Option<Mac> {
     arp_entries(table, iface).into_iter().find(|(_, i)| *i == ip).map(|(m, _)| m)
 }
 
+/// Complete neighbour entries on `iface`, now.
+pub fn neighbours(iface: &str) -> Vec<(Mac, Ipv4Addr)> {
+    arp_entries(&std::fs::read_to_string("/proc/net/arp").unwrap_or_default(), iface)
+}
+
+/// Sends `ip` an empty UDP packet (to the discard port) so the kernel checks
+/// its neighbour entry: a stale one is probed, and turns incomplete if
+/// nothing answers. Errors (a failed entry, no route) don't matter here.
+pub fn nudge(sock: &std::net::UdpSocket, ip: Ipv4Addr) {
+    let _ = sock.send_to(&[], (ip, 9));
+}
+
 /// Complete neighbour entries on `iface`.
 fn arp_entries(table: &str, iface: &str) -> Vec<(Mac, Ipv4Addr)> {
     let mut out = vec![];

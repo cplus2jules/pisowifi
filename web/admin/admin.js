@@ -343,7 +343,7 @@ function go(tab) {
   if (tab === "vouchers") loadVouchers();
   if (tab === "activity") loadAudit();
   if (tab === "customize" && overview) loadBrand(overview.brand);
-  if (tab === "settings") loadUpdate();
+  if (tab === "settings") { loadUpdate(); loadSystem(); }
   else clearTimeout(updTimer);
   if (overview) renderOverview();
   if (changed || !enteredOnce) enterPanel($("tab-" + tab));
@@ -384,14 +384,14 @@ function placeNavPill() {
   if (nav.scrollWidth > nav.clientWidth) cur.scrollIntoView({ block: "nearest", inline: "nearest", behavior: REDUCE ? "auto" : "smooth" });
 }
 
-function placeSegPill() {
-  const seg = $("period"), cur = seg.querySelector('[aria-selected="true"]'), pill = seg.querySelector(".seg-pill");
+function placeSegPill(seg = $("period")) {
+  const cur = seg.querySelector('[aria-selected="true"],[aria-checked="true"]'), pill = seg.querySelector(".seg-pill");
   if (!cur || !cur.offsetWidth) return;
   pill.style.setProperty("--x", cur.offsetLeft - 3 + "px");
   pill.style.setProperty("--w", cur.offsetWidth + "px");
 }
 
-window.addEventListener("resize", () => { placeNavPill(); placeSegPill(); });
+window.addEventListener("resize", () => { placeNavPill(); placeSegPill(); placeSegPill($("away-mins")); });
 
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("[data-tab],[data-goto]");
@@ -674,7 +674,7 @@ function renderMiniDevices(clients) {
     li.className = c.running ? "" : "paused";
     r.name.textContent = d.name;
     r.name.title = d.detail || c.mac;
-    setLeft(r.time, c.remaining_secs, c.running, c.running ? " left" : "", c.running ? "" : "Paused · ");
+    setLeft(r.time, c.remaining_secs, c.running, c.running ? " left" : "", c.running ? "" : c.away ? "Away · " : "Paused · ");
     r.fill.style.width = (100 * c.remaining_secs) / max + "%";
   });
 }
@@ -742,9 +742,9 @@ function renderDevices(clients, others) {
     r.name.textContent = d.name;
     r.detail.textContent = d.detail || shortMac(c.mac);
     r.status.className = "status " + (c.running ? "on" : "off");
-    r.status.textContent = c.running ? "Online" : "Paused";
+    r.status.textContent = c.running ? "Online" : c.away ? "Away" : "Paused";
     setLeft(r.time, c.remaining_secs, c.running);
-    r.label.textContent = c.running ? "left" : "saved for later";
+    r.label.textContent = c.running ? "left" : c.away ? "starts when they're back" : "saved for later";
     r.fill.style.width = (100 * c.remaining_secs) / max + "%";
     if (r.running !== c.running) {
       r.running = c.running;
@@ -792,7 +792,7 @@ function renderPeople() {
   $("people-empty").hidden = list.length > 0;
   $("people-empty").textContent = !people.length ? "Nobody yet. Devices show up here the first time they open your page."
     : q ? "No one matches “" + q + "”." : "No blocked devices.";
-  keyed($("people"), JSON.stringify([q, blockedOnly, list.map((p) => [p.mac, p.name, p.detail, p.spend.pesos, p.running, p.has_time, p.last_seen, p.blocked])]), () =>
+  keyed($("people"), JSON.stringify([q, blockedOnly, list.map((p) => [p.mac, p.name, p.detail, p.spend.pesos, p.running, p.away, p.has_time, p.last_seen, p.blocked])]), () =>
     list.slice(0, 200).map((p, i) => {
       const seen = Math.max(p.last_seen || 0, p.spend.last || 0);
       const li = el("li", { class: "dev-row" + (p.blocked ? " is-blocked" : "") },
@@ -802,7 +802,7 @@ function renderPeople() {
         el("span", { class: "nums" },
           el("span", {}, el("b", { text: peso(p.spend.pesos) }), "spent"),
           el("span", {}, el("b", { text: String(p.spend.count) }), p.spend.count === 1 ? "purchase" : "purchases"),
-          el("span", {}, el("b", { text: p.has_time ? (p.running ? "Online" : "Paused") : seen ? when(seen) : "—" }), p.has_time ? "now" : "last seen")),
+          el("span", {}, el("b", { text: p.has_time ? (p.running ? "Online" : p.away ? "Away" : "Paused") : seen ? when(seen) : "—" }), p.has_time ? "now" : "last seen")),
         p.blocked ? el("span", { class: "status bad", text: "Blocked" }) : null);
       li.style.setProperty("--i", Math.min(i, 20));
       return li;
@@ -871,7 +871,7 @@ async function loadDrawer() {
   $("dv-give").hidden = !!c || d.blocked;
   if (c) {
     $("dv-time").classList.toggle("paused", !c.running);
-    $("dv-state").textContent = c.running ? "Online now" : "Paused";
+    $("dv-state").textContent = c.running ? "Online now" : c.away ? "Away: starts again when it's back" : "Paused";
     setLeft($("dv-left"), c.remaining_secs, c.running);
     const p = $("dv-pause");
     p.replaceChildren(icon(c.running ? "pause" : "play"), el("span", { text: c.running ? "Pause" : "Resume" }));
@@ -1307,9 +1307,37 @@ function rateRow(r = { pesos: "", minutes: "" }) {
 
 async function loadRates() {
   await busy(null, async () => {
-    const rates = await api("GET", "/rates");
+    const [rates, away] = await Promise.all([api("GET", "/rates"), api("GET", "/auto-pause")]);
     $("rates").replaceChildren(...rates.map(rateRow));
+    renderAway(away.minutes, away.choices);
   });
+}
+
+// Auto-pause: one tap saves it.
+let awayMins = null;
+
+function renderAway(mins, choices) {
+  const seg = $("away-mins");
+  if (choices) {
+    seg.replaceChildren(seg.querySelector(".seg-pill"), ...choices.map((m) =>
+      el("button", { type: "button", role: "radio", "data-mins": m, text: m ? m + " min" : "Off", onclick: () => setAway(m) })));
+  }
+  awayMins = mins;
+  for (const b of seg.querySelectorAll("button")) b.setAttribute("aria-checked", String(Number(b.dataset.mins) === mins));
+  requestAnimationFrame(() => placeSegPill(seg));
+}
+
+async function setAway(mins) {
+  if (mins === awayMins) return;
+  const before = awayMins;
+  renderAway(mins);
+  try {
+    await api("PUT", "/auto-pause", { minutes: mins });
+    toast(mins ? "Time pauses after " + mins + " minutes away" : "Auto-pause is off: time keeps running until customers pause it");
+  } catch (e) {
+    renderAway(before);
+    toast(e.message, true);
+  }
 }
 
 $("add-rate").addEventListener("click", () => $("rates").append(rateRow()));
@@ -1416,7 +1444,7 @@ const ACTIONS = {
   pause: "Paused a device", resume: "Resumed a device", rename_device: "Named a device",
   collect_coins: "Emptied the coin box", set_goal: "Set the daily goal", branding: "Changed the customer page",
   upload_image: "Uploaded an image", remove_image: "Removed an image", mac_clone: "Possible copied address",
-  block_device: "Blocked a device", unblock_device: "Unblocked a device",
+  block_device: "Blocked a device", unblock_device: "Unblocked a device", set_auto_pause: "Changed auto-pause",
 };
 
 // "da:a1:19:…" in a log line becomes the device's name when we know it.
@@ -1444,6 +1472,11 @@ async function loadAudit() {
 const ACCENTS = [
   ["#5A43E6", "Purple"], ["#2563EB", "Blue"], ["#0E8F7E", "Teal"],
   ["#D9363E", "Red"], ["#C2378A", "Pink"], ["#2B2D42", "Ink"],
+];
+// The big coin button: bright colours that read well with dark text.
+const BUTTONS = [
+  ["#D4F04C", "Lime"], ["#FFD84D", "Sunshine"], ["#FFB38A", "Peach"],
+  ["#FF9FCB", "Bubblegum"], ["#8FE3C6", "Mint"], ["#9CD8F0", "Sky"], ["#C9BFFA", "Lavender"],
 ];
 let brandDraft = null;   // what the form currently shows (unsaved)
 
@@ -1476,13 +1509,16 @@ function logoNode(b) {
 }
 
 function renderSwatches(current) {
-  const row = $("swatches");
+  swatchRow($("swatches"), ACCENTS, current, "accent", setAccent);
+}
+
+function swatchRow(row, presets, current, group, pick) {
   row.replaceChildren();
-  const isPreset = ACCENTS.some(([h]) => h.toLowerCase() === current.toLowerCase());
-  for (const [hex, name] of ACCENTS) {
-    const input = el("input", { type: "radio", name: "accent", value: hex, "aria-label": name });
+  const isPreset = presets.some(([h]) => h.toLowerCase() === current.toLowerCase());
+  for (const [hex, name] of presets) {
+    const input = el("input", { type: "radio", name: group, value: hex, "aria-label": name });
     if (hex.toLowerCase() === current.toLowerCase()) input.checked = true;
-    input.addEventListener("change", () => setAccent(hex));
+    input.addEventListener("change", () => pick(hex));
     const sw = el("label", { class: "swatch", title: name }, input);
     sw.style.background = hex;
     sw.style.color = hex;
@@ -1492,7 +1528,7 @@ function renderSwatches(current) {
   if (!isPreset) picker.setAttribute("checked", "");
   picker.addEventListener("input", () => {
     for (const r of row.querySelectorAll("input[type=radio]")) r.checked = false;
-    setAccent(picker.value.toUpperCase());
+    pick(picker.value.toUpperCase());
   });
   const custom = el("label", { class: "swatch custom", title: "Custom colour" }, picker);
   custom.style.color = isPreset ? "#999" : current;
@@ -1505,8 +1541,14 @@ function setAccent(hex) {
   renderPreview();
 }
 
+function setButton(hex) {
+  brandDraft.button = hex;
+  renderPreview();
+}
+
 function loadBrand(b) {
   brandDraft = Object.assign({}, b);
+  renderFonts();
   $("b-name").value = b.name;
   $("b-wifi").value = b.wifi_name;
   $("b-alt").value = b.poster ? b.poster.alt : "";
@@ -1515,6 +1557,7 @@ function loadBrand(b) {
   $("b-sounds").checked = b.sounds;
   renderSwatches(b.accent);
   $("accent-warn").hidden = luminance(b.accent) < 0.45;
+  swatchRow($("button-swatches"), BUTTONS, b.button, "button", setButton);
   renderThumbs(b);
   renderPreview();
   renderSign();
@@ -1534,7 +1577,14 @@ function renderPreview() {
   const phone = $("phone");
   phone.style.setProperty("--a", b.accent);
   phone.style.setProperty("--a-soft", mix(b.accent, "#ffffff", 0.88));
-  $("ph-name").textContent = $("b-name").value.trim() || "Piso WiFi";
+  phone.style.setProperty("--b", b.button);
+  phone.style.setProperty("--on-b", luminance(b.button) < 0.2 ? "#ffffff" : "var(--ink)");
+  const name = $("b-name").value.trim() || "Piso WiFi";
+  $("ph-name").textContent = name;
+  $("ph-name").style.fontFamily = fontFamily(b.name_font);
+  $("ph-name").style.fontWeight = b.name_weight || 800;
+  $("ph-name").style.letterSpacing = b.name_font ? "0" : "";
+  for (const s of $("font-grid").querySelectorAll(".sample")) s.textContent = name;
   const notice = $("b-notice").value.trim();
   $("ph-notice").hidden = !notice;
   $("ph-notice-text").textContent = notice;
@@ -1542,6 +1592,71 @@ function renderPreview() {
   const poster = $("ph-poster");
   if (b.poster) { poster.src = b.poster.url; poster.hidden = false; } else { poster.hidden = true; }
 }
+
+// ---- the name's font ----------------------------------------------------------
+// Fonts are built into the vendo (customers' phones have no internet before
+// paying), so the list and files come from it.
+
+let fontList = null;   // { fonts: [{ key, name, min, max, default, size }], system: [min, max, default] }
+
+async function ensureFonts() {
+  if (fontList) return fontList;
+  const list = await api("GET", "/fonts");
+  if (window.FontFace && document.fonts) {
+    for (const f of list.fonts) {
+      const face = new FontFace("Name " + f.key, "url(/fonts/" + f.key + ".woff2)", { weight: "1 1000", display: "swap", sizeAdjust: f.size + "%" });
+      document.fonts.add(face);
+      face.load().catch(() => {});
+    }
+  }
+  return (fontList = list);
+}
+
+const fontFamily = (key) => (key ? '"Name ' + key + '", var(--font)' : "var(--font)");
+
+function weightRange(key) {
+  const f = fontList && fontList.fonts.find((x) => x.key === key);
+  const [min, max, def] = f ? [f.min, f.max, f.default] : fontList ? fontList.system : [300, 900, 800];
+  return { min, max, def };
+}
+
+const weightWord = (w) => [[350, "Light"], [450, "Regular"], [550, "Medium"], [650, "Semibold"], [750, "Bold"], [850, "Extra bold"], [Infinity, "Black"]].find(([max]) => w < max)[1];
+
+async function renderFonts() {
+  try { await ensureFonts(); } catch { return; }
+  const b = brandDraft;
+  if (!b) return;
+  const key = b.name_font || "";
+  const name = $("b-name").value.trim() || "Piso WiFi";
+  const opts = [{ key: "", name: "Phone's own", default: fontList.system[2] }, ...fontList.fonts];
+  $("font-grid").replaceChildren(...opts.map((f) => {
+    const sample = el("span", { class: "sample", text: name });
+    sample.style.fontFamily = fontFamily(f.key);
+    sample.style.fontWeight = f.key === key ? b.name_weight : f.default;
+    return el("button", { type: "button", class: "font-chip", role: "radio", "aria-checked": String(f.key === key), onclick: () => pickFont(f.key) },
+      sample, el("small", { text: f.name }));
+  }));
+  const r = weightRange(key), range = $("b-weight");
+  range.min = r.min;
+  range.max = r.max;
+  range.value = b.name_weight;
+  $("b-weight-out").textContent = weightWord(b.name_weight);
+}
+
+function pickFont(key) {
+  brandDraft.name_font = key;
+  brandDraft.name_weight = weightRange(key).def;
+  renderFonts();
+  renderPreview();
+}
+
+$("b-weight").addEventListener("input", (ev) => {
+  brandDraft.name_weight = Number(ev.target.value);
+  $("b-weight-out").textContent = weightWord(brandDraft.name_weight);
+  const s = $("font-grid").querySelector('[aria-checked="true"] .sample');
+  if (s) s.style.fontWeight = brandDraft.name_weight;
+  renderPreview();
+});
 
 $("b-name").addEventListener("input", renderPreview);
 $("b-notice").addEventListener("input", renderPreview);
@@ -1552,11 +1667,14 @@ $("brand-form").addEventListener("submit", (ev) => {
     const r = await api("PUT", "/branding", {
       name: $("b-name").value,
       accent: brandDraft.accent,
+      button: brandDraft.button,
       poster_alt: $("b-alt").value,
       wifi_name: $("b-wifi").value,
       after_url: $("b-after").value,
       notice: $("b-notice").value,
       sounds: $("b-sounds").checked,
+      name_font: brandDraft.name_font || "",
+      name_weight: brandDraft.name_weight,
     });
     overview.brand = r.brand;
     overview.name = r.brand.name;
@@ -1719,6 +1837,43 @@ let updRestarting = false;
 const UPD_ACTIVE = ["installing", "trial", "rolling_back"];
 
 const day = (ts) => new Date(ts * 1000).toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" });
+
+// ---- system (Settings → System) ----------------------------------------------
+
+let sysText = "";
+
+async function loadSystem() {
+  try {
+    renderSystem(await api("GET", "/system"));
+  } catch (e) {
+    $("sys-grid").replaceChildren(el("p", { class: "sub", text: "Couldn't read the system details: " + e.message }));
+  }
+}
+
+function renderSystem(s) {
+  // No clock battery and no internet: the board's clock drifts, and sales get its dates.
+  const off = s.clock * 1000 - Date.now(), warn = $("sys-clock");
+  warn.hidden = Math.abs(off) < 2 * 60 * 1000;
+  if (!warn.hidden) {
+    warn.textContent = "The vendo's clock is " + human(Math.abs(off) / 1000) + (off < 0 ? " behind" : " ahead of") +
+      " this device. Sales get the wrong date until it's online: the board has no clock battery.";
+  }
+  const grid = $("sys-grid");
+  grid.replaceChildren(...s.sections.map((sec) => el("section", { class: "sys-sec" },
+    el("h3", { text: sec.title }),
+    el("dl", {}, ...sec.rows.flatMap((r) => [
+      el("dt", { text: r.label }),
+      el("dd", {}, el("span", { text: r.value || "—" }), r.detail ? el("small", { text: r.detail }) : null),
+    ])))));
+  if (s.sample) grid.prepend(el("p", { class: "sys-sample", text: "Dev mode on a laptop: the hardware below is a sample, modelled on an Orange Pi One." }));
+  sysText = ["# Piso WiFi vendo: system details", s.sample ? "(Sample hardware: dev mode on a laptop.)" : "",
+    "Vendo clock: " + new Date(s.clock * 1000).toISOString() + " · this device: " + new Date().toISOString(),
+    ...s.sections.map((sec) => "## " + sec.title + "\n" + sec.rows.map((r) => "- " + r.label + ": " + r.value + (r.detail ? " (" + r.detail + ")" : "")).join("\n")),
+  ].filter(Boolean).join("\n\n");
+  $("sys-copy").disabled = false;
+}
+
+$("sys-copy").addEventListener("click", () => copyText(sysText, "Copied. Paste it into a message or a GitHub issue."));
 
 async function loadUpdate() {
   clearTimeout(updTimer);

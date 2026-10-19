@@ -34,10 +34,13 @@ pub fn router(st: Shared) -> Router {
         .route("/coinbox", get(coinbox))
         .route("/coinbox/collect", post(collect_coins))
         .route("/goal", put(set_goal))
+        .route("/auto-pause", get(get_auto_pause).put(set_auto_pause))
+        .route("/system", get(system_info))
         .route("/rates", get(get_rates).put(set_rates))
         .route("/vouchers", get(list_vouchers).post(create_vouchers))
         .route("/vouchers/{id}", delete(delete_voucher))
         .route("/branding", put(set_branding))
+        .route("/fonts", get(|| async { Json(json!({ "fonts": crate::fonts::FONTS, "system": crate::fonts::SYSTEM })) }))
         .route(
             "/brand/{name}",
             put(upload_image).delete(remove_image).layer(DefaultBodyLimit::max(crate::brand::MAX_ASSET_BYTES + 1024)),
@@ -69,6 +72,7 @@ pub fn router(st: Shared) -> Router {
         .route("/admin.css", get(|| async { asset("text/css; charset=utf-8", include_str!("../web/admin/admin.css")) }))
         .route("/icon.svg", get(|| async { asset("image/svg+xml", include_str!("../web/shared/icon.svg")) }))
         .route("/brand/{name}", get(app::brand_image))
+        .route("/fonts/{file}", get(crate::fonts::serve))
         .route("/coins.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/shared/coins.js")) }))
         .nest("/api", api)
         .layer(from_fn_with_state(st.clone(), app::admin_mac_guard))
@@ -400,6 +404,8 @@ struct DeviceItem {
     has_time: bool,
     blocked: bool,
     running: bool,
+    /// Paused because it left the WiFi (auto-pause).
+    away: bool,
     remaining_secs: u64,
 }
 
@@ -427,6 +433,7 @@ async fn list_devices(State(st): State<Shared>) -> ApiResult<Json<Value>> {
                 has_time: client.is_some(),
                 blocked: blocked.contains(&mac),
                 running: client.is_some_and(|c| c.running),
+                away: client.is_some_and(|c| c.away),
                 remaining_secs: client.map_or(0, |c| c.remaining_secs),
                 mac: m,
                 info,
@@ -625,6 +632,49 @@ async fn set_goal(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo<Socke
     Ok(Json(json!({ "ok": true, "goal": req.pesos })))
 }
 
+/// Settings → System: software, OS and hardware, for whoever works on the vendo next.
+async fn system_info(State(st): State<Shared>) -> ApiResult<Json<crate::sysinfo::SysInfo>> {
+    let (schema, cipher) = st.db.versions();
+    let facts = crate::sysinfo::Facts {
+        schema,
+        cipher,
+        uptime_secs: st.engine.uptime_secs(),
+        reader_ok: st.engine.slot_admin().reader_ok,
+    };
+    let st2 = st.clone();
+    // Reads files and runs `ip`, `nft` and `dnsmasq --version`: off the async threads.
+    let info = tokio::task::spawn_blocking(move || crate::sysinfo::read(&st2.cfg, st2.dev, &facts))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Json(info))
+}
+
+async fn get_auto_pause(State(st): State<Shared>) -> Json<Value> {
+    Json(json!({ "minutes": st.engine.auto_pause_mins(), "choices": crate::engine::AUTO_PAUSE_CHOICES }))
+}
+
+#[derive(Deserialize)]
+struct AutoPauseReq {
+    minutes: u32,
+}
+
+async fn set_auto_pause(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<AutoPauseReq>,
+) -> ApiResult<Json<Value>> {
+    if !crate::engine::AUTO_PAUSE_CHOICES.contains(&req.minutes) {
+        return Err(ApiError::bad("Pick one of the choices"));
+    }
+    st.engine.set_auto_pause(req.minutes)?;
+    let detail = match req.minutes {
+        0 => "off".to_string(),
+        m => format!("after {m} min away"),
+    };
+    st.db.audit(&actor(addr), "set_auto_pause", &detail);
+    Ok(Json(json!({ "ok": true, "minutes": req.minutes })))
+}
+
 async fn get_rates(State(st): State<Shared>) -> ApiResult<Json<Vec<Rate>>> {
     Ok(Json(st.db.rates()?))
 }
@@ -684,6 +734,8 @@ async fn delete_voucher(State(st): State<Shared>, ConnectInfo(addr): ConnectInfo
 struct BrandingReq {
     name: String,
     accent: String,
+    /// The coin button's colour; left out: unchanged.
+    button: Option<String>,
     #[serde(default)]
     poster_alt: String,
     #[serde(default)]
@@ -692,6 +744,9 @@ struct BrandingReq {
     sounds: Option<bool>,
     after_url: Option<String>,
     notice: Option<String>,
+    /// A font key, or "" for the phone's own.
+    name_font: Option<String>,
+    name_weight: Option<u16>,
 }
 
 async fn set_branding(
@@ -707,6 +762,12 @@ async fn set_branding(
     if !valid_accent(&req.accent) {
         return Err(ApiError::bad("Pick a colour like #5A43E6"));
     }
+    if req.button.as_deref().is_some_and(|b| !valid_accent(b)) {
+        return Err(ApiError::bad("Pick a button colour like #D4F04C"));
+    }
+    if req.name_font.as_deref().is_some_and(|f| !f.is_empty() && crate::fonts::find(f).is_none()) {
+        return Err(ApiError::bad("Pick one of the fonts"));
+    }
     let (alt, wifi) = (clean_text(&req.poster_alt, 120), clean_text(&req.wifi_name, 32));
     let now = st.brand.get();
     let after_url = match &req.after_url {
@@ -716,6 +777,12 @@ async fn set_branding(
     st.brand.set_online(&st.db, req.sounds.unwrap_or(now.sounds), &after_url)?;
     if let Some(notice) = &req.notice {
         st.brand.set_notice(&st.db, &clean_text(notice, 140))?;
+    }
+    if let Some(font) = &req.name_font {
+        st.brand.set_name_font(&st.db, font, req.name_weight)?;
+    }
+    if let Some(button) = &req.button {
+        st.brand.set_button(&st.db, &button.to_uppercase())?;
     }
     st.brand.set_text(&st.db, &name, &req.accent.to_uppercase(), &alt, &wifi)?;
     st.db.audit(&actor(addr), "branding", &format!("{name} · {}", req.accent));
