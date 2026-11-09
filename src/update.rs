@@ -1649,7 +1649,7 @@ mod tests {
         fs::write(layout.units_dir.join("pisowifi.service"), "old unit").unwrap();
         let db = Db::open(&data.join("pisowifi.db"), &DbKey(Zeroizing::new(KEY))).unwrap();
         db.add_sale(Some(Mac::parse(PHONE).unwrap()), 20, 7200, "coin").unwrap();
-        let client = ClientRow { mac: Mac::parse(PHONE).unwrap(), ip: "10.0.0.9".parse().unwrap(), remaining_secs: 5000, paused: false, away: false };
+        let client = ClientRow { mac: Mac::parse(PHONE).unwrap(), ip: "10.0.0.9".parse().unwrap(), remaining_secs: 5000, paused: false, away: false, paused_secs: 0 };
         db.save(&Batch { clients: vec![client], ..Default::default() }).unwrap();
         drop(db);
         fs::write(data.join("db.salt"), [1u8; 32]).unwrap();

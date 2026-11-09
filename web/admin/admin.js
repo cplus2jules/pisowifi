@@ -1601,7 +1601,7 @@ const ACTIONS = {
   rename: "Renamed portal", password_changed: "Changed password", password_set: "Set password from shell",
   pause: "Paused a device", resume: "Resumed a device", rename_device: "Named a device",
   collect_coins: "Emptied the coin box", set_goal: "Set the daily goal", branding: "Changed the customer page",
-  upload_image: "Uploaded an image", remove_image: "Removed an image", mac_clone: "Possible copied address",
+  upload_image: "Uploaded an image", remove_image: "Removed an image", mac_clone: "Possible copied address", time_expired: "Unclaimed time ended",
   block_device: "Blocked a device", unblock_device: "Unblocked a device", set_auto_pause: "Changed auto-pause", set_coins: "Changed the coins it takes",
 };
 

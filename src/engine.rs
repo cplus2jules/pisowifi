@@ -48,6 +48,24 @@ pub const AUTO_PAUSE_CHOICES: &[u32] = &[0, 2, 3, 5, 10, 15, 30];
 /// A phone whose time resumed when it came back is welcomed if it opens
 /// the page within this long.
 const WELCOME_BACK_FOR: Duration = Duration::from_secs(30 * 60);
+/// Time left behind without pausing (still running, or stopped by
+/// auto-pause) ends once its phone has been away from the WiFi this long.
+/// Not announced to customers yet: nothing on the portal mentions it.
+const AWAY_EXPIRY: Duration = Duration::from_secs(60 * 60);
+/// Time the customer (or the owner) paused is kept at least this long. It's
+/// counted only while the vendo runs (no RTC: the wall clock can jump), so a
+/// power cut never makes it end early. Not announced to customers yet.
+const PAUSED_EXPIRY: Duration = Duration::from_secs(4 * 24 * 60 * 60);
+
+/// "3h 20m", "45m" or "50s", for the activity log.
+fn short_time(secs: u64) -> String {
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, 0) => format!("{secs}s"),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
 
 pub struct Engine {
     state: Mutex<State>,
@@ -95,6 +113,8 @@ struct State {
     auto_pause_mins: u32,
     /// When each phone with time was last known to be on the WiFi.
     seen: HashMap<Mac, Instant>,
+    /// Checkpoints so far (paused time's age is saved every 20th).
+    checkpoints: u32,
     /// Phones whose time resumed when they came back, not yet welcomed.
     welcomes: HashMap<Mac, Instant>,
 }
@@ -116,14 +136,26 @@ struct Client {
     /// Paused by auto-pause because the phone left the WiFi: it resumes by
     /// itself when the phone is back (time the customer paused doesn't).
     away: bool,
+    /// Paused by the customer or the owner: how long it had been paused
+    /// before this run of the vendo, and when this run's share started.
+    idle: Option<(Duration, Instant)>,
 }
 
 impl Client {
+    fn new(ip: Ipv4Addr) -> Client {
+        Client { ip, until: None, banked: Duration::ZERO, away: false, idle: None }
+    }
+
     fn remaining(&self, now: Instant) -> Duration {
         match self.until {
             Some(u) => u.saturating_duration_since(now),
             None => self.banked,
         }
+    }
+
+    /// How long the customer's pause has lasted (vendo running time).
+    fn paused_for(&self, now: Instant) -> Option<Duration> {
+        self.idle.map(|(before, since)| before + now.saturating_duration_since(since))
     }
 }
 
@@ -258,9 +290,10 @@ impl Engine {
             let left = Duration::from_secs(row.remaining_secs.min(MAX_GRANT_SECS));
             // Downtime isn't charged: the clock resumes where it stopped.
             let c = if row.paused {
-                Client { ip: row.ip, until: None, banked: left, away: row.away }
+                let idle = (!row.away).then(|| (Duration::from_secs(row.paused_secs), now));
+                Client { banked: left, away: row.away, idle, ..Client::new(row.ip) }
             } else {
-                Client { ip: row.ip, until: Some(now + left), banked: Duration::ZERO, away: false }
+                Client { until: Some(now + left), ..Client::new(row.ip) }
             };
             clients.insert(row.mac, c);
         }
@@ -296,6 +329,7 @@ impl Engine {
                 blocked,
                 auto_pause_mins,
                 seen,
+                checkpoints: 0,
                 welcomes: HashMap::new(),
             }),
             writer: Mutex::new(()),
@@ -557,6 +591,7 @@ impl Engine {
                 c.banked = c.remaining(now);
                 c.until = None;
                 c.away = false;
+                c.idle = Some((Duration::ZERO, now));
                 self.fw.revoke(mac, c.ip);
                 true
             }
@@ -587,6 +622,7 @@ impl Engine {
                 self.fw.allow(mac, c.ip, c.banked.as_secs());
                 c.banked = Duration::ZERO;
                 c.away = false;
+                c.idle = None;
                 st.seen.insert(mac, now);
                 Resume::Resumed
             }
@@ -765,7 +801,10 @@ impl Engine {
     /// Called every second: expires sessions and abandoned coin slots, and
     /// saves whatever changed.
     pub fn tick(&self) {
-        let now = Instant::now();
+        self.tick_at(Instant::now());
+    }
+
+    fn tick_at(&self, now: Instant) {
         let mut st = self.state.lock().unwrap();
         let expired: Vec<Mac> = st
             .clients
@@ -778,6 +817,16 @@ impl Engine {
                 tracing::info!(%mac, "time is up");
                 self.fw.revoke(mac, c.ip);
             }
+        }
+        // Paused and never picked up again within PAUSED_EXPIRY: it ends.
+        let stale: Vec<Mac> = st
+            .clients
+            .iter()
+            .filter(|(m, c)| !st.links.contains_key(m) && c.paused_for(now).is_some_and(|d| d >= PAUSED_EXPIRY))
+            .map(|(m, _)| *m)
+            .collect();
+        for mac in stale {
+            self.end_unclaimed(&mut st, mac, now, "paused for 4 days");
         }
         // Never close the slot in the middle of counting a coin.
         if !st.counting && st.slot.as_ref().is_some_and(|s| s.deadline <= now) {
@@ -818,11 +867,26 @@ impl Engine {
     }
 
     /// Phones for the presence watcher to look for: those with running time
-    /// (while auto-pause is on) and those it paused, so they resume when back.
+    /// (for auto-pause, and so time left behind ends after AWAY_EXPIRY) and
+    /// those auto-pause paused, so they resume when back.
     pub fn watched(&self) -> Vec<(Mac, Ipv4Addr)> {
         let st = self.state.lock().unwrap();
-        let on = st.auto_pause_mins > 0;
-        st.clients.iter().filter(|(_, c)| c.away || (on && c.until.is_some())).map(|(m, c)| (*m, c.ip)).collect()
+        st.clients.iter().filter(|(_, c)| c.away || c.until.is_some()).map(|(m, c)| (*m, c.ip)).collect()
+    }
+
+    /// Ends time nobody came back for (see AWAY_EXPIRY and PAUSED_EXPIRY).
+    fn end_unclaimed(&self, st: &mut State, mac: Mac, now: Instant, why: &str) {
+        let Some(c) = st.clients.remove(&mac) else { return };
+        if c.until.is_some() {
+            self.fw.revoke(mac, c.ip);
+        }
+        let left = c.remaining(now).as_secs();
+        tracing::info!(%mac, left_secs = left, "time ended: {why}");
+        st.ledger.push(Ledger::Audit {
+            actor: "system",
+            action: "time_expired",
+            detail: format!("{mac}: {} left ended ({why})", short_time(left)),
+        });
     }
 
     /// What the presence watcher found on the WiFi just now (MAC → address).
@@ -854,10 +918,32 @@ impl Engine {
                 c.banked = c.remaining(now);
                 c.until = None;
                 c.away = true;
+                c.idle = None;
                 self.fw.revoke(mac, c.ip);
                 tracing::info!(%mac, "left the WiFi: time paused until it's back");
                 changed = true;
             }
+        }
+        // Left without pausing (running, or paused by auto-pause) and not
+        // back within AWAY_EXPIRY: the time ends. Piso Pass time is the hub's
+        // to keep, so it's left alone.
+        let State { seen, clients, .. } = &mut *st;
+        for m in clients.keys() {
+            seen.entry(*m).or_insert(now); // never seen yet: the hour starts now
+        }
+        let left_behind: Vec<Mac> = st
+            .clients
+            .iter()
+            .filter(|(m, c)| {
+                (c.until.is_some() || c.away)
+                    && !st.links.contains_key(m)
+                    && st.seen.get(m).is_some_and(|t| now.saturating_duration_since(*t) >= AWAY_EXPIRY)
+            })
+            .map(|(m, _)| *m)
+            .collect();
+        for mac in left_behind {
+            self.end_unclaimed(&mut st, mac, now, "left the WiFi without pausing");
+            changed = true;
         }
         drop(st);
         if changed {
@@ -882,6 +968,7 @@ impl Engine {
         self.fw.allow(mac, c.ip, c.banked.as_secs());
         c.banked = Duration::ZERO;
         c.away = false;
+        c.idle = None;
         st.welcomes.insert(mac, now);
         tracing::info!(%mac, "back on the WiFi: time started again");
         true
@@ -1115,11 +1202,12 @@ impl Engine {
         let now = Instant::now();
         let left = Duration::from_secs(secs.min(MAX_GRANT_SECS));
         st.seen.insert(mac, now);
-        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO, away: false });
+        let c = st.clients.entry(mac).or_insert(Client::new(ip));
         c.away = false;
         if run {
             c.until = Some(now + left);
             c.banked = Duration::ZERO;
+            c.idle = None;
             self.fw.allow(mac, ip, left.as_secs());
         } else {
             if c.until.is_some() {
@@ -1127,6 +1215,8 @@ impl Engine {
             }
             c.until = None;
             c.banked = left;
+            // The owner set it paused: its days start from now.
+            c.idle = Some((Duration::ZERO, now));
         }
         c.ip = ip;
     }
@@ -1141,8 +1231,9 @@ impl Engine {
         let ip = self.ip_for(st, mac, ip, now);
         let add = Duration::from_secs(secs.min(MAX_GRANT_SECS));
         st.seen.insert(mac, now);
-        let c = st.clients.entry(mac).or_insert(Client { ip, until: None, banked: Duration::ZERO, away: false });
+        let c = st.clients.entry(mac).or_insert(Client::new(ip));
         c.away = false;
+        c.idle = None;
         let total = (c.remaining(now) + add).min(Duration::from_secs(MAX_GRANT_SECS));
         c.until = Some(now + total);
         c.banked = Duration::ZERO;
@@ -1160,14 +1251,22 @@ impl Engine {
         let mut slot_mark = None;
         {
             let mut st = self.state.lock().unwrap();
+            if checkpoint {
+                st.checkpoints = st.checkpoints.wrapping_add(1);
+            }
             for (m, c) in &st.clients {
-                if st.saved.clients.get(m) != Some(c) || (checkpoint && c.until.is_some()) {
+                // Every 20th checkpoint (10 minutes) also saves paused time's age,
+                // so it survives restarts without rewriting the SD card every 30 s.
+                // A power cut loses at most that much age: in the customer's favour.
+                let age_due = checkpoint && st.checkpoints % 20 == 0 && c.idle.is_some();
+                if st.saved.clients.get(m) != Some(c) || (checkpoint && c.until.is_some()) || age_due {
                     batch.clients.push(ClientRow {
                         mac: *m,
                         ip: c.ip,
                         remaining_secs: c.remaining(now).as_secs(),
                         paused: c.until.is_none(),
                         away: c.away,
+                        paused_secs: c.paused_for(now).map_or(0, |d| d.as_secs()),
                     });
                     client_marks.push((*m, Some(c.clone())));
                 }
@@ -1551,8 +1650,8 @@ mod tests {
         let mac = Mac::parse(PHONE).unwrap();
         buy(&e, mac, IP, 5);
         e.set_auto_pause(0).unwrap();
-        assert!(e.watched().is_empty());
-        e.presence_at(&HashMap::new(), later(60));
+        assert_eq!(e.watched(), vec![(mac, IP)], "still watched, for time left behind");
+        e.presence_at(&HashMap::new(), later(59));
         assert!(view(&e, mac).running, "off: time keeps running");
         // Turned on again: nobody was watched meanwhile, so everyone starts as here.
         e.set_auto_pause(10).unwrap();
@@ -1685,6 +1784,100 @@ mod tests {
         assert!(row(b).unwrap() > 4242, "running clock checkpointed");
         assert!(e.kick(a));
         assert_eq!(row(a), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn has_time(e: &Engine, mac: Mac) -> bool {
+        e.clients().iter().any(|c| c.mac == mac.to_string())
+    }
+
+    #[test]
+    fn time_left_behind_without_pausing_ends_after_an_hour() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        e.presence(&HashMap::from([(mac, IP)]));
+        // Auto-pause stops it first; that isn't the customer pausing.
+        e.presence_at(&HashMap::new(), later(30));
+        assert!(view(&e, mac).away);
+        e.presence_at(&HashMap::new(), later(59));
+        assert!(has_time(&e, mac), "gone 59 minutes: kept");
+        e.presence_at(&HashMap::new(), later(60));
+        assert!(!has_time(&e, mac), "gone an hour: ended");
+        assert!(e.grants().is_empty());
+        assert!(e.db.load_clients().unwrap().is_empty(), "saved");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn with_auto_pause_off_running_time_left_behind_also_ends() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 20);
+        e.set_auto_pause(0).unwrap();
+        e.presence_at(&HashMap::new(), later(60));
+        assert!(!has_time(&e, mac));
+        assert!(e.grants().is_empty(), "internet taken back too");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn coming_back_within_the_hour_keeps_the_time() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        e.presence_at(&HashMap::from([(mac, IP)]), later(50));
+        e.presence_at(&HashMap::new(), later(100));
+        assert!(has_time(&e, mac), "the hour counts from when it was last here");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn paused_time_is_kept_four_days_then_ends() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        assert!(e.pause(mac, IP));
+        e.presence_at(&HashMap::new(), later(3 * 24 * 60));
+        assert!(has_time(&e, mac), "paused: leaving doesn't end it");
+        e.tick_at(later(4 * 24 * 60 - 1));
+        assert!(has_time(&e, mac));
+        e.tick_at(later(4 * 24 * 60));
+        assert!(!has_time(&e, mac), "four days paused: ended");
+        assert!(e.db.load_clients().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn how_long_it_was_paused_survives_a_restart() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        drop(e);
+        // Saved by an earlier run: paused for 4 days less a minute so far.
+        let db = Db::open(&dir.join("t.db"), &DbKey(Zeroizing::new([7u8; 32]))).unwrap();
+        let row = ClientRow { mac, ip: IP, remaining_secs: 3600, paused: true, away: false, paused_secs: 4 * 24 * 3600 - 60 };
+        db.save(&Batch { clients: vec![row], ..Default::default() }).unwrap();
+        drop(db);
+        let e = engine_at(&dir, true, None);
+        e.tick_at(Instant::now());
+        assert!(has_time(&e, mac));
+        e.tick_at(later(1));
+        assert!(!has_time(&e, mac), "the last minute ran out after the restart");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoints_save_how_long_it_has_been_paused() {
+        let (dir, e) = engine(true);
+        let mac = Mac::parse(PHONE).unwrap();
+        buy(&e, mac, IP, 5);
+        assert!(e.pause(mac, IP));
+        e.persist();
+        let row = e.db.load_clients().unwrap().into_iter().find(|r| r.mac == mac).unwrap();
+        assert!(row.paused && !row.away && row.paused_secs < 5);
+        assert_eq!(short_time(0), "0s");
+        assert_eq!(short_time(45 * 60), "45m");
+        assert_eq!(short_time(3 * 3600 + 20 * 60), "3h 20m");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
