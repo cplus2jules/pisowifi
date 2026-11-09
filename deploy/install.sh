@@ -142,14 +142,19 @@ ask "I have a backup of the SD card. Continue?" || exit 1
 # ---- 1. Interfaces -----------------------------------------------------------
 SRC_CONF=./config.example.toml
 [[ -f "$CONF" ]] && SRC_CONF="$CONF"
+ENV_IFACES="${LAN_IF:-}${WAN_IF:-}"   # given on the command line: no questions
 LAN_IF="${LAN_IF:-$(setting lan_iface "$SRC_CONF")}"
 WAN_IF="${WAN_IF:-$(setting wan_iface "$SRC_CONF")}"
 LAN_IP="$(setting portal_ip "$SRC_CONF")"
 
 pick_iface() { # $1 = role description, $2 = current guess
   local name="$2"
-  while ! ip link show "$name" >/dev/null 2>&1; do
-    warn "There's no interface called '$name'. These exist:" >&2
+  while [[ -z "$name" ]] || ! ip link show "$name" >/dev/null 2>&1; do
+    if [[ -n "$name" ]]; then
+      warn "There's no interface called '$name'. These exist:" >&2
+    else
+      echo "These network interfaces exist:" >&2
+    fi
     ip -br link | grep -v '^lo ' | sed 's/^/     /' >&2
     read -r -p "Which one $1? " name
   done
@@ -177,10 +182,28 @@ if ((TEST_LAYOUT)); then
   echo "Customers: $LAN_IF (after the restart)   Internet: none"
 else
   say "Network interfaces"
+  if [[ "$WAN_IF" == nowan0 && -z "$ENV_IFACES" ]]; then
+    # Coming from the test layout: the built-in port served customers there,
+    # but in the shop layout it goes to the modem and a USB adapter takes the
+    # customers. Reusing the old answer would keep customers on the wrong port.
+    WAN_IF="$LAN_IF"
+    LAN_IF="$(ip -o link show 2>/dev/null | awk -F': ' '{sub(/@.*/, "", $2); print $2}' \
+      | grep -E '^(en|eth)' | grep -vxF "$WAN_IF" | head -1 || true)"
+    echo "This vendo was in the test layout, so the ports are guessed afresh."
+  fi
   LAN_IF="$(pick_iface "goes to the access point (customers)" "$LAN_IF")"
   WAN_IF="$(pick_iface "goes to the ISP modem" "$WAN_IF")"
   [[ "$LAN_IF" != "$WAN_IF" ]] || { echo "The LAN and WAN interfaces must be different."; exit 1; }
   echo "Customers: $LAN_IF   Modem: $WAN_IF"
+  if [[ -z "$ENV_IFACES" ]] && ! ask "Is that right?"; then
+    ip -br link | grep -v '^lo ' | sed 's/^/     /'
+    read -r -p "Which one goes to the access point (customers)? " LAN_IF
+    read -r -p "Which one goes to the ISP modem? " WAN_IF
+    LAN_IF="$(pick_iface "goes to the access point (customers)" "$LAN_IF")"
+    WAN_IF="$(pick_iface "goes to the ISP modem" "$WAN_IF")"
+    [[ "$LAN_IF" != "$WAN_IF" ]] || { echo "The LAN and WAN interfaces must be different."; exit 1; }
+    echo "Customers: $LAN_IF   Modem: $WAN_IF"
+  fi
   if ip -4 addr show "$LAN_IF" | grep -q "inet $LAN_IP/"; then
     echo "OK: $LAN_IF has $LAN_IP"
     if ! lan_ip_saved; then
@@ -355,8 +378,10 @@ fi
 say "Looking for LPB"
 mkdir -p "$BACKUP"
 CHANGED=1
+# "piso" also matches pisowifi's own units; those are never LPB.
 mapfile -t LPB_UNITS < <(systemctl list-unit-files --type=service --no-legend 2>/dev/null \
-  | awk '{print $1}' | grep -Ei 'lpb|piso|nginx|php.*fpm|mariadb|mysql|apache2|lighttpd' | grep -v '^pisowifi\.service$' || true)
+  | awk '{print $1}' | grep -Ei 'lpb|piso|nginx|php.*fpm|mariadb|mysql|apache2|lighttpd' \
+  | grep -vxE 'pisowifi(-update|-hub|-hub-update|-hub-autoupdate)?\.service' || true)
 if ((${#LPB_UNITS[@]})); then
   printf '  %s\n' "${LPB_UNITS[@]}"
   if ask "Stop and disable these (they are not uninstalled)? Customers go offline from here."; then
@@ -379,9 +404,11 @@ if [[ -s /root/.ssh/authorized_keys ]]; then
   warn "These SSH keys can log in as root (LPB's seller?). Remove any you don't know from /root/.ssh/authorized_keys:"
   awk '{print "     " $NF}' /root/.ssh/authorized_keys
 fi
-if ss -ltn 'sport = :80' 2>/dev/null | grep -q LISTEN; then
+# pisowifi itself on port 80 (a re-run) is fine: it's restarted at the end.
+PORT80="$(ss -ltnp 'sport = :80' 2>/dev/null | grep LISTEN | grep -v '"pisowifi"' || true)"
+if [[ -n "$PORT80" ]]; then
   warn "Something still serves port 80, which the portal needs:"
-  ss -ltnp 'sport = :80' | sed 's/^/     /'
+  echo "$PORT80" | sed 's/^/     /'
   ask "Continue anyway (the portal won't start until it's gone)?" || exit 1
 fi
 
@@ -420,13 +447,25 @@ if [[ -n "$(ls /sys/class/gpio 2>/dev/null | grep -E '^gpio[0-9]+$' || true)" ]]
 fi
 echo "Drop a few coins. Each burst of pulses is printed with its pin."
 echo "Press Ctrl-C when done (it also stops by itself after 3 minutes)."
+CUR_LINE="$(setting line "$CONF" || true)"
+KEEP="blank to set it later"
+[[ "$CUR_LINE" =~ ^[0-9]+$ ]] && KEEP="blank keeps line $CUR_LINE"
 if ask "Run the coin probe now?"; then
-  # Ctrl-C stops the probe only, not this installer.
+  # On a re-run the vendo's own service holds the coin pin, and the probe can't
+  # watch a pin that's in use. Pause it for the probe (step 7 restarts it).
+  PAUSED=0
+  if systemctl is-active -q pisowifi 2>/dev/null; then
+    echo "Pausing the running Piso WiFi service so the probe can watch its coin pin."
+    systemctl stop pisowifi && PAUSED=1
+  fi
+  # Ctrl-C stops the probe. At the question below it's ignored (Enter keeps
+  # the current line), so it can't stop this installer half way.
   trap ':' INT
   ./pisowifi --config "$CONF" coin-probe --seconds 180 || true
-  trap - INT
   echo
-  read -r -p "The line number it showed (blank to set it later): " LINE
+  read -r -p "The line number it showed ($KEEP): " LINE || LINE=""
+  trap - INT
+  ((PAUSED)) && { systemctl start pisowifi || true; }
   if [[ "$LINE" =~ ^[0-9]+$ ]]; then
     sed -i -E "s/^line = .*/line = $LINE/" "$CONF"
   fi
