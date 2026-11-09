@@ -7,7 +7,7 @@
 #
 # Where it goes: the signed bundles and the signed update list
 # (channels/stable.json + .sig) are pushed to the public repository
-# cplus2jules/pisowifi-releases, which vendos and the hub check; this private
+# cplus2jules/pisowifi-releases, which vendos and the hub check; this
 # repository gets a GitHub Release with the same files for your records.
 #
 # The build job runs third-party build scripts (crates.io), so it never sees

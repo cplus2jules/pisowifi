@@ -218,12 +218,7 @@ pub fn asset_version() -> &'static str {
     })
 }
 
-/// An HTML page with its asset links stamped with the current version.
-pub fn page(html: &'static str, cell: &'static std::sync::OnceLock<String>) -> Response {
-    html_page(cell.get_or_init(|| html.replace("__V__", asset_version())))
-}
-
-/// A finished HTML page (asset links already stamped).
+/// A finished HTML page (asset links already stamped with `asset_version`).
 pub fn html_page(body: &'static str) -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }

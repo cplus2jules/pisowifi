@@ -82,6 +82,7 @@ impl Kind {
 }
 
 /// Release asset name for a product and board, e.g. pisowifi-armv7.tar.gz.
+#[cfg(test)]
 pub fn asset_name(kind: Kind, target: &str) -> String {
     let arch = target.split('-').next().unwrap_or(target);
     match kind {

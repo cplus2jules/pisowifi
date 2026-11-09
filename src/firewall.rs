@@ -547,11 +547,11 @@ mod tests {
         assert!(r.contains("192.168.0.0/16 } tcp dport { 22, 320 } accept"));
         // Customers can't SSH in; in the test layout the owner's device can.
         assert!(!r.contains("ether saddr {"));
-        cfg.admin.allow_macs = vec!["00:E0:4C:36:52:91".into()];
+        cfg.admin.allow_macs = vec!["00:E0:4C:11:22:33".into()];
         assert!(!base_ruleset(&cfg, &[]).unwrap().contains("ether saddr {"), "needs the test-layout switch");
         cfg.admin.owner_ssh_from_lan = true;
         let r = base_ruleset(&cfg, &[]).unwrap();
-        assert!(r.contains("ether saddr { 00:e0:4c:36:52:91 } tcp dport { 22, 320 } accept"));
+        assert!(r.contains("ether saddr { 00:e0:4c:11:22:33 } tcp dport { 22, 320 } accept"));
     }
 
     #[test]

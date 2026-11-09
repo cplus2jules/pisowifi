@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 430" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <rect width="900" height="430" rx="24" fill="#F7F6FB"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 10 5 0 10z" fill="#6E7183"/></marker>
+  </defs>
+
+  <!-- internet + modem -->
+  <g transform="translate(40 150)">
+    <rect width="170" height="110" rx="18" fill="#fff" stroke="#E2E0EC" stroke-width="2"/>
+    <text x="85" y="40" text-anchor="middle" font-size="17" font-weight="700" fill="#1E1F2E">ISP modem</text>
+    <text x="85" y="64" text-anchor="middle" font-size="13" fill="#6E7183">PLDT, Globe, Converge…</text>
+    <text x="85" y="88" text-anchor="middle" font-size="13" fill="#6E7183">gives the internet</text>
+  </g>
+
+  <!-- the vendo board -->
+  <g transform="translate(330 110)">
+    <rect width="240" height="190" rx="22" fill="#5A43E6"/>
+    <text x="120" y="42" text-anchor="middle" font-size="18" font-weight="800" fill="#fff">Orange Pi One</text>
+    <text x="120" y="64" text-anchor="middle" font-size="13" fill="#DCD6FA">inside your vendo</text>
+    <rect x="16" y="86" width="96" height="40" rx="10" fill="#fff" opacity=".16"/>
+    <text x="64" y="104" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">Built-in</text>
+    <text x="64" y="119" text-anchor="middle" font-size="12" fill="#fff">LAN port</text>
+    <rect x="128" y="86" width="96" height="40" rx="10" fill="#D4F04C"/>
+    <text x="176" y="104" text-anchor="middle" font-size="12" font-weight="700" fill="#3F4D06">USB LAN</text>
+    <text x="176" y="119" text-anchor="middle" font-size="12" fill="#3F4D06">adapter</text>
+    <rect x="16" y="140" width="208" height="34" rx="10" fill="#fff" opacity=".16"/>
+    <text x="120" y="162" text-anchor="middle" font-size="12" font-weight="700" fill="#fff">microSD card (new) · GPIO pins</text>
+  </g>
+
+  <!-- access point -->
+  <g transform="translate(690 150)">
+    <rect width="170" height="110" rx="18" fill="#fff" stroke="#E2E0EC" stroke-width="2"/>
+    <text x="85" y="40" text-anchor="middle" font-size="17" font-weight="700" fill="#1E1F2E">Access point</text>
+    <text x="85" y="64" text-anchor="middle" font-size="13" fill="#6E7183">the outdoor WiFi</text>
+    <text x="85" y="88" text-anchor="middle" font-size="13" fill="#6E7183">customers connect here</text>
+  </g>
+
+  <!-- coin slot -->
+  <g transform="translate(355 345)">
+    <rect width="190" height="62" rx="16" fill="#fff" stroke="#E2E0EC" stroke-width="2"/>
+    <text x="95" y="27" text-anchor="middle" font-size="15" font-weight="700" fill="#1E1F2E">Coin slot</text>
+    <text x="95" y="47" text-anchor="middle" font-size="12" fill="#6E7183">COIN wire → a GPIO pin</text>
+  </g>
+
+  <!-- cables -->
+  <path d="M210 205 H330" stroke="#1E1F2E" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <text x="270" y="194" text-anchor="middle" font-size="12" font-weight="700" fill="#1E1F2E">cable</text>
+  <text x="270" y="226" text-anchor="middle" font-size="11" fill="#6E7183">to the modem</text>
+  <path d="M570 205 H690" stroke="#1E1F2E" stroke-width="4" fill="none" stroke-linecap="round"/>
+  <text x="630" y="194" text-anchor="middle" font-size="12" font-weight="700" fill="#1E1F2E">cable</text>
+  <text x="630" y="226" text-anchor="middle" font-size="11" fill="#6E7183">to the access point</text>
+  <path d="M450 345 V300" stroke="#1E1F2E" stroke-width="3" stroke-dasharray="6 5" fill="none" marker-end="url(#a)"/>
+
+  <!-- phones -->
+  <g transform="translate(740 40)" fill="none" stroke="#5A43E6" stroke-width="3" stroke-linecap="round">
+    <path d="M20 38a28 28 0 0 1 40 0M28 46a16 16 0 0 1 24 0"/>
+    <circle cx="40" cy="55" r="3" fill="#5A43E6"/>
+  </g>
+  <text x="780" y="120" text-anchor="middle" font-size="13" fill="#6E7183">customers' phones</text>
+
+  <text x="450" y="50" text-anchor="middle" font-size="20" font-weight="800" fill="#1E1F2E">Keep your cables exactly as they are</text>
+  <text x="450" y="76" text-anchor="middle" font-size="14" fill="#6E7183">Only the microSD card changes. The installer asks which port is which.</text>
+</svg>

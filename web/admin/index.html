@@ -607,6 +607,18 @@
               <h3 id="upd-notes-title"></h3>
               <p id="upd-notes-text"></p>
             </div>
+            <div class="upd-progress" id="upd-progress" aria-live="polite" hidden>
+              <div class="upd-prog-head"><b id="upd-prog-title">Getting ready</b><span id="upd-prog-pct">0%</span></div>
+              <div class="track upd-bar" id="upd-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-labelledby="upd-prog-title"><div class="fill" id="upd-fill"></div></div>
+              <p class="sub" id="upd-prog-detail"></p>
+              <ol class="upd-steps" id="upd-steps">
+                <li><i></i><span>Download</span></li>
+                <li><i></i><span>Verify</span></li>
+                <li><i></i><span>Install</span></li>
+                <li><i></i><span>Restart</span></li>
+                <li><i></i><span>Done</span></li>
+              </ol>
+            </div>
             <p class="upd-msg" id="upd-msg" hidden></p>
             <div class="row" id="upd-ready-row" hidden>
               <button class="btn outline" type="button" id="upd-cancel">Cancel</button>

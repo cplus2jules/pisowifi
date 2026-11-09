@@ -911,6 +911,11 @@ pub fn clean_url(url: &str, dev: bool) -> Result<Option<String>> {
 /// included, with a size cap and timeouts so a slow or hostile server can't
 /// hold the vendo up or fill its disk.
 fn get(url: &str, limit: u64, total: Duration, dev: bool) -> Result<Vec<u8>> {
+    get_with(url, limit, total, dev, &|_| {})
+}
+
+/// Like `get`, telling `on` how many bytes have arrived after each chunk.
+fn get_with(url: &str, limit: u64, total: Duration, dev: bool, on: &dyn Fn(u64)) -> Result<Vec<u8>> {
     let agent = ureq::AgentBuilder::new()
         .https_only(!dev)
         .timeout_connect(Duration::from_secs(15))
@@ -922,7 +927,18 @@ fn get(url: &str, limit: u64, total: Duration, dev: bool) -> Result<Vec<u8>> {
     match agent.get(url).call() {
         Ok(r) => {
             let mut data = Vec::new();
-            r.into_reader().take(limit + 1).read_to_end(&mut data).context("The download was interrupted.")?;
+            let mut reader = r.into_reader().take(limit + 1);
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).context("The download was interrupted."),
+                };
+                data.extend_from_slice(&buf[..n]);
+                on(data.len() as u64);
+            }
             if data.len() as u64 > limit {
                 bail!("The update server sent more than expected.");
             }
@@ -986,7 +1002,14 @@ pub fn check_online(p: &Profile, url: &str, key: Option<&VerifyingKey>, current:
 /// Downloads an offered bundle and checks everything: size and SHA-256
 /// against the list, then the bundle's own signature, board and version.
 pub fn download(p: &Profile, o: &Offer, key: Option<&VerifyingKey>, current: Version, dev: bool) -> Result<Vec<u8>> {
-    let data = get(&o.url, o.file.size, Duration::from_secs(20 * 60), dev)?;
+    download_with(p, o, key, current, dev, &|_| {})
+}
+
+/// Like `download`, reporting progress for the dashboard: `Some(bytes)` as
+/// the file arrives, then `None` once it's all here and being checked.
+pub fn download_with(p: &Profile, o: &Offer, key: Option<&VerifyingKey>, current: Version, dev: bool, on: &dyn Fn(Option<u64>)) -> Result<Vec<u8>> {
+    let data = get_with(&o.url, o.file.size, Duration::from_secs(20 * 60), dev, &|n| on(Some(n)))?;
+    on(None);
     if data.len() as u64 != o.file.size || !hex::encode(Sha256::digest(&data)).eq_ignore_ascii_case(&o.file.sha256) {
         bail!("The download doesn't match the update list (damaged or tampered with). Nothing was changed.");
     }
@@ -1203,8 +1226,12 @@ struct Status {
     found: Option<Offer>,
     /// An uploaded file that checked out, waiting for Install now.
     ready: Option<Manifest>,
-    /// "checking", "downloading" or "waiting" (staged; the installer takes over).
+    /// "checking", "downloading", "verifying" or "waiting" (staged; the
+    /// installer takes over).
     busy: Option<&'static str>,
+    /// Bytes of the update downloaded so far, and its full size.
+    got: u64,
+    size: u64,
     error: Option<String>,
     auto_day: Option<chrono::NaiveDate>,
 }
@@ -1270,6 +1297,7 @@ impl Updater {
             "last_check": s.last_check,
             "check_error": s.check_error,
             "busy": s.busy,
+            "progress": matches!(s.busy, Some("downloading" | "verifying")).then(|| json!({ "got": s.got, "size": s.size })),
             "error": s.error,
             "auto": self.auto(),
             "state": read_state(&self.state_path).filter(|s| s.phase != Phase::Idle),
@@ -1422,8 +1450,18 @@ impl Updater {
         if auto && failed.as_deref() == Some(o.version.to_string().as_str()) {
             bail!("Version {} couldn't start last time, so it isn't installed automatically. Tap Install now to try again.", o.version);
         }
-        self.set_busy(Some("downloading"));
-        let bundle = download(&self.p, &o, self.key.as_ref(), current, self.dev)?;
+        {
+            let mut s = self.st.lock().unwrap();
+            (s.busy, s.got, s.size) = (Some("downloading"), 0, o.file.size);
+        }
+        let report = |p: Option<u64>| {
+            let mut s = self.st.lock().unwrap();
+            match p {
+                Some(n) => s.got = n,
+                None => s.busy = Some("verifying"),
+            }
+        };
+        let bundle = download_with(&self.p, &o, self.key.as_ref(), current, self.dev, &report)?;
         let v = o.version;
         self.st.lock().unwrap().found = Some(o);
         if self.dev {
@@ -1903,8 +1941,15 @@ mod tests {
         let key = test_key(1).verifying_key();
         let o = check_online(&pb.profile, &pb.url, Some(&key), Version(0, 1, 0), true).unwrap().expect("0.2.0 is newer");
         assert_eq!((o.version, o.notes.as_str()), (Version(0, 2, 0), "Faster coin counting."));
-        let bundle = download(&pb.profile, &o, Some(&key), Version(0, 1, 0), true).unwrap();
+        let seen = Mutex::new(Vec::new());
+        let bundle = download_with(&pb.profile, &o, Some(&key), Version(0, 1, 0), true, &|p| seen.lock().unwrap().push(p)).unwrap();
         assert_eq!(bundle, fs::read(&pb.bundle_path).unwrap());
+        // The dashboard's bar: bytes only go up, end at the full size, then checking.
+        let seen = seen.into_inner().unwrap();
+        let (last, bytes) = seen.split_last().unwrap();
+        assert_eq!(*last, None, "checked after it's all here");
+        assert_eq!(bytes.last().copied().flatten(), Some(o.file.size));
+        assert!(bytes.windows(2).all(|w| w[0] < w[1]));
         let asset = release::asset_name(Kind::Vendo, release::TARGET);
         assert_eq!(*pb.asked.lock().unwrap(), ["/channels/stable.json", "/channels/stable.json.sig", &format!("/v0.2.0/{asset}")]);
         // Already on it: nothing to offer, nothing downloaded.

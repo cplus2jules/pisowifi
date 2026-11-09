@@ -168,7 +168,10 @@ h1, h2, p { margin: 0; }
 .drop-top h2 { font-size: 18px; font-weight: 750; letter-spacing: -.02em; }
 .drop-top .sub b, .drop-top .sub span { font-variant-numeric: tabular-nums; }
 .drop-zone { position: relative; width: clamp(180px, 56vw, 210px); aspect-ratio: 1; display: grid; place-items: center; margin: 6px 0 2px; perspective: 600px; }
-.ring { position: absolute; inset: 0; transform: rotate(-90deg); overflow: visible; }
+/* The drawing has 20 units of margin around the 120-unit ring (inset widens the
+   box to match, so the ring keeps its size): iOS Safari clips a filtered SVG
+   to its own box, which sliced the Glass ring's outer edge and shadow flat. */
+.ring { position: absolute; inset: -16.667%; transform: rotate(-90deg); overflow: visible; pointer-events: none; }
 .ring circle { fill: none; stroke-width: 9; }
 .ring-bg { stroke: var(--lavender); }
 .ring-tube { display: none; } /* the Glass look's tube edges */
@@ -376,9 +379,11 @@ h1, h2, p { margin: 0; }
 .made-by:hover { color: var(--purple); background: var(--lavender); }
 
 /* ---- onboarding ------------------------------------------------------------ */
-.onboard { position: fixed; inset: 0; z-index: 50; display: grid; align-items: end; justify-items: center; background: rgba(30, 31, 46, .38); backdrop-filter: blur(4px); animation: fade .3s ease; }
+.onboard { position: fixed; inset: 0; z-index: 50; display: grid; grid-template-columns: minmax(0, 1fr); align-items: end; justify-items: center; background: rgba(30, 31, 46, .38); backdrop-filter: blur(4px); animation: fade .3s ease; }
 .ob-sheet {
-  width: min(100%, 480px); background: #fff; border-radius: 30px 30px 0 0; overflow: hidden; overflow: clip; /* clip: focus or scrollIntoView can't shift the slides sideways */
+  /* min-width 0: with overflow: clip (unlike hidden) the slides' own width would
+     otherwise stretch the sheet past a narrow phone's screen. */
+  width: min(100%, 480px); min-width: 0; background: #fff; border-radius: 30px 30px 0 0; overflow: hidden; overflow: clip; /* clip: focus or scrollIntoView can't shift the slides sideways */
   padding: 10px 0 calc(16px + env(safe-area-inset-bottom)); animation: sheet .6s var(--ease); animation-timing-function: var(--spring);
   touch-action: pan-y; outline: none;
 }
@@ -509,7 +514,11 @@ html[data-theme="glass"] body::before, html[data-theme="glass"] body::after {
   content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
 }
 html[data-theme="glass"] body::before {
+  /* First layer: under the iPhone status bar the field is the flat theme-color
+     Safari paints there, then fades into the colour, so content scrolling up
+     under Safari's band meets no hard line. No status bar (inset 0): no layer. */
   background:
+    linear-gradient(var(--bg) env(safe-area-inset-top, 0px), transparent calc(env(safe-area-inset-top, 0px) * 2.5)),
     radial-gradient(60vmax 46vmax at 6% 4%, color-mix(in srgb, var(--purple) 46%, transparent), transparent 68%),
     radial-gradient(52vmax 44vmax at 100% 24%, color-mix(in srgb, var(--rose) 62%, transparent), transparent 70%),
     radial-gradient(58vmax 46vmax at 88% 96%, color-mix(in srgb, var(--peach) 52%, transparent), transparent 70%),

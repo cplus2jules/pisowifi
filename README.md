@@ -3,6 +3,10 @@
 Open-source, security-first Piso WiFi for an Orange Pi. One static Rust
 binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 
+**Switching your vendo over?** Follow the step-by-step guide with
+screenshots: [docs/INSTALL.md](docs/INSTALL.md). It takes about 45 minutes,
+and your old microSD card stays untouched as your way back.
+
 - **Customer portal** on `http://10.0.0.1/`: tap *Insert coin*, drop coins,
   get online. Pause and resume to save time. Voucher codes. Each coin you drop
   animates on screen as the real ₱1/₱5/₱10/₱20 coin it is. First-time visitors
@@ -85,6 +89,10 @@ binary (about 6 MB) replaces LPB's nginx + PHP + MariaDB stack.
 - **SSH works only from the modem's side** (e.g. a laptop on the modem's own WiFi), never from the customer WiFi.
 
 ## Install on the Orange Pi
+
+New to this? [docs/INSTALL.md](docs/INSTALL.md) walks through the same steps
+with screenshots, starting from a fresh microSD card. The steps below install
+over the old card instead.
 
 **0. Back up the SD card first** (balenaEtcher "clone", or `dd`). That's
 your guaranteed way back to LPB.
@@ -219,7 +227,7 @@ You develop on the Mac and push to GitHub as usual. When a version is ready,
 you tag it: GitHub builds it, signs it and publishes it, and every
 vendo with internet offers it the same day. An ordinary push ships nothing.
 
-- **`cplus2jules/pisowifi`** (private) holds the code. Each release is also
+- **`cplus2jules/pisowifi`** (public) holds the code. Each release is also
   kept here as a GitHub Release, for your records.
 - **`cplus2jules/pisowifi-releases`** (public) holds only the signed update
   files that vendos and the hub download: the newest three versions and the

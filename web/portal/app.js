@@ -292,7 +292,8 @@ function render() {
     if (slot.pesos > 0) credit.replaceChildren("That's ", el("b", human(slot.credit_secs)), " of internet");
     else credit.textContent = "Waiting for your first coin…";
     $("done").disabled = slot.pesos === 0;
-    $("done").textContent = slot.pesos > 0 ? "Start internet" : "Drop a coin to continue";
+    // Someone topping up already has internet (or paused time), so "start" is wrong.
+    $("done").textContent = slot.pesos === 0 ? "Drop a coin to continue" : state.remaining_secs > 0 ? "Add time" : "Start internet";
     // Backing out is only offered before any coin: paid coins always become time.
     $("cancel-insert").hidden = slot.pesos > 0;
   } else {

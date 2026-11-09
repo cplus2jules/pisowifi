@@ -2224,17 +2224,108 @@ function renderSystem(s) {
 
 $("sys-copy").addEventListener("click", () => copyText(sysText, "Copied. Paste it into a message or a GitHub issue."));
 
+// An install in progress, followed step by step: download, verify, install,
+// restart, done. While the vendo restarts the dashboard can't be reached, and
+// afterwards its sign-in is gone, so polling then is quiet (no jump to the
+// sign-in page) until the vendo answers again.
+let updFlow = null;   // { to, uploaded, down, back, samples: [[ms, bytes]] }
+
+async function updFetch() {
+  try {
+    const r = await fetch("/api/update", { headers: { "x-pisowifi": "1" }, cache: "no-store", credentials: "same-origin" });
+    if (r.status === 401) return { back: true };
+    if (!r.ok) return { down: true };
+    return { data: await r.json() };
+  } catch (_) {
+    return { down: true };
+  }
+}
+
 async function loadUpdate() {
   clearTimeout(updTimer);
+  if (updFlow || updRestarting) {
+    updFlow = updFlow || { to: upd && (upd.available || upd.ready || {}).version, samples: [] };
+    const r = await updFetch();
+    if (r.data) {
+      upd = r.data;
+      if (updFlow.down) updFlow.back = true; // answered again with the sign-in still valid
+    } else if (r.down) {
+      updFlow.down = true;
+    } else if (r.back) {
+      // The vendo restarted: it answers, but the old sign-in is gone.
+      updFlow.down = updFlow.back = true;
+      renderUpdate();
+      clearTimeout(updTimer);
+      const to = updFlow.to;
+      updFlow = null;
+      updTimer = setTimeout(() => showLogin("The vendo restarted with the update" + (to ? " to " + to : "") + ". Sign in to check it started properly."), 1800);
+      return;
+    }
+    renderUpdate();
+    const st = upd && upd.state;
+    const settled = !upd.busy && !(st && UPD_ACTIVE.includes(st.phase)) && !updFlow.down;
+    if (settled && !updRestarting) updFlow = null;
+    if (updFlow || updRestarting) updTimer = setTimeout(loadUpdate, upd && upd.busy === "downloading" ? 800 : 2000);
+    return;
+  }
   try {
     upd = await api("GET", "/update");
     renderUpdate();
   } catch (_) {
-    // Unreachable while the vendo restarts into the new version: keep asking.
-    if (!updRestarting) return;
+    return;
   }
-  const active = updRestarting || (upd && (upd.busy || (upd.state && UPD_ACTIVE.includes(upd.state.phase))));
-  if (currentTab === "settings" && active) updTimer = setTimeout(loadUpdate, 2000);
+  const active = upd && (upd.busy || (upd.state && UPD_ACTIVE.includes(upd.state.phase)));
+  if (active) { updFlow = { to: (upd.available || upd.ready || {}).version, samples: [] }; loadUpdate(); }
+}
+
+const MB = (b) => (b / 1048576).toFixed(1);
+
+// Where an install is: which step (0 download … 4 done), how far overall,
+// and what to say. Download fills most of the bar, as it takes the longest.
+function updProgress(u) {
+  const st = u.state, f = updFlow || {}, to = f.to || (u.available || u.ready || {}).version || (st && st.to) || "";
+  const v = to ? " " + to : "";
+  if (f.back || (st && st.phase === "done" && f.down)) return { step: 4, pct: 100, title: "Back online", detail: "The vendo restarted with the update. Sign in again to see how it went." };
+  if (st && st.phase === "rolling_back") return { step: 3, pct: 92, title: "Putting the old version back", detail: "The new version didn't start properly, so the vendo is undoing it. Customers stay online.", warn: true, wait: true };
+  if (st && st.phase === "trial") return { step: 3, pct: 95, title: "Making sure it starts properly", detail: "The new version is running. If it doesn't settle within about 90 seconds, the old one comes back by itself.", wait: true };
+  if (f.down) return { step: 3, pct: 88, title: "Restarting the vendo", detail: "Customers stay online. The dashboard comes back in about a minute.", wait: true };
+  if (u.busy === "waiting" || (st && st.phase === "installing")) return { step: 2, pct: 74, title: "Installing version" + v, detail: "Swapping in the new version. Your settings, sales and customers' time are kept.", wait: true };
+  if (u.busy === "verifying") return { step: 1, pct: 62, title: "Checking the signature", detail: "Making sure this is the real update, signed with your release key and not changed on the way." , wait: true };
+  if (u.busy === "downloading" && u.progress && u.progress.size) {
+    const { got, size } = u.progress, frac = Math.min(1, got / size);
+    const s = f.samples || [];
+    s.push([performance.now(), got]);
+    while (s.length > 8) s.shift();
+    let eta = "";
+    if (s.length > 2) {
+      const [t0, b0] = s[0], [t1, b1] = s[s.length - 1], rate = (b1 - b0) / Math.max(1, (t1 - t0) / 1000);
+      if (rate > 0 && got < size) {
+        const left = Math.max(1, Math.round((size - got) / rate));
+        eta = " · " + (left < 60 ? left + (left === 1 ? " second" : " seconds") : "about " + Math.round(left / 60) + " min") + " left";
+      }
+    }
+    return { step: 0, pct: 4 + Math.round(54 * frac), title: "Downloading version" + v, detail: MB(got) + " of " + MB(size) + " MB" + eta };
+  }
+  return { step: 0, pct: 2, title: "Getting ready", detail: "Asking the update server for the newest version…", wait: true };
+}
+
+function renderProgress(u) {
+  const box = $("upd-progress"), p = updProgress(u);
+  box.hidden = false;
+  box.classList.toggle("warn", !!p.warn);
+  $("upd-prog-title").textContent = p.title;
+  $("upd-prog-pct").textContent = p.pct + "%";
+  $("upd-prog-detail").textContent = p.detail;
+  const bar = $("upd-bar");
+  bar.setAttribute("aria-valuenow", String(p.pct));
+  bar.classList.toggle("live", p.pct < 100);
+  bar.classList.toggle("wait", !!p.wait);
+  $("upd-fill").style.width = p.pct + "%";
+  const uploaded = updFlow && updFlow.uploaded;
+  [...$("upd-steps").children].forEach((li, i) => {
+    const done = i < p.step || (p.step === 4) || (uploaded && i < 2);
+    li.className = done ? "done" : i === p.step ? "now" : "";
+  });
 }
 
 function renderUpdate(note, noteBad) {
@@ -2242,7 +2333,9 @@ function renderUpdate(note, noteBad) {
   // An uploaded file comes first; a newer version online second.
   const offer = u.ready || u.available;
   updRestarting = u.busy === "waiting" || !!(st && UPD_ACTIVE.includes(st.phase));
-  const working = !!u.busy || updRestarting;
+  const working = !!u.busy || updRestarting || !!(updFlow && (updFlow.down || updFlow.back));
+  const installing = working && u.busy !== "checking" || !!(updFlow && u.busy === "checking");
+  if (installing) renderProgress(u); else $("upd-progress").hidden = true;
 
   $("upd-current").textContent = "Version " + u.current;
   let last = "";
@@ -2254,7 +2347,9 @@ function renderUpdate(note, noteBad) {
   let pill = "Up to date", cls = "used";
   if (!u.signed) pill = "Off";
   else if (u.busy === "checking") { pill = "Checking"; cls = "off"; }
-  else if (u.busy === "downloading") { pill = "Downloading"; cls = "off"; }
+  else if (u.busy === "downloading" || u.busy === "verifying") { pill = "Downloading"; cls = "off"; }
+  else if (updFlow && updFlow.back) { pill = "Back online"; cls = "on"; }
+  else if (updFlow && updFlow.down) { pill = "Restarting"; cls = "off"; }
   else if (updRestarting) { pill = "Installing"; cls = "off"; }
   else if (u.ready) { pill = "Ready to install"; cls = "on"; }
   else if (u.available) { pill = "Update available"; cls = "on"; }
@@ -2273,9 +2368,7 @@ function renderUpdate(note, noteBad) {
   if (!msg) {
     if (!u.signed) msg = "Updates are off: this copy was built without a release key. Reinstall it once from a signed bundle.";
     else if (u.error) { msg = u.error; bad = true; }
-    else if (u.busy === "checking") msg = "Checking…";
-    else if (u.busy === "downloading") msg = "Downloading and checking version " + (u.available ? u.available.version : "") + "…";
-    else if (updRestarting) msg = "Installing. Customers stay online. The dashboard is back in about a minute; you'll need to sign in again.";
+    else if (u.busy === "checking" && !installing) msg = "Checking…";
   }
   $("upd-msg").textContent = msg;
   $("upd-msg").hidden = !msg;
@@ -2344,7 +2437,13 @@ $("upd-install").addEventListener("click", (ev) => {
   if (!confirm("Install version " + offer.version + " now?\n\nCustomers stay online. The dashboard restarts, so you'll sign in again. " +
     "If the new version doesn't start, this one is put back by itself.")) return;
   busy(ev.currentTarget, async () => {
-    upd = await api("POST", "/update/install");
+    updFlow = { to: offer.version, uploaded: !!upd.ready, samples: [] };
+    try {
+      upd = await api("POST", "/update/install");
+    } catch (e) {
+      updFlow = null;
+      throw e;
+    }
     renderUpdate();
     loadUpdate();
   });

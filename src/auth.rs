@@ -24,7 +24,6 @@ use subtle_eq::ct_eq;
 use tokio::sync::Semaphore;
 
 pub const PASSWORD_KEY: &str = "admin_password";
-pub const MIN_PASSWORD_LEN: usize = crate::pwpolicy::MIN_LEN;
 const MAX_FAILS: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(15 * 60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
