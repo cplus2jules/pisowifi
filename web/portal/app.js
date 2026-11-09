@@ -197,6 +197,9 @@ function renderDrain(left, online) {
   }
   if (left > peak) savePeak(left);
   bar.classList.toggle("still", !online);
+  // Over 15 minutes the bar moves under a pixel a second: jump, don't animate
+  // (a nonstop 1 s transition keeps the phone drawing every frame).
+  bar.classList.toggle("coarse", peak > 900);
   $("drain-fill").style.transform = "scaleX(" + Math.max(0.015, left / peak).toFixed(4) + ")";
   if (!low) {
     if (left > 330) lowWarned = 0;

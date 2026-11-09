@@ -483,6 +483,7 @@ a.btn.primary { color: #fff; }
 .drain i { display: block; height: 100%; border-radius: inherit; background: var(--purple); transform-origin: left center; transition: transform 1s linear; }
 .hero.online .drain i { background: #fff; }
 .drain.still i { transition: transform .6s var(--ease); transition-timing-function: var(--spring); }
+.drain.coarse:not(.still) i { transition: none; } /* long session: steps are under a pixel */
 .hero.low .drain i { background: var(--lime); animation: low-pulse 1.4s ease-in-out infinite; }
 .slot.nudge { animation: nudge 2.6s ease-in-out infinite; }
 
@@ -533,16 +534,20 @@ html[data-theme="glass"] {
   --peach: #FFA27E;
   --rose: #F39BD3;
   --sky: #93C9FF;
-  --frost: linear-gradient(165deg, rgba(255, 255, 255, .62), rgba(255, 255, 255, .2) 55%, rgba(255, 255, 255, .34));
+  /* The panes are frosted by colour alone, no live blur: behind them is only
+     the soft colour field, which looks the same blurred, and a dozen live
+     blurs redone every frame made cheap phones lag. Sheets keep real blur
+     (they cover real content, and only briefly). */
+  --frost: linear-gradient(165deg, rgba(255, 255, 255, .7), rgba(255, 255, 255, .3) 55%, rgba(255, 255, 255, .42));
   --rim: inset 0 0 0 1.5px rgba(255, 255, 255, .78), inset 0 0 22px rgba(255, 255, 255, .45);
   --lift: 0 26px 44px -30px rgba(52, 36, 104, .5);
-  --blur: blur(22px) saturate(1.7);
   background: var(--bg);
 }
 html[data-theme="glass"] body { background: transparent; }
 /* The colour field, and a fine grain over it so it reads as frosted, not flat. */
 html[data-theme="glass"] body::before, html[data-theme="glass"] body::after {
   content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  will-change: transform; /* their own layers: scrolling never repaints them */
 }
 html[data-theme="glass"] body::before {
   /* First layer: under the iPhone status bar the field is the flat theme-color
@@ -565,7 +570,6 @@ html[data-theme="glass"] body::after {
 html[data-theme="glass"] :is(.drop, .pass-card, .home-card, .voucher, .notice, .blocked-card, .rate, .help, .poster, .steps li) {
   background: var(--frost); border: 0;
   box-shadow: var(--rim), var(--lift);
-  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
 }
 /* An uploaded logo gets the same bright glass rim as the built-in mark. */
 html[data-theme="glass"] .logo { position: relative; box-shadow: 0 10px 20px -12px rgba(52, 36, 104, .55); }
@@ -575,9 +579,8 @@ html[data-theme="glass"] .help { color: var(--ink); background: rgba(255, 255, 2
 /* ---- time left: a pane that fills with colour once you're online ---------- */
 html[data-theme="glass"] .hero {
   border-radius: 36px; padding: 20px 22px;
-  background: rgba(255, 255, 255, .26);
+  background: rgba(255, 255, 255, .34);
   box-shadow: var(--rim), var(--lift);
-  -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
 }
 html[data-theme="glass"] .hero::before { /* calm tint: no time yet, or paused */
   opacity: 1;
@@ -597,7 +600,7 @@ html[data-theme="glass"] .hero::after { /* the gel that swirls in when online */
   transition: opacity .8s ease, transform 1.2s var(--ease);
 }
 html[data-theme="glass"] .hero.online { background-color: transparent; text-shadow: 0 1px 14px rgba(44, 24, 96, .28); }
-html[data-theme="glass"] .hero.online::after { opacity: 1; transform: none; animation: gel 26s ease-in-out infinite alternate; }
+html[data-theme="glass"] .hero.online::after { opacity: 1; transform: none; animation: gel 26s ease-in-out infinite alternate; will-change: transform; }
 html[data-theme="glass"] .hero .pill { background: rgba(255, 255, 255, .55); color: var(--ink); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .8); }
 html[data-theme="glass"] .hero.online .pill { background: rgba(255, 255, 255, .2); color: #fff; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .45); text-shadow: none; }
 /* Big thin numerals, like a watch face. */
@@ -656,7 +659,9 @@ html[data-theme="glass"] .drop-zone::before {
 }
 html[data-theme="glass"] .ring { filter: drop-shadow(0 10px 12px rgba(52, 36, 104, .2)); }
 html[data-theme="glass"] .ring-bg { stroke: rgba(255, 255, 255, .42); stroke-width: 15; }
-html[data-theme="glass"] .ring-fg { stroke-width: 10; stroke: url(#ring-gel); filter: url(#gel); }
+/* The gel lighting is recalculated whenever the ring moves, so here it ticks
+   once a second (a short ease) instead of gliding nonstop for the minute. */
+html[data-theme="glass"] .ring-fg { stroke-width: 10; stroke: url(#ring-gel); filter: url(#gel); transition: stroke-dashoffset .3s ease-out; }
 html[data-theme="glass"] .ring-tube { display: block; fill: none; stroke: #fff; }
 html[data-theme="glass"] .ring-tube.in { stroke-width: 1.4; stroke-opacity: .95; }
 html[data-theme="glass"] .ring-tube.out { stroke-width: 1.4; stroke-opacity: .85; }
@@ -748,9 +753,12 @@ html[data-theme="glass"] .toast { background: rgba(255, 255, 255, .7); border-co
 
 /* Phones without frosted-glass support get milkier panes so text stays readable. */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  html[data-theme="glass"] :is(.drop, .pass-card, .home-card, .voucher, .notice, .blocked-card, .rate, .help, .poster, .steps li, .hero) { background-color: rgba(255, 255, 255, .78); }
   html[data-theme="glass"] .ob-sheet { background: rgba(255, 255, 255, .96); }
 }
+
+/* A sheet open: the page under its blur holds still, so the blur isn't
+   redone every frame for animations no one can see. */
+body:has(> .onboard:not([hidden])) main * { animation-play-state: paused !important; }
 
 @keyframes gel { 0% { transform: rotate(0) scale(1); } 50% { transform: rotate(14deg) scale(1.08); } 100% { transform: rotate(-10deg) scale(1.02); } }
 
