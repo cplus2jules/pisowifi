@@ -802,6 +802,8 @@ struct BrandingReq {
     name_weight: Option<u16>,
     /// One of [`crate::brand::THEMES`]; left out: unchanged.
     theme: Option<String>,
+    /// One of [`crate::brand::NAME_STYLES`]; left out: unchanged.
+    name_style: Option<String>,
 }
 
 async fn set_branding(
@@ -826,6 +828,9 @@ async fn set_branding(
     if req.theme.as_deref().is_some_and(|t| !crate::brand::THEMES.contains(&t)) {
         return Err(ApiError::bad("Pick one of the looks"));
     }
+    if req.name_style.as_deref().is_some_and(|s| !crate::brand::NAME_STYLES.contains(&s)) {
+        return Err(ApiError::bad("Pick Glossy or Plain for the name"));
+    }
     let (alt, wifi) = (clean_text(&req.poster_alt, 120), clean_text(&req.wifi_name, 32));
     let now = st.brand.get();
     let after_url = match &req.after_url {
@@ -844,6 +849,9 @@ async fn set_branding(
     }
     if let Some(theme) = &req.theme {
         st.brand.set_theme(&st.db, theme)?;
+    }
+    if let Some(style) = &req.name_style {
+        st.brand.set_name_style(&st.db, style)?;
     }
     st.brand.set_text(&st.db, &name, &req.accent.to_uppercase(), &alt, &wifi)?;
     st.db.audit(&actor(addr), "branding", &format!("{name} · {}", req.accent));

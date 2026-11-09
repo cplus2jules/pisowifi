@@ -690,6 +690,8 @@ function applyBrand(b) {
   if (glass) document.documentElement.dataset.theme = "glass";
   else delete document.documentElement.dataset.theme;
   document.querySelector('meta[name="theme-color"]').content = glass ? "#EFEBF5" : "#FFFFFF";
+  if (b.name_style === "plain") document.documentElement.dataset.name = "plain";
+  else delete document.documentElement.dataset.name;
   const root = document.documentElement.style;
   root.setProperty("--purple", b.accent);
   root.setProperty("--purple-2", mix(b.accent, "#ffffff", 0.2));

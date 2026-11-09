@@ -28,16 +28,22 @@ pub fn router(st: Shared) -> Router {
         .layer(from_fn(app::portal_csrf_guard));
     Router::new()
         .route("/", get(|State(st): State<Shared>| async move {
-            // The owner's look is stamped into the page, so it never flashes the other one first.
-            static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-            static GLASS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            // The owner's look and name style are stamped into the page, so it
+            // never flashes the other one first. One copy per combination.
+            static PAGES: [std::sync::OnceLock<String>; 4] = [const { std::sync::OnceLock::new() }; 4];
             const PAGE: &str = include_str!("../web/portal/index.html");
-            let html = match st.brand.get().theme.as_str() {
-                "glass" => GLASS.get_or_init(|| {
-                    PAGE.replace("__V__", app::asset_version()).replacen("<html lang=\"en\">", "<html lang=\"en\" data-theme=\"glass\">", 1)
-                }),
-                _ => HTML.get_or_init(|| PAGE.replace("__V__", app::asset_version())),
-            };
+            let b = st.brand.get();
+            let (glass, plain) = (b.theme == "glass", b.name_style == "plain");
+            let html = PAGES[usize::from(glass) * 2 + usize::from(plain)].get_or_init(|| {
+                let mut attrs = String::new();
+                if glass {
+                    attrs.push_str(" data-theme=\"glass\"");
+                }
+                if plain {
+                    attrs.push_str(" data-name=\"plain\"");
+                }
+                PAGE.replace("__V__", app::asset_version()).replacen("<html lang=\"en\">", &format!("<html lang=\"en\"{attrs}>"), 1)
+            });
             app::html_page(html)
         }))
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/portal/app.js")) }))

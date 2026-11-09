@@ -482,7 +482,7 @@ function placeSegPill(seg = $("period")) {
   pill.style.setProperty("--w", cur.offsetWidth + "px");
 }
 
-window.addEventListener("resize", () => { placeNavPill(); placeSegPill(); placeSegPill($("away-mins")); });
+window.addEventListener("resize", () => { placeNavPill(); placeSegPill(); placeSegPill($("away-mins")); placeSegPill($("b-style")); });
 
 // Phones: the sidebar slides in over the page.
 let navScrim = null;
@@ -1749,9 +1749,25 @@ for (const c of document.querySelectorAll(".look-chip")) {
   });
 }
 
+// Glossy or plain name: a two-way switch with a sliding pill.
+function renderNameStyle() {
+  const style = brandDraft.name_style || "glossy";
+  for (const btn of $("b-style").querySelectorAll("[data-style]")) btn.setAttribute("aria-checked", String(btn.dataset.style === style));
+  requestAnimationFrame(() => placeSegPill($("b-style")));
+}
+
+for (const btn of $("b-style").querySelectorAll("[data-style]")) {
+  btn.addEventListener("click", () => {
+    brandDraft.name_style = btn.dataset.style;
+    renderNameStyle();
+    renderPreview();
+  });
+}
+
 function loadBrand(b) {
   brandDraft = Object.assign({}, b);
   renderLook();
+  renderNameStyle();
   renderFonts();
   $("b-name").value = b.name;
   $("b-wifi").value = b.wifi_name;
@@ -1780,6 +1796,7 @@ function renderPreview() {
   const b = brandDraft;
   const phone = $("phone");
   phone.classList.toggle("glass", b.theme === "glass");
+  phone.classList.toggle("plain-name", b.name_style === "plain");
   phone.style.setProperty("--a", b.accent);
   phone.style.setProperty("--a-soft", mix(b.accent, "#ffffff", 0.88));
   phone.style.setProperty("--b", b.button);
@@ -1881,6 +1898,7 @@ $("brand-form").addEventListener("submit", (ev) => {
       name_font: brandDraft.name_font || "",
       name_weight: brandDraft.name_weight,
       theme: brandDraft.theme || "classic",
+      name_style: brandDraft.name_style || "glossy",
     });
     overview.brand = r.brand;
     overview.name = r.brand.name;

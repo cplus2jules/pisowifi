@@ -54,14 +54,15 @@ h1, h2, p { margin: 0; }
 .top h1 { flex: 1; min-width: 0; font-size: clamp(18px, 5vw, 21px); line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The name, in the font and thickness the owner picked (set from the brand). */
 .top h1, #ob-name { font-family: var(--name-font, var(--font)); font-weight: var(--name-weight, 800); letter-spacing: var(--name-track, -.025em); }
-/* The shop name as glass: a glossy top half over deep ink, a bright edge
-   underneath and a soft purple glow. It springs in when the page opens. */
-.top h1 {
+/* The shop name springs in when the page opens. Glossy (the default; the
+   owner can pick Plain): accent-coloured glass, a glossy top half over
+   deep ink, a bright edge underneath and a soft glow. */
+.top h1 { animation: name-pop .9s var(--spring) .08s both; }
+html:not([data-name="plain"]) .top h1 {
   color: transparent; -webkit-background-clip: text; background-clip: text;
   background-image: linear-gradient(180deg, color-mix(in srgb, var(--purple) 70%, #fff) 0%, var(--purple) 44%, var(--purple-ink) 52%, color-mix(in srgb, var(--purple-ink) 65%, var(--ink)) 100%);
   filter: drop-shadow(0 1px 0 rgba(255, 255, 255, .95)) drop-shadow(0 4px 8px color-mix(in srgb, var(--purple) 38%, transparent));
   padding-bottom: 2px; /* room for descenders inside the clipped text */
-  animation: name-pop .9s var(--spring) .08s both;
 }
 @keyframes name-pop { from { transform: translateY(8px) scale(.94); opacity: 0; } }
 .help { width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--line); background: rgba(255, 255, 255, .8); color: var(--muted); display: grid; place-items: center; flex: none; transition: transform .4s var(--ease); transition-timing-function: var(--spring); }

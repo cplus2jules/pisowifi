@@ -23,6 +23,9 @@ pub const COINS: [u32; 4] = [1, 5, 10, 20];
 /// Looks the customer page can wear: the flat purple-and-lime one, or
 /// frosted glass over soft colour. The first is the default.
 pub const THEMES: [&str; 2] = ["classic", "glass"];
+/// How the name is drawn: glossy (accent-coloured glass, the default) or
+/// plain ink.
+pub const NAME_STYLES: [&str; 2] = ["glossy", "plain"];
 
 #[derive(Clone, Serialize)]
 pub struct Brand {
@@ -49,6 +52,8 @@ pub struct Brand {
     pub coins: Vec<u32>,
     /// One of [`THEMES`].
     pub theme: String,
+    /// One of [`NAME_STYLES`].
+    pub name_style: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -128,6 +133,11 @@ pub fn theme_of(setting: Option<&str>) -> &'static str {
     THEMES.iter().copied().find(|t| Some(*t) == setting).unwrap_or(THEMES[0])
 }
 
+/// The saved name style; glossy when unset or unknown.
+pub fn name_style_of(setting: Option<&str>) -> &'static str {
+    NAME_STYLES.iter().copied().find(|t| Some(*t) == setting).unwrap_or(NAME_STYLES[0])
+}
+
 fn asset_name(name: &str) -> Option<&'static str> {
     ASSETS.iter().copied().find(|n| *n == name)
 }
@@ -159,6 +169,7 @@ impl BrandStore {
                 name_size: 100,
                 coins: COINS.to_vec(),
                 theme: THEMES[0].into(),
+                name_style: NAME_STYLES[0].into(),
             }),
             assets: RwLock::new(assets),
         };
@@ -211,6 +222,12 @@ impl BrandStore {
     /// `theme` must be one of [`THEMES`].
     pub fn set_theme(&self, db: &Db, theme: &str) -> Result<()> {
         db.set_setting("portal_theme", theme)?;
+        self.refresh(db)
+    }
+
+    /// `style` must be one of [`NAME_STYLES`].
+    pub fn set_name_style(&self, db: &Db, style: &str) -> Result<()> {
+        db.set_setting("name_style", style)?;
         self.refresh(db)
     }
 
@@ -285,6 +302,7 @@ impl BrandStore {
             name_size: font.map_or(100, |f| f.size),
             coins: coins_of(db.get_setting("coins")?.as_deref()),
             theme: theme_of(db.get_setting("portal_theme")?.as_deref()).into(),
+            name_style: name_style_of(db.get_setting("name_style")?.as_deref()).into(),
         };
         *self.brand.write().unwrap() = b;
         Ok(())
@@ -301,6 +319,14 @@ mod tests {
         assert_eq!(theme_of(Some("classic")), "classic");
         assert_eq!(theme_of(Some("neon")), "classic");
         assert_eq!(theme_of(None), "classic");
+    }
+
+    #[test]
+    fn unknown_name_styles_fall_back_to_glossy() {
+        assert_eq!(name_style_of(Some("plain")), "plain");
+        assert_eq!(name_style_of(Some("glossy")), "glossy");
+        assert_eq!(name_style_of(Some("neon")), "glossy");
+        assert_eq!(name_style_of(None), "glossy");
     }
 
     #[test]

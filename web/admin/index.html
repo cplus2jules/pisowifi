@@ -464,6 +464,13 @@
               <legend>Font for the name</legend>
               <div class="font-grid" id="font-grid" role="radiogroup" aria-label="Font for the name"></div>
               <div class="weight-row"><label for="b-weight">Thickness</label><input type="range" id="b-weight" min="300" max="900" step="10" value="800"><output id="b-weight-out" for="b-weight">Extra bold</output></div>
+              <div class="weight-row"><span class="row-label" id="b-style-label">Style</span>
+                <div class="seg" id="b-style" role="radiogroup" aria-labelledby="b-style-label">
+                  <span class="seg-pill" aria-hidden="true"></span>
+                  <button type="button" role="radio" data-style="glossy" aria-checked="true">Glossy</button>
+                  <button type="button" role="radio" data-style="plain" aria-checked="false">Plain</button>
+                </div>
+              </div>
             </fieldset>
 
             <fieldset class="swatches">
