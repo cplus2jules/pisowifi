@@ -49,6 +49,7 @@
   <symbol id="i-sound" viewBox="0 0 20 20"><path d="M3.5 7.5h3L10.5 4v12l-4-3.5h-3z"/><path d="M13.2 7.6a3.4 3.4 0 0 1 0 4.8M15.6 5.4a6.5 6.5 0 0 1 0 9.2"/></symbol>
   <symbol id="i-mute" viewBox="0 0 20 20"><path d="M3.5 7.5h3L10.5 4v12l-4-3.5h-3z"/><path d="M13.5 8l4 4M17.5 8l-4 4"/></symbol>
   <symbol id="i-megaphone" viewBox="0 0 20 20"><path d="M3.5 8.2v3.6a1 1 0 0 0 1 1h1.8l6.7 3.4V3.8L6.3 7.2H4.5a1 1 0 0 0-1 1z"/><path d="M6.3 12.8l1 3.7M15.5 7.5a3.4 3.4 0 0 1 0 5"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 20 20"><path d="M5.5 13.6V9.2a4.5 4.5 0 0 1 9 0v4.4l1.4 1.5H4.1z"/><path d="M8.2 17a2 2 0 0 0 3.6 0"/></symbol>
   <symbol id="i-help" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.5"/><path d="M7.8 7.8a2.3 2.3 0 1 1 3.2 2.1c-.6.3-1 .8-1 1.5v.4"/><circle cx="10" cy="14.4" r=".5"/></symbol>
 </svg>
 
@@ -69,7 +70,6 @@
   <!-- time left ---------------------------------------------------------->
   <section class="hero empty" id="meter">
     <div class="hero-top">
-      <p class="hero-label" id="meter-label">No time yet</p>
       <span class="pill" id="status">
         <svg class="glyph wifi" viewBox="0 0 20 20" aria-hidden="true">
           <circle class="w0" cx="10" cy="15.5" r="1.6"/>
@@ -84,8 +84,11 @@
     <div class="drain" id="drain" aria-hidden="true" hidden><i id="drain-fill"></i></div>
     <div class="hero-foot">
       <p class="hero-sub" id="meter-sub">Drop a coin to get online</p>
-      <button type="button" class="btn glass" id="pause" hidden>Pause</button>
-      <button type="button" class="btn light" id="resume" hidden>Resume</button>
+      <span class="hero-acts">
+        <button type="button" class="btn glass icon" id="remind" aria-label="Remind me before my time ends" hidden><svg class="ic"><use href="#i-bell"/></svg></button>
+        <button type="button" class="btn glass" id="pause" hidden>Pause</button>
+        <button type="button" class="btn light" id="resume" hidden>Resume</button>
+      </span>
     </div>
   </section>
 
@@ -213,6 +216,18 @@
       <button type="button" class="wallet-badge" id="ps-google" hidden><img src="/add-to-google-wallet.svg?v=__V__" width="283" height="50" alt="Add to Google Wallet"></button>
     </div>
     <button type="button" class="btn primary block" id="ps-done">Got it</button>
+  </div>
+</div>
+
+<!-- top-up reminder: the phone's calendar, or (Android) its Clock app ------->
+<div class="onboard" id="remind-sheet" role="dialog" aria-modal="true" aria-labelledby="rs-title" hidden>
+  <div class="ob-sheet pass-sheet" tabindex="-1" id="rs-box">
+    <span class="remind-art" aria-hidden="true"><svg class="ic"><use href="#i-bell"/></svg></span>
+    <h2 id="rs-title">Get a top-up reminder</h2>
+    <p id="rs-text">Your phone reminds you 5 minutes before your time ends.</p>
+    <a class="btn primary block" id="rs-cal" href="/reminder.ics">Add to calendar</a>
+    <a class="btn block" id="rs-timer" hidden>Set a timer instead</a>
+    <button type="button" class="btn ghost block" id="rs-close">Not now</button>
   </div>
 </div>
 

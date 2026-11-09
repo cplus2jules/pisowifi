@@ -152,11 +152,11 @@ function renderClock() {
   m.classList.toggle("paused", paused);
   m.classList.toggle("empty", left === 0);
   $("status-text").textContent = online ? "Online" : paused ? "Paused" : "Offline";
-  $("meter-label").textContent = online ? "You're online" : paused ? "Time saved" : "No time yet";
   if (online) setUntil($("meter-sub"), left);
   else $("meter-sub").textContent = paused ? "Paused. Your time isn't running." : state.blocked ? "Talk to the owner to get online" : "Drop a coin to get online";
   $("pause").hidden = !online;
   $("resume").hidden = !paused;
+  renderRemind(online, left);
   renderDrain(left, online);
 
   const slot = state.slot;
@@ -316,10 +316,13 @@ const Sound = (() => {
   try { quiet = localStorage.getItem(SOUND_KEY) === "off"; } catch (_) { /* private mode */ }
 
   const allowed = () => !!AC && !!state && state.brand.sounds;
-  const ready = () => allowed() && !quiet && ctx && ctx.state === "running";
 
+  // A tap unlocks sound. It may come before the page has loaded (state
+  // unknown), so only an owner who turned sounds off stops it.
   function wake() {
-    if (!allowed() || quiet) return;
+    if (!AC || quiet || (state && !state.brand.sounds)) return;
+    // iOS can close a context for good after an interruption: start over.
+    if (ctx && ctx.state === "closed") ctx = null;
     if (!ctx) {
       ctx = new AC();
       // Loud enough for a phone speaker in a busy shop; the limiter keeps
@@ -340,7 +343,19 @@ const Sound = (() => {
       blank.connect(ctx.destination);
       blank.start(0);
     }
-    if (ctx.state !== "running" && ctx.resume) ctx.resume();
+    if (ctx.state !== "running" && ctx.resume) ctx.resume().catch(() => {});
+  }
+
+  // Plays a sound now, or as soon as the audio finishes waking (resume is
+  // async, and phones pause audio after a call, a lock or an app switch).
+  // Too late to match what's on screen (over 1.5 s): skipped, never stale.
+  function play(fn) {
+    if (!allowed() || quiet || !ctx) return;
+    if (ctx.state === "running") return fn();
+    const asked = Date.now();
+    Promise.resolve(ctx.resume && ctx.resume())
+      .then(() => { if (ctx.state === "running" && Date.now() - asked < 1500) fn(); })
+      .catch(() => {});
   }
 
   // One voice: a quick strike, then a ringing fade. `glide` bends the pitch.
@@ -361,15 +376,16 @@ const Sound = (() => {
 
   // The slot opening: a soft clunk, then two bubbly blips up.
   function slot() {
-    if (!ready()) return;
+    play(() => {
     tone(0, 260, 0.13, 0.3, "triangle", 110);
     tone(0.07, 520, 0.13, 0.2, "sine", 1040);
     tone(0.17, 780, 0.2, 0.2, "sine", 1560);
+    });
   }
 
   // A coin landing: a metal clink, a two-note ding, and a sparkle for big coins.
   function coin(denom) {
-    if (!ready()) return;
+    play(() => {
     for (const [f, d] of [[2730, 0.08], [4120, 0.06], [5650, 0.05]]) tone(0, f, d, 0.06);
     tone(0.03, 988, 0.09, 0.22, "triangle");
     tone(0.03, 988, 0.08, 0.04, "square");
@@ -377,22 +393,32 @@ const Sound = (() => {
     tone(0.11, 1319, 0.3, 0.04, "square");
     if (denom >= 10) tone(0.2, 1976, 0.45, 0.07, "triangle");
     if (denom >= 20) tone(0.28, 2637, 0.4, 0.05, "triangle");
+    });
   }
 
   // Cancelled: the slot closing, two soft notes going down.
   function close() {
-    if (!ready()) return;
+    play(() => {
     tone(0, 660, 0.16, 0.16, "triangle", 520);
     tone(0.12, 440, 0.26, 0.16, "triangle", 300);
     tone(0.3, 150, 0.16, 0.22, "sine", 80);
+    });
   }
 
   // Online: a quick run up a major chord, landing on a shimmer.
   function online() {
-    if (!ready()) return;
+    play(() => {
     [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(i * 0.085, f, 0.34, 0.2, "triangle"));
     [1046.5, 1318.5, 1568].forEach((f) => tone(0.34, f, 1.3, 0.08));
     tone(0.34, 2093, 0.9, 0.035, "triangle");
+    });
+  }
+
+  // Back on the page: resume where the phone allows it without a tap
+  // (Android does; iOS waits for the next one). Never creates the audio:
+  // older iPhones only unlock audio that was made during a tap.
+  function revive() {
+    if (ctx && !quiet && ctx.state !== "running" && ctx.state !== "closed" && ctx.resume) ctx.resume().catch(() => {});
   }
 
   function setQuiet(q) {
@@ -401,10 +427,10 @@ const Sound = (() => {
     if (q) return;
     // A ding, so you hear it's on.
     wake();
-    if (ctx && ctx.resume) Promise.resolve(ctx.resume()).then(() => coin(5));
+    coin(5);
   }
 
-  return { wake, slot, coin, close, online, allowed, quiet: () => quiet, setQuiet };
+  return { wake, revive, slot, coin, close, online, allowed, quiet: () => quiet, setQuiet };
 })();
 
 for (const t of ["pointerdown", "pointerup", "touchend", "keydown"]) {
@@ -897,6 +923,7 @@ $("done").addEventListener("click", () =>
     if (before > 0) {
       confetti($("done"));
       Sound.online();
+      remindNudge(true);
       if (r.pass_code) showPassSheet(r.pass_code, !wasOnline);
       else {
         toast(r.pass_secs > 0 ? "You're online, with " + human(r.pass_secs) + " from your Piso Pass too." : "You're online. Enjoy!");
@@ -1039,6 +1066,61 @@ function savePass(code) {
 }
 
 let sheetCode = null;   // pass shown in the sheet (works even if storage is off)
+
+// ---- top-up reminder ------------------------------------------------------------
+
+// Web pages can't set reminders by themselves: one tap hands the phone a
+// calendar event (any phone) or, on Android, a ready-made Clock timer.
+// Times come from the phone's clock; the vendo's can be far off.
+const REMIND_LEAD = 5 * 60;
+const NUDGE_KEY = "pisowifi-remind-nudge";
+const ANDROID = /Android/i.test(navigator.userAgent);
+
+function remindNudge(set) {
+  try {
+    if (set) sessionStorage.setItem(NUDGE_KEY, "1");
+    else return sessionStorage.getItem(NUDGE_KEY) === "1" && (sessionStorage.removeItem(NUDGE_KEY), true);
+  } catch (_) { /* private mode */ }
+  return false;
+}
+
+// Offered while online with more than the lead (plus a minute) left.
+function renderRemind(online, left) {
+  const b = $("remind");
+  const show = online && left > REMIND_LEAD + 60;
+  if (b.hidden !== !show) b.hidden = !show;
+  // The page reloads after a purchase; the bell rings once it's back.
+  if (show && remindNudge()) {
+    b.classList.add("nudge");
+    setTimeout(() => b.classList.remove("nudge"), 3600);
+  }
+}
+
+function openRemind() {
+  const left = state.running ? Math.max(0, state.remaining_secs - elapsed()) : 0;
+  if (left <= REMIND_LEAD + 60) return;
+  const end = Date.now() + left * 1000;
+  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  $("rs-text").textContent = "Your time ends at about " + hm(end) + ". Your phone reminds you at " + hm(end - REMIND_LEAD * 1000) + ", 5 minutes before, so you can top up.";
+  $("rs-cal").href = "/reminder.ics?end=" + Math.round(end / 1000);
+  // Android's Clock app takes timers up to a day.
+  const secs = left - REMIND_LEAD;
+  const timer = ANDROID && secs <= 86400;
+  $("rs-timer").hidden = !timer;
+  if (timer) {
+    const msg = encodeURIComponent(state.brand.name + ": 5 minutes of WiFi left");
+    $("rs-timer").href = "intent:#Intent;action=android.intent.action.SET_TIMER;i.android.intent.extra.alarm.LENGTH=" + secs +
+      ";S.android.intent.extra.alarm.MESSAGE=" + msg + ";B.android.intent.extra.alarm.SKIP_UI=false;end";
+  }
+  $("remind-sheet").hidden = false;
+  $("rs-box").focus({ preventScroll: true });
+}
+$("remind").addEventListener("click", openRemind);
+$("rs-close").addEventListener("click", () => { $("remind-sheet").hidden = true; });
+for (const id of ["rs-cal", "rs-timer"]) {
+  $(id).addEventListener("click", () => setTimeout(() => { $("remind-sheet").hidden = true; }, 400));
+}
+$("remind-sheet").addEventListener("click", (ev) => { if (ev.target === $("remind-sheet")) $("remind-sheet").hidden = true; });
 let sheetLanding = false; // shown on first getting online: "Got it" goes on from there
 
 function showPassSheet(code, landing) {
@@ -1394,7 +1476,9 @@ async function maybeClaimPass() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh();
+  if (document.hidden) return;
+  refresh();
+  Sound.revive();
 });
 
 $("slot").querySelector(".peek").append(PisoCoins.draw(5, 30));

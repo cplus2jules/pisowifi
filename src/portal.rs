@@ -4,7 +4,7 @@ use crate::app::{self, asset, ApiError, ApiResult, Shared};
 use crate::engine::{CoinStart, MeView, Resume};
 use crate::hub::proto::{WalletKind, WalletSupport, UNKNOWN_PASS};
 use crate::hubclient::{AfterPurchase, HubError, PassError};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -51,6 +51,7 @@ pub fn router(st: Shared) -> Router {
         .route("/home-icon-512.png", get(|st: State<Shared>| home_icon(st, 512, true)))
         .route("/home-icon-maskable.png", get(|st: State<Shared>| home_icon(st, 512, false)))
         .route("/captive-api", get(captive_api))
+        .route("/reminder.ics", get(reminder))
         .route("/brand/{name}", get(app::brand_image))
         .route("/fonts/{file}", get(crate::fonts::serve))
         .nest("/api", api)
@@ -140,6 +141,104 @@ async fn home_icon(State(st): State<Shared>, size: u32, round: bool) -> Response
 
 async fn fallback(State(st): State<Shared>) -> Response {
     Redirect::to(&st.portal_url()).into_response()
+}
+
+#[derive(Deserialize)]
+struct ReminderQuery {
+    /// When the time runs out, in Unix seconds by the phone's clock. The
+    /// vendo's own clock can be far off (no RTC), so it never decides this.
+    end: i64,
+}
+
+/// A top-up reminder for the phone's calendar: an event for the last five
+/// minutes of the customer's time, with an alert as it starts.
+async fn reminder(State(st): State<Shared>, Query(q): Query<ReminderQuery>) -> Response {
+    let Some(ics) = reminder_ics(&st.brand.get().name, &st.portal_url(), q.end) else {
+        return (StatusCode::BAD_REQUEST, "That reminder time doesn't look right.").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/calendar; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, "inline; filename=\"wifi-reminder.ics\""),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        ics,
+    )
+        .into_response()
+}
+
+/// Minutes before the end that the reminder goes off.
+const REMIND_LEAD_MINS: i64 = 5;
+
+/// The calendar file (RFC 5545). None for an end time outside 2020–2100,
+/// which no real phone clock sends.
+fn reminder_ics(name: &str, portal_url: &str, end: i64) -> Option<String> {
+    if !(1_577_836_800..4_102_444_800).contains(&end) {
+        return None;
+    }
+    let stamp = |t: i64| chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%Y%m%dT%H%M%SZ").to_string());
+    let (start, finish) = (stamp(end - REMIND_LEAD_MINS * 60)?, stamp(end)?);
+    let now = stamp(chrono::Utc::now().timestamp().clamp(1_577_836_800, 4_102_444_800))?;
+    let name = if name.trim().is_empty() { "Piso WiFi" } else { name.trim() };
+    let summary = format!("{name}: {REMIND_LEAD_MINS} minutes left");
+    let desc = format!("Your WiFi time ends in {REMIND_LEAD_MINS} minutes. Top up at {portal_url} or drop more coins.");
+    let lines = [
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".into(),
+        "PRODID:-//PisoWiFi//Top-up reminder//EN".into(),
+        "METHOD:PUBLISH".into(),
+        "BEGIN:VEVENT".into(),
+        format!("UID:{end}-pisowifi-reminder"),
+        format!("DTSTAMP:{now}"),
+        format!("DTSTART:{start}"),
+        format!("DTEND:{finish}"),
+        format!("SUMMARY:{}", ics_text(&summary)),
+        format!("DESCRIPTION:{}", ics_text(&desc)),
+        format!("URL:{portal_url}"),
+        "TRANSP:TRANSPARENT".into(),
+        "BEGIN:VALARM".into(),
+        "ACTION:DISPLAY".into(),
+        "TRIGGER:-PT0M".into(),
+        format!("DESCRIPTION:{}", ics_text(&summary)),
+        "END:VALARM".into(),
+        "END:VEVENT".into(),
+        "END:VCALENDAR".into(),
+    ];
+    Some(lines.iter().map(|l| ics_fold(l)).collect::<Vec<_>>().join("\r\n") + "\r\n")
+}
+
+/// Escapes a TEXT value (backslash, comma, semicolon, line breaks).
+fn ics_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ',' => out.push_str("\\,"),
+            ';' => out.push_str("\\;"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Folds a content line at 75 bytes, never inside a character (a shop name
+/// can hold emoji).
+fn ics_fold(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut used = 0;
+    for c in line.chars() {
+        let n = c.len_utf8();
+        if used + n > 75 {
+            out.push_str("\r\n ");
+            used = 1;
+        }
+        out.push(c);
+        used += n;
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -385,5 +484,42 @@ async fn voucher(
     match st.engine.redeem_voucher(mac, ip, &req.code) {
         Ok(secs) => Ok(Json(json!({ "ok": true, "secs": secs }))),
         Err(msg) => Err(ApiError::bad(msg)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reminder_is_a_valid_calendar_event() {
+        // 2026-11-09 12:00:00 UTC
+        let ics = reminder_ics("Overly PisoWiFi 💜, the best; really", "http://10.0.0.1/", 1_794_225_600).unwrap();
+        assert!(ics.starts_with("BEGIN:VCALENDAR\r\n") && ics.ends_with("END:VCALENDAR\r\n"));
+        assert!(ics.contains("DTSTART:20261109T115500Z\r\n"), "five minutes before the end");
+        assert!(ics.contains("DTEND:20261109T120000Z\r\n"));
+        assert!(ics.contains("TRIGGER:-PT0M"));
+        assert!(ics.contains("SUMMARY:Overly PisoWiFi 💜\\, the best\\; really: 5 minutes left"));
+        for line in ics.split("\r\n") {
+            assert!(line.len() <= 75, "folded: {line:?}");
+        }
+        // Unfolding gives back the description whole.
+        let unfolded = ics.replace("\r\n ", "");
+        assert!(unfolded.contains("DESCRIPTION:Your WiFi time ends in 5 minutes. Top up at http://10.0.0.1/ or drop more coins."));
+    }
+
+    #[test]
+    fn reminder_refuses_silly_times_and_names_the_page() {
+        assert!(reminder_ics("x", "http://10.0.0.1/", 0).is_none());
+        assert!(reminder_ics("x", "http://10.0.0.1/", 9_999_999_999).is_none());
+        assert!(reminder_ics("  ", "http://10.0.0.1/", 1_794_225_600).unwrap().contains("SUMMARY:Piso WiFi: 5 minutes left"));
+    }
+
+    #[test]
+    fn folding_never_splits_a_character() {
+        let long = format!("SUMMARY:{}", "💜".repeat(40));
+        let folded = ics_fold(&long);
+        assert!(folded.split("\r\n").all(|l| l.len() <= 75 && std::str::from_utf8(l.as_bytes()).is_ok()));
+        assert_eq!(folded.replace("\r\n ", ""), long);
     }
 }
