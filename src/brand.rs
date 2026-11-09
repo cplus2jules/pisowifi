@@ -18,6 +18,11 @@ pub const DEFAULT_ACCENT: &str = "#5A43E6";
 pub const DEFAULT_BUTTON: &str = "#D4F04C";
 /// Where customers land once online, until the owner picks another page (or none).
 pub const DEFAULT_AFTER_URL: &str = "https://www.google.com/search?q=cats";
+/// Philippine coins a coin slot can be set to take.
+pub const COINS: [u32; 4] = [1, 5, 10, 20];
+/// Looks the customer page can wear: the flat purple-and-lime one, or
+/// frosted glass over soft colour. The first is the default.
+pub const THEMES: [&str; 2] = ["classic", "glass"];
 
 #[derive(Clone, Serialize)]
 pub struct Brand {
@@ -40,6 +45,10 @@ pub struct Brand {
     pub name_weight: u16,
     /// The font's size adjustment, in percent.
     pub name_size: u16,
+    /// Coins this machine takes, smallest first (a non-empty subset of [`COINS`]).
+    pub coins: Vec<u32>,
+    /// One of [`THEMES`].
+    pub theme: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -101,6 +110,24 @@ pub fn clean_after_url(s: &str) -> Option<String> {
     ok.then_some(url)
 }
 
+/// The owner's pick of coins, sorted and without repeats; `None` if it is
+/// empty or names a coin that isn't one of [`COINS`].
+pub fn clean_coins(coins: &[u32]) -> Option<Vec<u32>> {
+    let list: Vec<u32> = COINS.iter().copied().filter(|c| coins.contains(c)).collect();
+    (!list.is_empty() && coins.iter().all(|c| COINS.contains(c))).then_some(list)
+}
+
+/// The saved setting ("5,10"); all coins when unset or unreadable.
+fn coins_of(setting: Option<&str>) -> Vec<u32> {
+    let parsed: Option<Vec<u32>> = setting.map(|s| s.split(',').filter_map(|c| c.trim().parse().ok()).collect());
+    parsed.and_then(|p| clean_coins(&p)).unwrap_or_else(|| COINS.to_vec())
+}
+
+/// The saved theme; the default when unset or unknown.
+pub fn theme_of(setting: Option<&str>) -> &'static str {
+    THEMES.iter().copied().find(|t| Some(*t) == setting).unwrap_or(THEMES[0])
+}
+
 fn asset_name(name: &str) -> Option<&'static str> {
     ASSETS.iter().copied().find(|n| *n == name)
 }
@@ -130,6 +157,8 @@ impl BrandStore {
                 name_font: String::new(),
                 name_weight: crate::fonts::SYSTEM.2,
                 name_size: 100,
+                coins: COINS.to_vec(),
+                theme: THEMES[0].into(),
             }),
             assets: RwLock::new(assets),
         };
@@ -169,6 +198,19 @@ impl BrandStore {
     pub fn set_name_font(&self, db: &Db, font: &str, weight: Option<u16>) -> Result<()> {
         db.set_setting("name_font", font)?;
         db.set_setting("name_weight", &crate::fonts::weight_for(font, weight).to_string())?;
+        self.refresh(db)
+    }
+
+    /// `coins` must be a non-empty subset of [`COINS`] (see [`clean_coins`]).
+    pub fn set_coins(&self, db: &Db, coins: &[u32]) -> Result<()> {
+        let list: Vec<String> = coins.iter().map(u32::to_string).collect();
+        db.set_setting("coins", &list.join(","))?;
+        self.refresh(db)
+    }
+
+    /// `theme` must be one of [`THEMES`].
+    pub fn set_theme(&self, db: &Db, theme: &str) -> Result<()> {
+        db.set_setting("portal_theme", theme)?;
         self.refresh(db)
     }
 
@@ -241,6 +283,8 @@ impl BrandStore {
             name_font: key.to_string(),
             name_weight: weight,
             name_size: font.map_or(100, |f| f.size),
+            coins: coins_of(db.get_setting("coins")?.as_deref()),
+            theme: theme_of(db.get_setting("portal_theme")?.as_deref()).into(),
         };
         *self.brand.write().unwrap() = b;
         Ok(())
@@ -250,6 +294,26 @@ impl BrandStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_themes_fall_back_to_classic() {
+        assert_eq!(theme_of(Some("glass")), "glass");
+        assert_eq!(theme_of(Some("classic")), "classic");
+        assert_eq!(theme_of(Some("neon")), "classic");
+        assert_eq!(theme_of(None), "classic");
+    }
+
+    #[test]
+    fn coins_are_a_sorted_subset() {
+        assert_eq!(clean_coins(&[10, 5]), Some(vec![5, 10]));
+        assert_eq!(clean_coins(&[5, 5, 20]), Some(vec![5, 20]));
+        assert_eq!(clean_coins(&[]), None);
+        assert_eq!(clean_coins(&[5, 25]), None, "not a coin");
+        assert_eq!(coins_of(None), COINS.to_vec());
+        assert_eq!(coins_of(Some("5,10")), vec![5, 10]);
+        assert_eq!(coins_of(Some("")), COINS.to_vec());
+        assert_eq!(coins_of(Some("3")), COINS.to_vec());
+    }
 
     #[test]
     fn sniffs_only_real_images() {

@@ -27,9 +27,18 @@ pub fn router(st: Shared) -> Router {
         .route("/pass/wallet", post(pass_wallet))
         .layer(from_fn(app::portal_csrf_guard));
     Router::new()
-        .route("/", get(|| async {
+        .route("/", get(|State(st): State<Shared>| async move {
+            // The owner's look is stamped into the page, so it never flashes the other one first.
             static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-            app::page(include_str!("../web/portal/index.html"), &HTML)
+            static GLASS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            const PAGE: &str = include_str!("../web/portal/index.html");
+            let html = match st.brand.get().theme.as_str() {
+                "glass" => GLASS.get_or_init(|| {
+                    PAGE.replace("__V__", app::asset_version()).replacen("<html lang=\"en\">", "<html lang=\"en\" data-theme=\"glass\">", 1)
+                }),
+                _ => HTML.get_or_init(|| PAGE.replace("__V__", app::asset_version())),
+            };
+            app::html_page(html)
         }))
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/portal/app.js")) }))
         .route("/app.css", get(|| async { asset("text/css; charset=utf-8", include_str!("../web/portal/app.css")) }))

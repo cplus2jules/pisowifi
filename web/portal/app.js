@@ -24,6 +24,8 @@ const SPRING = CSS.supports("transition-timing-function", "linear(0, 1)")
   : "cubic-bezier(.2, .9, .25, 1.15)";
 
 let state = null;      // last /api/me response
+let slotBack = false;  // Cancel's fold-away has played; the button springs back next render
+let cancelHold = false; // ...and while it plays, polling must not swap the card out early
 let fetchedAt = 0;     // performance.now() when state arrived
 let pollTimer = null;
 let seenCoins = 0;     // coins already animated this insert session
@@ -223,6 +225,7 @@ function intro() {
 let lastSlotState = "idle";
 
 function render() {
+  if (cancelHold) return;
   const slot = state.slot;
   if (firstRender) intro();
   const changed = slot.state !== lastSlotState && !firstRender;
@@ -246,8 +249,31 @@ function render() {
     renderRates();
     renderClock();
   };
-  if (changed && !REDUCE && document.startViewTransition) document.startViewTransition(apply);
+  // After Cancel the card has already folded away: the button springs back
+  // on its own instead of a crossfade.
+  const back = slotBack && changed && slot.state === "idle";
+  // Opening unfolds the card out of the button (Cancel plays it backwards).
+  const opening = changed && slot.state === "mine" && lastSlotState === "idle" && !REDUCE;
+  if (changed && !REDUCE && document.startViewTransition && !back && !opening) document.startViewTransition(apply);
   else apply();
+  if (opening) {
+    const c = $("inserting");
+    c.classList.remove("opening", "closing");
+    void c.offsetWidth;
+    c.classList.add("opening");
+    clearTimeout(c._open);
+    c._open = setTimeout(() => c.classList.remove("opening"), 1000);
+  }
+  if (back) {
+    slotBack = false;
+    $("inserting").classList.remove("closing");
+    $("slot-pill").textContent = "Slot open";
+    const b = $("slot");
+    b.classList.remove("back");
+    void b.offsetWidth;
+    b.classList.add("back");
+    setTimeout(() => b.classList.remove("back"), 1400);
+  }
   if (changed && slot.state === "mine") Sound.slot();
 
   if (slot.state === "mine") {
@@ -267,6 +293,8 @@ function render() {
     else credit.textContent = "Waiting for your first coin…";
     $("done").disabled = slot.pesos === 0;
     $("done").textContent = slot.pesos > 0 ? "Start internet" : "Drop a coin to continue";
+    // Backing out is only offered before any coin: paid coins always become time.
+    $("cancel-insert").hidden = slot.pesos > 0;
   } else {
     seenCoins = 0;
   }
@@ -350,6 +378,14 @@ const Sound = (() => {
     if (denom >= 20) tone(0.28, 2637, 0.4, 0.05, "triangle");
   }
 
+  // Cancelled: the slot closing, two soft notes going down.
+  function close() {
+    if (!ready()) return;
+    tone(0, 660, 0.16, 0.16, "triangle", 520);
+    tone(0.12, 440, 0.26, 0.16, "triangle", 300);
+    tone(0.3, 150, 0.16, 0.22, "sine", 80);
+  }
+
   // Online: a quick run up a major chord, landing on a shimmer.
   function online() {
     if (!ready()) return;
@@ -367,7 +403,7 @@ const Sound = (() => {
     if (ctx && ctx.resume) Promise.resolve(ctx.resume()).then(() => coin(5));
   }
 
-  return { wake, slot, coin, online, allowed, quiet: () => quiet, setQuiet };
+  return { wake, slot, coin, close, online, allowed, quiet: () => quiet, setQuiet };
 })();
 
 for (const t of ["pointerdown", "pointerup", "touchend", "keydown"]) {
@@ -517,6 +553,8 @@ function confetti(from) {
 // ---- owner branding -----------------------------------------------------------
 
 const LIME = "#D4F04C";
+const LOGO_WAVES = ["M18.6 27.6A19 19 0 0 1 45.4 27.6", "M12.9 21.9A27 27 0 0 1 51.1 21.9"];
+const LOGO_PESO = "M29 47.5V34.5h4a3.7 3.7 0 0 1 0 7.4h-4M25.5 36.8h12.6M25.5 39.6h12.6";
 
 // Relative luminance (0 black … 1 white) of "#RRGGBB".
 function luminance(hex) {
@@ -538,17 +576,53 @@ function svgEl(tag, attrs) {
 }
 
 // Built-in coin + WiFi mark in the owner's accent colour.
+// The built-in mark: a peso coin sending out WiFi waves. Keep it in step
+// with web/shared/icon.svg and defaultMark in admin.js.
 function defaultMark(accent, button) {
   const s = svgEl("svg", { viewBox: "0 0 64 64" });
-  const g = svgEl("g", { fill: "none", stroke: accent, "stroke-width": 4, "stroke-linecap": "round" });
-  g.append(svgEl("path", { d: "M27.05 32.05a7 7 0 0 1 9.9 0" }), svgEl("path", { d: "M22.8 27.8a13 13 0 0 1 18.4 0" }));
-  s.append(svgEl("rect", { width: 64, height: 64, rx: 18, fill: accent }), svgEl("circle", { cx: 32, cy: 32, r: 20, fill: button }), g,
-    svgEl("circle", { cx: 32, cy: 38, r: 3, fill: accent }));
+  const waves = svgEl("g", { fill: "none", stroke: button, "stroke-width": 5, "stroke-linecap": "round" });
+  waves.append(svgEl("path", { d: LOGO_WAVES[0] }), svgEl("path", { d: LOGO_WAVES[1] }));
+  const peso = svgEl("path", { d: LOGO_PESO, fill: "none", stroke: accent, "stroke-width": 2.6, "stroke-linecap": "round", "stroke-linejoin": "round" });
+  s.append(svgEl("rect", { width: 64, height: 64, rx: 18, fill: accent }), waves,
+    svgEl("circle", { cx: 32, cy: 41, r: 13, fill: button }), peso);
+  return s;
+}
+
+// The same mark for the Glass look: a gel tile with soft colour swirling in
+// it, a glossy rim, and the coin as a shiny bead.
+let glassMarks = 0;
+function glassMark(accent, button) {
+  const id = "gm" + ++glassMarks, s = svgEl("svg", { viewBox: "0 0 64 64" });
+  const radial = (name, cx, cy, r, stops) => {
+    const g = svgEl("radialGradient", { id: id + name, cx, cy, r });
+    for (const [o, c, a] of stops) g.append(svgEl("stop", { offset: o, "stop-color": c, "stop-opacity": a }));
+    return g;
+  };
+  const sheen = svgEl("linearGradient", { id: id + "s", x1: 0, y1: 0, x2: 0, y2: 1 });
+  sheen.append(svgEl("stop", { offset: 0, "stop-color": "#fff", "stop-opacity": 0.55 }), svgEl("stop", { offset: 0.5, "stop-color": "#fff", "stop-opacity": 0 }));
+  const defs = svgEl("defs", {});
+  defs.append(
+    radial("a", 0.15, 0.1, 0.8, [[0, accent, 1], [1, accent, 0]]),
+    radial("r", 0.95, 0.2, 0.6, [[0, "#F39BD3", 0.95], [1, "#F39BD3", 0]]),
+    radial("p", 0.8, 1, 0.65, [[0, "#FFA27E", 0.85], [1, "#FFA27E", 0]]),
+    radial("c", 0.36, 0.3, 0.75, [[0, mix(button, "#ffffff", 0.75), 1], [0.45, button, 1], [1, mix(button, "#000000", 0.22), 1]]),
+    sheen);
+  const tile = (fill) => svgEl("rect", { width: 64, height: 64, rx: 18, fill });
+  const waves = svgEl("g", { fill: "none", stroke: "#fff", "stroke-width": 5, "stroke-linecap": "round", "stroke-opacity": 0.92 });
+  waves.append(svgEl("path", { d: LOGO_WAVES[0] }), svgEl("path", { d: LOGO_WAVES[1] }));
+  const peso = svgEl("path", { d: LOGO_PESO, fill: "none", stroke: mix(accent, "#000000", 0.15), "stroke-width": 2.6, "stroke-linecap": "round", "stroke-linejoin": "round" });
+  s.append(defs, tile(mix(accent, "#ffffff", 0.35)), tile("url(#" + id + "a)"), tile("url(#" + id + "r)"), tile("url(#" + id + "p)"), tile("url(#" + id + "s)"),
+    svgEl("rect", { x: 0.9, y: 0.9, width: 62.2, height: 62.2, rx: 17.1, fill: "none", stroke: "#fff", "stroke-opacity": 0.7, "stroke-width": 1.8 }),
+    waves,
+    svgEl("circle", { cx: 32, cy: 42.5, r: 13, fill: "#000", opacity: 0.12 }),
+    svgEl("circle", { cx: 32, cy: 41, r: 13, fill: "url(#" + id + "c)" }),
+    svgEl("circle", { cx: 32, cy: 41, r: 12.4, fill: "none", stroke: "#fff", "stroke-opacity": 0.6, "stroke-width": 1.2 }),
+    peso);
   return s;
 }
 
 function logoNode(b) {
-  if (!b.logo) return defaultMark(b.accent, b.button || LIME);
+  if (!b.logo) return b.theme === "glass" ? glassMark(b.accent, b.button || LIME) : defaultMark(b.accent, b.button || LIME);
   const img = document.createElement("img");
   img.src = b.logo;
   img.alt = "";
@@ -584,6 +658,11 @@ function applyBrand(b) {
   brandKey = key;
   document.title = b.name;
   $("name").textContent = b.name;
+  // The page arrives with the owner's look already set; this follows a change made while it's open.
+  const glass = b.theme === "glass";
+  if (glass) document.documentElement.dataset.theme = "glass";
+  else delete document.documentElement.dataset.theme;
+  document.querySelector('meta[name="theme-color"]').content = glass ? "#EFEBF5" : "#FFFFFF";
   const root = document.documentElement.style;
   root.setProperty("--purple", b.accent);
   root.setProperty("--purple-2", mix(b.accent, "#ffffff", 0.2));
@@ -599,9 +678,13 @@ function applyBrand(b) {
   root.setProperty("--lime-bright", dark ? mix(btn, "#ffffff", 0.55) : btn);
   root.setProperty("--on-lime", dark ? "#ffffff" : "var(--ink)");
   document.querySelector("#ring-grad stop:first-child").setAttribute("stop-color", btn);
+  document.querySelector("#ring-gel stop:first-child").setAttribute("stop-color", btn);
+  document.querySelector("#ring-gel stop:last-child").setAttribute("stop-color", b.accent);
   $("logo").replaceChildren(logoNode(b));
   $("ob-logo").replaceChildren(logoNode(b));
   $("ob-name").textContent = b.name;
+  if (Array.isArray(b.coins) && b.coins.length) acceptedCoins = b.coins;
+  if (!$("onboard").hidden) renderCoinIntro();
   $("home-logo").replaceChildren(logoNode(b));
   $("hs-logo").replaceChildren(logoNode(b));
   $("hs-name").textContent = b.name;
@@ -661,9 +744,25 @@ function maybeOnboard() {
   if (!seenOnboarding() && !standalone()) openOnboarding();
 }
 
+// Only the coins the owner set the machine to take.
+let acceptedCoins = [1, 5, 10, 20];
+function coinList(coins, last) {
+  const names = coins.map((c) => "₱" + c);
+  return names.length < 2 ? names.join("") : names.slice(0, -1).join(", ") + " " + last + " " + names.at(-1);
+}
+function renderCoinIntro() {
+  const coins = acceptedCoins;
+  $("ob-coin-list").textContent = coins.length === 1 ? "Use " + coinList(coins) + " coins." : coinList(coins, "and") + (coins.length > 2 ? " all work." : " both work.");
+  const box = $("ob-coins");
+  if (box.dataset.coins !== coins.join()) {
+    box.dataset.coins = coins.join();
+    box.replaceChildren(...coins.map((d) => PisoCoins.draw(d, 70)));
+  }
+}
+
 function openOnboarding() {
   $("ob-addr").textContent = location.host;
-  if (!$("ob-coins").children.length) $("ob-coins").append(...[1, 5, 10, 20].map((d) => PisoCoins.draw(d, 70)));
+  renderCoinIntro();
   $("onboard").hidden = false;
   obGo(0);
   $("ob-sheet").focus({ preventScroll: true });
@@ -803,6 +902,37 @@ $("done").addEventListener("click", () =>
         recheckSoon(!wasOnline);
       }
     }
+  }));
+
+// Changed their mind before dropping anything: close the slot so the next
+// customer can use it. If a coin lands meanwhile, the server credits it.
+// The card plays out the slot closing first (ring unwinds, a cross, then it
+// folds away) while the server frees the slot, so backing out is felt.
+$("cancel-insert").addEventListener("click", () =>
+  action($("cancel-insert"), async () => {
+    if (!state.slot || state.slot.pesos > 0) return;
+    const card = $("inserting");
+    if (!REDUCE) {
+      slotBack = true;
+      cancelHold = true;
+      clearTimeout(card._open);
+      card.classList.remove("opening");
+      card.classList.add("closing");
+      $("slot-pill").textContent = "Closing";
+      Sound.close();
+      if (navigator.vibrate) navigator.vibrate([18, 60, 30]);
+    }
+    try {
+      await Promise.all([api("/coin/done", {}), new Promise((r) => setTimeout(r, REDUCE ? 0 : 820))]);
+      cancelHold = false;
+    } catch (e) {
+      cancelHold = false;
+      slotBack = false;
+      card.classList.remove("closing");
+      $("slot-pill").textContent = "Slot open";
+      throw e;
+    }
+    toast("Cancelled. Tap Insert coin when you're ready.");
   }));
 
 $("pause").addEventListener("click", () =>

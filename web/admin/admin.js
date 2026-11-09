@@ -318,8 +318,99 @@ $("login-form").addEventListener("submit", (ev) => {
 });
 
 $("logout").addEventListener("click", async () => {
+  closeProfile();
   try { await api("POST", "/logout", {}); } catch (_) { /* already out */ }
   showLogin("You're signed out.");
+});
+
+// The account menu behind the avatar: Sign out takes a deliberate second tap.
+function profileItems() { return [...$("profile-menu").querySelectorAll("[role=menuitem],[role=menuitemcheckbox]")]; }
+
+// ---- the dashboard's own look ---------------------------------------------------
+// Classic or Glass, saved on the vendo so every phone the owner signs in on
+// matches. Switching spreads the new look out in a circle from the switch.
+const isGlass = () => document.documentElement.dataset.theme === "glass";
+function renderLookSwitch() {
+  $("pm-glass").setAttribute("aria-checked", String(isGlass()));
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", isGlass() ? "#EFEBF5" : "#FFFFFF");
+}
+renderLookSwitch();
+// Turning Glass on washes it out from the switch in a soft-edged circle;
+// turning it off draws the glass back into the switch. Whichever look is
+// leaving frosts over as it goes, and the arriving one stays sharp.
+let switchingLook = false;
+$("pm-glass").addEventListener("click", async (ev) => {
+  if (switchingLook) return; // a tap mid-switch would leave the switch and the page out of step
+  switchingLook = true;
+  const glass = !isGlass(), btn = $("pm-glass"), root = document.documentElement;
+  const apply = () => {
+    if (glass) root.dataset.theme = "glass";
+    else delete root.dataset.theme;
+    renderLookSwitch();
+    placeNavPill();
+  };
+  btn.setAttribute("aria-checked", String(glass));
+  try {
+    if (REDUCE || !document.startViewTransition) apply();
+    else {
+      const r = btn.querySelector(".pm-switch").getBoundingClientRect();
+      const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      const end = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y)) + 120;
+      root.style.setProperty("--vt-x", x + "px");
+      root.style.setProperty("--vt-y", y + "px");
+      root.classList.add(glass ? "vt-grow" : "vt-shrink");
+      // Let the knob finish most of its slide before the page changes under it.
+      await new Promise((res) => setTimeout(res, 140));
+      const vt = document.startViewTransition(apply);
+      await vt.ready;
+      // No fill: a held last frame would stay on the page and latch onto the
+      // next switch's snapshots.
+      const opts = { duration: glass ? 820 : 640, easing: glass ? "cubic-bezier(.22, 1, .36, 1)" : "cubic-bezier(.65, 0, .35, 1)" };
+      const radius = ["0px", end + "px"];
+      const anims = glass
+        ? [root.animate({ "--vt-r": radius }, { ...opts, pseudoElement: "::view-transition-new(root)" }),
+           root.animate({ filter: ["blur(0)", "blur(6px)"] }, { ...opts, pseudoElement: "::view-transition-old(root)" })]
+        : [root.animate({ "--vt-r": radius.reverse(), filter: ["blur(0)", "blur(6px)"] }, { ...opts, pseudoElement: "::view-transition-old(root)" })];
+      await vt.finished;
+      for (const a of anims) a.cancel();
+    }
+  } catch (_) {
+    apply(); // the transition was skipped; just land on the new look
+  } finally {
+    root.classList.remove("vt-grow", "vt-shrink");
+    switchingLook = false;
+  }
+  try { await api("PUT", "/look", { theme: glass ? "glass" : "classic" }); }
+  catch (e) { toast(e.message || "Couldn't save the look", true); }
+});
+
+function openProfile(focusFirst) {
+  const name = overview && overview.brand && overview.brand.name;
+  if (name) $("pm-name").textContent = name;
+  $("profile-menu").hidden = false;
+  $("profile-btn").setAttribute("aria-expanded", "true");
+  if (focusFirst) profileItems()[0].focus();
+}
+
+function closeProfile(refocus) {
+  if ($("profile-menu").hidden) return;
+  $("profile-menu").hidden = true;
+  $("profile-btn").setAttribute("aria-expanded", "false");
+  if (refocus) $("profile-btn").focus();
+}
+
+$("profile-btn").addEventListener("click", (ev) => {
+  if ($("profile-menu").hidden) openProfile(ev.detail === 0); else closeProfile();
+});
+$("profile-menu").addEventListener("click", (ev) => { if (ev.target.closest("[data-goto]")) closeProfile(); });
+document.addEventListener("pointerdown", (ev) => { if (!ev.target.closest("#profile")) closeProfile(); });
+$("profile").addEventListener("keydown", (ev) => {
+  if ($("profile-menu").hidden) return;
+  const items = profileItems(), i = items.indexOf(document.activeElement);
+  if (ev.key === "Escape") { ev.preventDefault(); closeProfile(true); }
+  else if (ev.key === "ArrowDown") { ev.preventDefault(); items[(i + 1) % items.length].focus(); }
+  else if (ev.key === "ArrowUp") { ev.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  else if (ev.key === "Tab") closeProfile();
 });
 
 // ---- navigation -----------------------------------------------------------
@@ -393,9 +484,34 @@ function placeSegPill(seg = $("period")) {
 
 window.addEventListener("resize", () => { placeNavPill(); placeSegPill(); placeSegPill($("away-mins")); });
 
+// Phones: the sidebar slides in over the page.
+let navScrim = null;
+function openNav() {
+  $("shell").classList.add("nav-open");
+  $("menu-btn").setAttribute("aria-expanded", "true");
+  navScrim = el("div", { class: "scrim", onclick: () => closeNav() });
+  document.body.append(navScrim);
+  requestAnimationFrame(placeNavPill);
+  (document.querySelector('.nav [aria-current="page"]') || $("side-close")).focus({ preventScroll: true });
+}
+function closeNav(refocus) {
+  if (!$("shell").classList.contains("nav-open")) return;
+  $("shell").classList.remove("nav-open");
+  $("menu-btn").setAttribute("aria-expanded", "false");
+  const s = navScrim;
+  navScrim = null;
+  if (s) { s.classList.add("out"); setTimeout(() => s.remove(), 240); }
+  if (refocus) $("menu-btn").focus();
+}
+$("menu-btn").addEventListener("click", () => ($("shell").classList.contains("nav-open") ? closeNav() : openNav()));
+$("side-close").addEventListener("click", () => closeNav(true));
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeNav(true); });
+matchMedia("(min-width: 641px)").addEventListener("change", (m) => { if (m.matches) closeNav(); });
+
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("[data-tab],[data-goto]");
   if (!t) return;
+  closeNav();
   go(t.dataset.tab || t.dataset.goto);
   const target = t.dataset.scroll && $(t.dataset.scroll);
   if (target) setTimeout(() => target.scrollIntoView({ behavior: REDUCE ? "auto" : "smooth", block: "start" }), 450);
@@ -1307,10 +1423,52 @@ function rateRow(r = { pesos: "", minutes: "" }) {
 
 async function loadRates() {
   await busy(null, async () => {
-    const [rates, away] = await Promise.all([api("GET", "/rates"), api("GET", "/auto-pause")]);
+    const [rates, away, coins] = await Promise.all([api("GET", "/rates"), api("GET", "/auto-pause"), api("GET", "/coins")]);
     $("rates").replaceChildren(...rates.map(rateRow));
     renderAway(away.minutes, away.choices);
+    renderCoinPicks(coins.coins, coins.choices);
   });
+}
+
+// Coins it takes: one tap saves it. At least one must stay on.
+let takenCoins = [];
+
+function coinNames(coins, last) {
+  const names = coins.map((c) => "₱" + c);
+  return names.length < 2 ? names.join("") : names.slice(0, -1).join(", ") + " " + last + " " + names.at(-1);
+}
+
+function renderCoinPicks(coins, choices) {
+  const box = $("coin-picks");
+  if (choices) {
+    box.replaceChildren(...choices.map((c) => {
+      const b = el("button", { type: "button", class: "coin-pick", "data-coin": c, "aria-pressed": "false", onclick: () => toggleCoin(c) },
+        el("span", { class: "coin-pick-label", text: "₱" + c }), el("span", { class: "coin-pick-tick", "aria-hidden": "true" }));
+      b.prepend(PisoCoins.draw(c, 44));
+      return b;
+    }));
+  }
+  takenCoins = coins;
+  for (const b of box.querySelectorAll("button")) b.setAttribute("aria-pressed", String(coins.includes(Number(b.dataset.coin))));
+}
+
+async function toggleCoin(c) {
+  const on = takenCoins.includes(c);
+  if (on && takenCoins.length === 1) {
+    toast("Keep at least one coin on", true);
+    return;
+  }
+  const before = takenCoins;
+  const next = on ? before.filter((x) => x !== c) : [...before, c].sort((a, b) => a - b);
+  renderCoinPicks(next);
+  try {
+    const r = await api("PUT", "/coins", { coins: next });
+    if (overview && overview.brand) overview.brand.coins = r.coins;
+    toast("Customers now see " + coinNames(r.coins, "and"));
+  } catch (e) {
+    renderCoinPicks(before);
+    toast(e.message, true);
+  }
 }
 
 // Auto-pause: one tap saves it.
@@ -1444,7 +1602,7 @@ const ACTIONS = {
   pause: "Paused a device", resume: "Resumed a device", rename_device: "Named a device",
   collect_coins: "Emptied the coin box", set_goal: "Set the daily goal", branding: "Changed the customer page",
   upload_image: "Uploaded an image", remove_image: "Removed an image", mac_clone: "Possible copied address",
-  block_device: "Blocked a device", unblock_device: "Unblocked a device", set_auto_pause: "Changed auto-pause",
+  block_device: "Blocked a device", unblock_device: "Unblocked a device", set_auto_pause: "Changed auto-pause", set_coins: "Changed the coins it takes",
 };
 
 // "da:a1:19:…" in a log line becomes the device's name when we know it.
@@ -1492,20 +1650,53 @@ function luminance(hex) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-function defaultMark(accent) {
-  // The built-in coin + WiFi mark, recoloured to the accent.
+function defaultMark(accent, button = "#D4F04C") {
+  // The built-in mark: a peso coin sending out WiFi waves, recoloured to the
+  // accent. Keep it in step with web/shared/icon.svg and the portal's app.js.
   const s = svg("svg", { viewBox: "0 0 64 64", "aria-hidden": "true" });
-  s.append(svg("rect", { width: 64, height: 64, rx: 18, fill: accent }),
-    svg("circle", { cx: 32, cy: 32, r: 20, fill: "#D4F04C" }));
-  const g = svg("g", { fill: "none", stroke: accent, "stroke-width": 4, "stroke-linecap": "round" });
-  g.append(svg("path", { d: "M27.05 32.05a7 7 0 0 1 9.9 0" }), svg("path", { d: "M22.8 27.8a13 13 0 0 1 18.4 0" }));
-  s.append(g, svg("circle", { cx: 32, cy: 38, r: 3, fill: accent }));
+  const waves = svg("g", { fill: "none", stroke: button, "stroke-width": 5, "stroke-linecap": "round" });
+  waves.append(svg("path", { d: "M18.6 27.6A19 19 0 0 1 45.4 27.6" }), svg("path", { d: "M12.9 21.9A27 27 0 0 1 51.1 21.9" }));
+  s.append(svg("rect", { width: 64, height: 64, rx: 18, fill: accent }), waves,
+    svg("circle", { cx: 32, cy: 41, r: 13, fill: button }),
+    svg("path", { d: "M29 47.5V34.5h4a3.7 3.7 0 0 1 0 7.4h-4M25.5 36.8h12.6M25.5 39.6h12.6", fill: "none", stroke: accent, "stroke-width": 2.6, "stroke-linecap": "round", "stroke-linejoin": "round" }));
   return s;
 }
 
-function logoNode(b) {
+// The same mark for the Glass look: a gel tile with soft colour in it, a
+// glossy rim, and the coin as a shiny bead. Keep it in step with the portal's glassMark.
+let glassMarks = 0;
+function glassMark(accent, button = "#D4F04C") {
+  const id = "gm" + ++glassMarks, s = svg("svg", { viewBox: "0 0 64 64", "aria-hidden": "true" });
+  const radial = (name, cx, cy, r, stops) => {
+    const g = svg("radialGradient", { id: id + name, cx, cy, r });
+    for (const [o, c, a] of stops) g.append(svg("stop", { offset: o, "stop-color": c, "stop-opacity": a }));
+    return g;
+  };
+  const sheen = svg("linearGradient", { id: id + "s", x1: 0, y1: 0, x2: 0, y2: 1 });
+  sheen.append(svg("stop", { offset: 0, "stop-color": "#fff", "stop-opacity": 0.55 }), svg("stop", { offset: 0.5, "stop-color": "#fff", "stop-opacity": 0 }));
+  const defs = svg("defs");
+  defs.append(
+    radial("a", 0.15, 0.1, 0.8, [[0, accent, 1], [1, accent, 0]]),
+    radial("r", 0.95, 0.2, 0.6, [[0, "#F39BD3", 0.95], [1, "#F39BD3", 0]]),
+    radial("p", 0.8, 1, 0.65, [[0, "#FFA27E", 0.85], [1, "#FFA27E", 0]]),
+    radial("c", 0.36, 0.3, 0.75, [[0, mix(button, "#ffffff", 0.75), 1], [0.45, button, 1], [1, mix(button, "#000000", 0.22), 1]]),
+    sheen);
+  const tile = (fill) => svg("rect", { width: 64, height: 64, rx: 18, fill });
+  const waves = svg("g", { fill: "none", stroke: "#fff", "stroke-width": 5, "stroke-linecap": "round", "stroke-opacity": 0.92 });
+  waves.append(svg("path", { d: "M18.6 27.6A19 19 0 0 1 45.4 27.6" }), svg("path", { d: "M12.9 21.9A27 27 0 0 1 51.1 21.9" }));
+  s.append(defs, tile(mix(accent, "#ffffff", 0.35)), tile("url(#" + id + "a)"), tile("url(#" + id + "r)"), tile("url(#" + id + "p)"), tile("url(#" + id + "s)"),
+    svg("rect", { x: 0.9, y: 0.9, width: 62.2, height: 62.2, rx: 17.1, fill: "none", stroke: "#fff", "stroke-opacity": 0.7, "stroke-width": 1.8 }),
+    waves,
+    svg("circle", { cx: 32, cy: 42.5, r: 13, fill: "#000", opacity: 0.12 }),
+    svg("circle", { cx: 32, cy: 41, r: 13, fill: "url(#" + id + "c)" }),
+    svg("circle", { cx: 32, cy: 41, r: 12.4, fill: "none", stroke: "#fff", "stroke-opacity": 0.6, "stroke-width": 1.2 }),
+    svg("path", { d: "M29 47.5V34.5h4a3.7 3.7 0 0 1 0 7.4h-4M25.5 36.8h12.6M25.5 39.6h12.6", fill: "none", stroke: mix(accent, "#000000", 0.15), "stroke-width": 2.6, "stroke-linecap": "round", "stroke-linejoin": "round" }));
+  return s;
+}
+
+function logoNode(b, glass) {
   if (b.logo) return el("img", { src: b.logo, alt: "" });
-  return defaultMark(b.accent);
+  return glass ? glassMark(b.accent, b.button) : defaultMark(b.accent, b.button);
 }
 
 function renderSwatches(current) {
@@ -1546,8 +1737,21 @@ function setButton(hex) {
   renderPreview();
 }
 
+function renderLook() {
+  for (const c of document.querySelectorAll(".look-chip")) c.setAttribute("aria-checked", String(c.dataset.theme === (brandDraft.theme || "classic")));
+}
+
+for (const c of document.querySelectorAll(".look-chip")) {
+  c.addEventListener("click", () => {
+    brandDraft.theme = c.dataset.theme;
+    renderLook();
+    renderPreview();
+  });
+}
+
 function loadBrand(b) {
   brandDraft = Object.assign({}, b);
+  renderLook();
   renderFonts();
   $("b-name").value = b.name;
   $("b-wifi").value = b.wifi_name;
@@ -1575,6 +1779,7 @@ function renderThumbs(b) {
 function renderPreview() {
   const b = brandDraft;
   const phone = $("phone");
+  phone.classList.toggle("glass", b.theme === "glass");
   phone.style.setProperty("--a", b.accent);
   phone.style.setProperty("--a-soft", mix(b.accent, "#ffffff", 0.88));
   phone.style.setProperty("--b", b.button);
@@ -1588,7 +1793,7 @@ function renderPreview() {
   const notice = $("b-notice").value.trim();
   $("ph-notice").hidden = !notice;
   $("ph-notice-text").textContent = notice;
-  $("ph-logo").replaceChildren(logoNode(b));
+  $("ph-logo").replaceChildren(logoNode(b, b.theme === "glass"));
   const poster = $("ph-poster");
   if (b.poster) { poster.src = b.poster.url; poster.hidden = false; } else { poster.hidden = true; }
 }
@@ -1675,6 +1880,7 @@ $("brand-form").addEventListener("submit", (ev) => {
       sounds: $("b-sounds").checked,
       name_font: brandDraft.name_font || "",
       name_weight: brandDraft.name_weight,
+      theme: brandDraft.theme || "classic",
     });
     overview.brand = r.brand;
     overview.name = r.brand.name;
@@ -1788,24 +1994,167 @@ for (const name of ["logo", "poster"]) {
   });
 }
 
-function renderSign() {
-  const b = overview.brand;
-  $("sign-name").textContent = b.name;
-  $("sign-logo").replaceChildren(logoNode(b));
-  const hasWifi = !!b.wifi_name;
-  $("qr-wifi-fig").hidden = !hasWifi;
-  $("sign-warn").hidden = hasWifi;
-  $("qr-portal-step").textContent = hasWifi ? "2" : "1";
-  $("sign-ssid").textContent = "“" + b.wifi_name + "”";
-  const t = Date.now();
-  if (hasWifi) $("qr-wifi").src = "/api/qr/wifi?t=" + t;
-  $("qr-portal").src = "/api/qr/portal?t=" + t;
-  api("GET", "/rates").then((rates) => {
-    $("sign-rates").textContent = rates.map((r) => "₱" + r.pesos + " = " + human(r.minutes * 60)).join("   ·   ");
-  }).catch(() => {});
+// ---- the printable sign ------------------------------------------------------------
+// A glass poster drawn by sign.js. The owner's picks are kept on this device;
+// the design number brings any design back.
+
+const SIGN_KEY = "pisowifi-sign";
+const SIGN_DEFAULTS = {
+  seed: 1 + Math.floor(Math.random() * 9999), layout: "scatter", bg: "white", palette: "dopamine",
+  shapes: Object.keys(GlassSign.SHAPES), headline: "", tagline: "Drop a coin. Get online.",
+  sparkles: true, steps: true, rates: true, logoCard: true, logoArt: false, logoGlass: true,
+};
+let signOpts = (() => {
+  try { return Object.assign({}, SIGN_DEFAULTS, JSON.parse(localStorage.getItem(SIGN_KEY) || "{}")); }
+  catch { return Object.assign({}, SIGN_DEFAULTS); }
+})();
+let signData = null, signFrame = 0, signBuilt = false;
+const saveSign = () => { try { localStorage.setItem(SIGN_KEY, JSON.stringify(signOpts)); } catch {} };
+
+function loadImg(src) {
+  return new Promise((res) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
 }
 
-$("print-sign").addEventListener("click", () => printCard($("sign-card")));
+// The logo as an image the canvas can draw: the upload, or the built-in mark
+// in its glass version (the sign is a glass poster).
+function logoImage(b) {
+  if (b.logo) return loadImg(b.logo);
+  const svg = new XMLSerializer().serializeToString(glassMark(b.accent, b.button));
+  return loadImg("data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg));
+}
+
+async function renderSign() {
+  const b = overview.brand;
+  buildSignControls();
+  const hasWifi = !!b.wifi_name, t = Date.now();
+  $("sign-warn").hidden = hasWifi;
+  $("sign-logo-hint").textContent = b.logo ? "Your logo next to the codes" : "Upload a logo above to use your own";
+  let fontFamily = "system-ui, -apple-system, sans-serif";
+  if (b.name_font) {
+    try { await ensureFonts(); } catch {}
+    fontFamily = '"Name ' + b.name_font + '", ' + fontFamily;
+    try { await document.fonts.load((b.name_weight || 800) + ' 80px "Name ' + b.name_font + '"'); } catch {}
+  }
+  const coins = b.coins && b.coins.length ? b.coins : [1, 5, 10, 20];
+  const [qrWifi, qrPortal, logo, rates] = await Promise.all([
+    hasWifi ? loadImg("/api/qr/wifi?t=" + t) : null,
+    loadImg("/api/qr/portal?t=" + t),
+    logoImage(b),
+    api("GET", "/rates").catch(() => []),
+  ]);
+  signLogo = logo;
+  signData = {
+    name: b.name, ssid: b.wifi_name, hasWifi, qrWifi, qrPortal, logo: signLogoFor(b), coins, accent: b.accent, button: b.button,
+    fontFamily, fontWeight: b.name_font ? b.name_weight || 800 : 800,
+    steps: "Tap Insert coin  →  Drop " + coinNames(coins, "or") + "  →  Tap Start internet",
+    rates: rates.map((r) => "₱" + r.pesos + " · " + human(r.minutes * 60)),
+  };
+  drawSign();
+}
+
+// An uploaded logo goes through the glass filter when the owner wants it.
+let signLogo = null;
+function signLogoFor(b) {
+  if (!signLogo) return null;
+  return b.logo && signOpts.logoGlass ? GlassSign.glassify(signLogo) : signLogo;
+}
+
+function drawSign(animate) {
+  if (!signData) return;
+  cancelAnimationFrame(signFrame);
+  signFrame = requestAnimationFrame(() => {
+    GlassSign.draw($("sign-canvas"), signOpts, signData);
+    if (animate && !REDUCE) {
+      const f = $("sign-frame");
+      f.classList.remove("swap"); void f.offsetWidth; f.classList.add("swap");
+    }
+  });
+  $("sign-seed").value = signOpts.seed;
+}
+
+function setSign(patch, animate) {
+  Object.assign(signOpts, patch);
+  if ("logoGlass" in patch && signData) signData.logo = signLogoFor(overview.brand);
+  saveSign();
+  syncSignControls();
+  drawSign(animate);
+}
+
+function buildSignControls() {
+  if (signBuilt) { syncSignControls(); return; }
+  signBuilt = true;
+  const seg = (box, choices, key) => box.append(...Object.entries(choices).map(([k, label]) =>
+    el("button", { type: "button", role: "radio", "data-v": k, "aria-checked": "false", text: label, onclick: () => setSign({ [key]: k }, true) })));
+  seg($("sign-layout"), GlassSign.LAYOUTS, "layout");
+  seg($("sign-bg"), GlassSign.BGS, "bg");
+  $("sign-palettes").replaceChildren(...Object.entries(GlassSign.PALETTES).map(([k, p]) => {
+    const cols = p.colors || [overview.brand.accent, overview.brand.button, "#F39BD3", "#FFA27E"];
+    const dots = el("span", { class: "pal-dots" }, ...cols.slice(0, 4).map((c) => { const d = el("i"); d.style.background = c; return d; }));
+    return el("button", { type: "button", class: "pal-chip", role: "radio", "data-v": k, "aria-checked": "false", onclick: () => setSign({ palette: k }, true) }, dots, el("span", { text: p.name }));
+  }));
+  $("sign-shapes").replaceChildren(...Object.entries(GlassSign.SHAPES).map(([k, name]) =>
+    el("button", { type: "button", class: "shape-chip", "data-v": k, "aria-pressed": "false", text: name, onclick: () => {
+      const on = new Set(signOpts.shapes);
+      if (on.has(k)) { if (on.size === 1) { toast("Keep at least one shape"); return; } on.delete(k); } else on.add(k);
+      setSign({ shapes: [...on] }, true);
+    } })));
+  for (const [id, key] of [["sign-logo-card", "logoCard"], ["sign-logo-art", "logoArt"], ["sign-logo-glass", "logoGlass"], ["sign-sparkles", "sparkles"], ["sign-steps", "steps"], ["sign-rates", "rates"]]) {
+    $(id).addEventListener("change", (ev) => setSign({ [key]: ev.target.checked }, true));
+  }
+  let typing = 0;
+  for (const [id, key] of [["sign-headline", "headline"], ["sign-tagline", "tagline"]]) {
+    $(id).addEventListener("input", (ev) => {
+      clearTimeout(typing);
+      typing = setTimeout(() => setSign({ [key]: ev.target.value.trim() }), 160);
+    });
+  }
+  $("sign-shuffle").addEventListener("click", () => {
+    let seed = signOpts.seed;
+    while (seed === signOpts.seed) seed = 1 + Math.floor(Math.random() * 9999);
+    setSign({ seed }, true);
+  });
+  $("sign-seed").addEventListener("change", (ev) => {
+    const n = Math.round(Number(ev.target.value));
+    if (n >= 1 && n <= 9999) setSign({ seed: n }, true); else ev.target.value = signOpts.seed;
+  });
+  syncSignControls();
+}
+
+function syncSignControls() {
+  for (const [id, key] of [["sign-layout", "layout"], ["sign-bg", "bg"], ["sign-palettes", "palette"]]) {
+    for (const btn of $(id).querySelectorAll("[data-v]")) btn.setAttribute("aria-checked", String(btn.dataset.v === signOpts[key]));
+  }
+  for (const btn of $("sign-shapes").querySelectorAll("[data-v]")) btn.setAttribute("aria-pressed", String(signOpts.shapes.includes(btn.dataset.v)));
+  $("sign-logo-card").checked = signOpts.logoCard;
+  $("sign-logo-art").checked = signOpts.logoArt;
+  $("sign-logo-glass").checked = signOpts.logoGlass;
+  $("sign-logo-glass").disabled = !(overview && overview.brand.logo);
+  $("sign-sparkles").checked = signOpts.sparkles;
+  $("sign-steps").checked = signOpts.steps;
+  $("sign-rates").checked = signOpts.rates;
+  if (document.activeElement !== $("sign-headline")) $("sign-headline").value = signOpts.headline;
+  if (document.activeElement !== $("sign-tagline")) $("sign-tagline").value = signOpts.tagline;
+  $("sign-headline").placeholder = overview ? overview.brand.name : "Your WiFi's name";
+  requestAnimationFrame(() => { placeSegPill($("sign-layout")); placeSegPill($("sign-bg")); });
+}
+
+const signFile = (ext) => (overview.brand.name || "piso-wifi").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "-sign-" + String(signOpts.seed).padStart(4, "0") + "." + ext;
+function saveBlob(blob, name) {
+  const a = el("a", { href: URL.createObjectURL(blob), download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+$("sign-png").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
+  saveBlob(await new Promise((res) => $("sign-canvas").toBlob(res, "image/png")), signFile("png"));
+}));
+$("sign-pdf").addEventListener("click", (ev) => busy(ev.currentTarget, async () => {
+  saveBlob(await GlassSign.pdf($("sign-canvas")), signFile("pdf"));
+}));
+$("print-sign").addEventListener("click", () => {
+  const img = $("sign-print");
+  img.onload = () => { img.onload = null; printCard($("sign-card")); };
+  img.src = $("sign-canvas").toDataURL("image/png");
+});
 
 function printCard(card) {
   card.classList.add("printing");

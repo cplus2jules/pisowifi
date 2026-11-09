@@ -207,6 +207,7 @@ pub fn asset_version() -> &'static str {
             include_str!("../web/admin/index.html"),
             include_str!("../web/admin/admin.js"),
             include_str!("../web/admin/admin.css"),
+            include_str!("../web/admin/sign.js"),
             include_str!("../web/shared/coins.js"),
             include_str!("../web/shared/icon.svg"),
             include_str!("../web/portal/add-to-google-wallet.svg"),
@@ -219,12 +220,12 @@ pub fn asset_version() -> &'static str {
 
 /// An HTML page with its asset links stamped with the current version.
 pub fn page(html: &'static str, cell: &'static std::sync::OnceLock<String>) -> Response {
-    let body = cell.get_or_init(|| html.replace("__V__", asset_version()));
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
-        body.as_str(),
-    )
-        .into_response()
+    html_page(cell.get_or_init(|| html.replace("__V__", asset_version())))
+}
+
+/// A finished HTML page (asset links already stamped).
+pub fn html_page(body: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
 pub fn asset(content_type: &'static str, body: &'static str) -> Response {

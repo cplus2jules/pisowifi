@@ -35,6 +35,7 @@ pub fn router(st: Shared) -> Router {
         .route("/coinbox/collect", post(collect_coins))
         .route("/goal", put(set_goal))
         .route("/auto-pause", get(get_auto_pause).put(set_auto_pause))
+        .route("/coins", get(get_coins).put(set_coins))
         .route("/system", get(system_info))
         .route("/rates", get(get_rates).put(set_rates))
         .route("/vouchers", get(list_vouchers).post(create_vouchers))
@@ -58,18 +59,31 @@ pub fn router(st: Shared) -> Router {
         )
         .route("/update/settings", put(update_settings))
         .route("/logout", post(logout))
+        .route("/look", put(set_look))
         .layer(from_fn_with_state(st.clone(), require_session));
     let api = Router::new()
         .route("/session", get(session))
         .route("/login", post(login))
         .merge(protected);
     Router::new()
-        .route("/", get(|| async {
+        .route("/", get(|State(st): State<Shared>| async move {
+            // The owner's look for this dashboard is stamped in, so it never flashes the other one first.
             static HTML: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-            app::page(include_str!("../web/admin/index.html"), &HTML)
+            static GLASS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            const PAGE: &str = include_str!("../web/admin/index.html");
+            let glass = st.db.get_setting(ADMIN_LOOK).ok().flatten().as_deref() == Some("glass");
+            let html = if glass {
+                GLASS.get_or_init(|| {
+                    PAGE.replace("__V__", app::asset_version()).replacen("<html lang=\"en\">", "<html lang=\"en\" data-theme=\"glass\">", 1)
+                })
+            } else {
+                HTML.get_or_init(|| PAGE.replace("__V__", app::asset_version()))
+            };
+            app::html_page(html)
         }))
         .route("/admin.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/admin/admin.js")) }))
         .route("/admin.css", get(|| async { asset("text/css; charset=utf-8", include_str!("../web/admin/admin.css")) }))
+        .route("/sign.js", get(|| async { asset("text/javascript; charset=utf-8", include_str!("../web/admin/sign.js")) }))
         .route("/icon.svg", get(|| async { asset("image/svg+xml", include_str!("../web/shared/icon.svg")) }))
         .route("/brand/{name}", get(app::brand_image))
         .route("/fonts/{file}", get(crate::fonts::serve))
@@ -157,6 +171,24 @@ async fn require_session(
 
 fn actor(addr: SocketAddr) -> String {
     format!("owner@{}", addr.ip())
+}
+
+// ---- the dashboard's own look ------------------------------------------------
+
+/// Setting: "glass" or "classic" (unset: classic). Separate from the customer page's look.
+const ADMIN_LOOK: &str = "admin_theme";
+
+#[derive(Deserialize)]
+struct LookReq {
+    theme: String,
+}
+
+async fn set_look(State(st): State<Shared>, Json(req): Json<LookReq>) -> ApiResult<Json<Value>> {
+    if !crate::brand::THEMES.contains(&req.theme.as_str()) {
+        return Err(ApiError::bad("Pick one of the looks"));
+    }
+    st.db.set_setting(ADMIN_LOOK, &req.theme)?;
+    Ok(Json(json!({ "ok": true, "theme": req.theme })))
 }
 
 // ---- session -------------------------------------------------------------
@@ -675,6 +707,27 @@ async fn set_auto_pause(
     Ok(Json(json!({ "ok": true, "minutes": req.minutes })))
 }
 
+async fn get_coins(State(st): State<Shared>) -> Json<Value> {
+    Json(json!({ "coins": st.brand.get().coins, "choices": crate::brand::COINS }))
+}
+
+#[derive(Deserialize)]
+struct CoinsReq {
+    coins: Vec<u32>,
+}
+
+async fn set_coins(
+    State(st): State<Shared>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<CoinsReq>,
+) -> ApiResult<Json<Value>> {
+    let coins = crate::brand::clean_coins(&req.coins).ok_or_else(|| ApiError::bad("Pick at least one coin"))?;
+    st.brand.set_coins(&st.db, &coins)?;
+    let list: Vec<String> = coins.iter().map(|c| format!("₱{c}")).collect();
+    st.db.audit(&actor(addr), "set_coins", &list.join(", "));
+    Ok(Json(json!({ "ok": true, "coins": coins })))
+}
+
 async fn get_rates(State(st): State<Shared>) -> ApiResult<Json<Vec<Rate>>> {
     Ok(Json(st.db.rates()?))
 }
@@ -747,6 +800,8 @@ struct BrandingReq {
     /// A font key, or "" for the phone's own.
     name_font: Option<String>,
     name_weight: Option<u16>,
+    /// One of [`crate::brand::THEMES`]; left out: unchanged.
+    theme: Option<String>,
 }
 
 async fn set_branding(
@@ -768,6 +823,9 @@ async fn set_branding(
     if req.name_font.as_deref().is_some_and(|f| !f.is_empty() && crate::fonts::find(f).is_none()) {
         return Err(ApiError::bad("Pick one of the fonts"));
     }
+    if req.theme.as_deref().is_some_and(|t| !crate::brand::THEMES.contains(&t)) {
+        return Err(ApiError::bad("Pick one of the looks"));
+    }
     let (alt, wifi) = (clean_text(&req.poster_alt, 120), clean_text(&req.wifi_name, 32));
     let now = st.brand.get();
     let after_url = match &req.after_url {
@@ -783,6 +841,9 @@ async fn set_branding(
     }
     if let Some(button) = &req.button {
         st.brand.set_button(&st.db, &button.to_uppercase())?;
+    }
+    if let Some(theme) = &req.theme {
+        st.brand.set_theme(&st.db, theme)?;
     }
     st.brand.set_text(&st.db, &name, &req.accent.to_uppercase(), &alt, &wifi)?;
     st.db.audit(&actor(addr), "branding", &format!("{name} · {}", req.accent));

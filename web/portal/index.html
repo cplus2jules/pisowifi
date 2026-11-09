@@ -21,6 +21,21 @@
       <stop offset="0" stop-color="#D4F04C"/>
       <stop offset="1" stop-color="#5A43E6"/>
     </linearGradient>
+    <!-- Glass look: the coin ring's fill, through pink so it never turns grey -->
+    <linearGradient id="ring-gel" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#D4F04C"/>
+      <stop offset=".5" stop-color="#F39BD3"/>
+      <stop offset="1" stop-color="#5A43E6"/>
+    </linearGradient>
+    <!-- ...lit from the top left so it reads as a rounded gel tube -->
+    <filter id="gel" x="-15%" y="-15%" width="130%" height="130%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="2.4" result="b"/>
+      <feSpecularLighting in="b" surfaceScale="5" specularConstant="1.1" specularExponent="24" lighting-color="#fff" result="s">
+        <fePointLight x="140" y="-20" z="90"/>
+      </feSpecularLighting>
+      <feComposite in="s" in2="SourceAlpha" operator="in" result="lit"/>
+      <feComposite in="SourceGraphic" in2="lit" operator="arithmetic" k2="1" k3=".85"/>
+    </filter>
   </defs>
   <symbol id="i-ticket" viewBox="0 0 20 20"><path d="M2.5 6.5V5a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v1.5a2.5 2.5 0 0 0 0 5V15a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1v-3.5a2.5 2.5 0 0 0 0-5z"/><path d="M12 4v12" stroke-dasharray="1.5 1.8"/></symbol>
   <symbol id="i-chev" viewBox="0 0 20 20"><path d="M8 5l5 5-5 5"/></symbol>
@@ -102,17 +117,19 @@
         </div>
         <span class="pill soft">
           <svg class="glyph coin" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M8.6 13V7h2a1.8 1.8 0 0 1 0 3.6h-2M7.4 8.6h5.2M7.4 9.9h5.2"/></svg>
-          <b>Slot open</b>
+          <b id="slot-pill">Slot open</b>
         </span>
       </div>
       <div class="drop-zone" id="drop-zone" aria-hidden="true">
-        <svg class="ring" viewBox="0 0 120 120"><circle class="ring-bg" cx="60" cy="60" r="54"/><circle class="ring-fg" id="ring" cx="60" cy="60" r="54"/></svg>
+        <svg class="ring" viewBox="0 0 120 120"><circle class="ring-bg" cx="60" cy="60" r="54"/><circle class="ring-fg" id="ring" cx="60" cy="60" r="54"/><circle class="ring-tube in" cx="60" cy="60" r="46.5"/><circle class="ring-tube out" cx="60" cy="60" r="61.5"/><circle class="ring-tube shine" cx="60" cy="60" r="50.5"/></svg>
         <div class="coin-chute" id="chute"></div>
         <div class="total"><small>₱</small><span id="pesos">0</span></div>
+        <span class="drop-x" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></svg></span>
       </div>
       <div class="tray" id="tray" aria-label="Coins inserted"></div>
       <p class="credit" id="credit">Waiting for your first coin…</p>
       <button type="button" class="btn primary block" id="done">Start internet</button>
+      <button type="button" class="btn ghost block cancel-insert" id="cancel-insert">Cancel</button>
     </div>
 
     <div class="drop busy" id="busy" hidden>
@@ -239,12 +256,12 @@
       <section class="ob-slide">
         <div class="ob-art art-welcome"><span class="ob-logo" id="ob-logo"></span><i></i><i></i><i></i></div>
         <h2 id="ob-title">Welcome to <span id="ob-name">Piso WiFi</span></h2>
-        <p>Get online in a few taps. No app, no sign-up.</p>
+        <p>Drop a coin and you're online in seconds. Nothing to download, no account to make.</p>
       </section>
       <section class="ob-slide">
         <div class="ob-art art-coins" id="ob-coins"></div>
         <h2>Tap Insert coin, then drop coins</h2>
-        <p>₱1, ₱5, ₱10 and ₱20 all work. Each coin pops up on screen as it lands, and you get the best rate for the total.</p>
+        <p><span id="ob-coin-list">₱1, ₱5, ₱10 and ₱20 all work.</span> Each coin pops up on screen as it lands, and you get the best rate for the total.</p>
       </section>
       <section class="ob-slide">
         <div class="ob-art art-pause"><b>01:59</b><span><svg class="ic" viewBox="0 0 20 20"><path d="M7.5 5.5v9M12.5 5.5v9"/></svg></span></div>
